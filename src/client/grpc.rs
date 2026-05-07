@@ -217,10 +217,18 @@ impl KeryxdHandler {
         let mut request_hash = [0u8; 32];
         request_hash.copy_from_slice(&full_hash.as_bytes()[..32]);
 
+        // Phase 3 C: prepend the deterministic MLP commitment to the result.
+        // First 32 bytes of result = model_fixed::forward(request_hash).
+        // This allows consensus to verify fraud via re-execution without ZK proofs.
+        let commitment = keryx_inference::compute_ai_commitment(&request_hash);
+        let mut result_bytes = Vec::with_capacity(32 + result.len());
+        result_bytes.extend_from_slice(&commitment);
+        result_bytes.extend_from_slice(result.as_bytes());
+
         let response_payload = keryx_inference::AiResponsePayload::new(
             request_hash,
             0, // challenge_window_end: computed by node on inclusion
-            result.into_bytes(),
+            result_bytes,
         );
 
         let tx = crate::proto::RpcTransaction {
