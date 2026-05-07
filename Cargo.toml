@@ -46,6 +46,7 @@ async-trait = "0.1"
 num = "0.4"
 nix = "0.25"
 hex = "0.4"
+keryx-inference = { path = "../keryx-node/inference" }
 semver = "1.0"
 # Phase-3 OPoI: SLM inference via candle
 candle-core = "0.8"
