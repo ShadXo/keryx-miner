@@ -73,6 +73,7 @@ async fn get_client(
     mining_address: String,
     mine_when_not_synced: bool,
     block_template_ctr: Arc<AtomicU16>,
+    escrow_pubkey: Option<String>,
 ) -> Result<Box<dyn Client + 'static>, Error> {
     if keryxd_address.starts_with("stratum+tcp://") {
         let (_schema, address) = keryxd_address.split_once("://").unwrap();
@@ -89,6 +90,7 @@ async fn get_client(
             mining_address.clone(),
             mine_when_not_synced,
             Some(block_template_ctr.clone()),
+            escrow_pubkey,
         )
         .await?)
     } else {
@@ -106,6 +108,7 @@ async fn client_main(
         opt.mining_address.clone(),
         opt.mine_when_not_synced,
         block_template_ctr.clone(),
+        opt.escrow_pubkey.clone(),
     )
     .await?;
 

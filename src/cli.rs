@@ -30,6 +30,12 @@ pub struct Opt {
     )]
     pub mine_when_not_synced: bool,
 
+    #[clap(
+        long = "escrow-pubkey",
+        help = "64-char hex Schnorr pubkey for the OPoI escrow output (enables 10% recovery instead of burn)"
+    )]
+    pub escrow_pubkey: Option<String>,
+
     #[clap(skip)]
     pub devfund_address: String,
 }

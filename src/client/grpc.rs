@@ -52,6 +52,11 @@ pub struct KeryxdHandler {
 
     /// In-flight SLM inference task: (payload_prefix, result_receiver).
     inference_rx: Option<(String, oneshot::Receiver<String>)>,
+
+    /// 64-char hex Schnorr pubkey for the OPoI escrow output.
+    /// `Some` → 10% of this miner's blue-block rewards go to this key (recoverable).
+    /// `None` → 10% is burned (standard miner).
+    escrow_pubkey: Option<String>,
 }
 
 #[async_trait(?Send)]
@@ -87,6 +92,7 @@ impl KeryxdHandler {
         miner_address: String,
         mine_when_not_synced: bool,
         block_template_ctr: Option<Arc<AtomicU16>>,
+        escrow_pubkey: Option<String>,
     ) -> Result<Box<Self>, Error>
     where
         D: std::convert::TryInto<tonic::transport::Endpoint>,
@@ -113,6 +119,7 @@ impl KeryxdHandler {
             ai_seen_prefixes: std::collections::HashSet::new(),
             pending_ai_response: None,
             inference_rx: None,
+            escrow_pubkey,
         }))
     }
 
@@ -148,9 +155,8 @@ impl KeryxdHandler {
         self.block_template_ctr.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| Some((v + 1) % 10_000)).unwrap();
         // Append a per-request random nonce so that parallel blocks at the same blue_score
         // get distinct coinbase payloads → distinct tx_ids (avoids DAG coinbase collisions).
-        // Unique nonce per request → distinct coinbase payloads at the same blue_score → no DAG tx_id collisions.
         let nonce_hex = format!("{:016x}", thread_rng().next_u64());
-        // OPoI Phase 1: run the deterministic MLP (matches node validation).
+        // OPoI Phase 2: run the deterministic fixed-point MLP (matches node validation).
         let opoi_tag = keryx_miner::inference::compute_opoi_tag(&nonce_hex);
         // Embed the pending AI response in every template request until a block is
         // successfully submitted. Using clone (not take) so the response survives
@@ -160,7 +166,13 @@ impl KeryxdHandler {
             .as_deref()
             .map(|r| format!("/{}", r))
             .unwrap_or_default();
-        let extra_data = format!("{}/{}/ai:v1:{}{}", EXTRA_DATA, nonce_hex, opoi_tag, ai_response);
+        // OPoI escrow: if a Schnorr pubkey is configured, embed it so the node can route
+        // the 10% escrow cut to a recoverable output instead of burning it.
+        let escrow_part = self.escrow_pubkey
+            .as_deref()
+            .map(|pk| format!("/escrow:{}", pk))
+            .unwrap_or_default();
+        let extra_data = format!("{}{}/{}/ai:v1:{}{}", EXTRA_DATA, escrow_part, nonce_hex, opoi_tag, ai_response);
         self.client_send(GetBlockTemplateRequestMessage { pay_address, extra_data }).await
     }
 
