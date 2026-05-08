@@ -36,6 +36,19 @@ pub struct Opt {
     )]
     pub escrow_pubkey: Option<String>,
 
+    #[clap(
+        long = "escrow-privkey",
+        help = "64-char hex Schnorr private key — derives escrow pubkey and enables automatic escrow claiming after the CSV window"
+    )]
+    pub escrow_privkey: Option<String>,
+
+    #[clap(
+        long = "escrow-state-file",
+        help = "Path to the escrow claim state file",
+        default_value = "escrow_state.json"
+    )]
+    pub escrow_state_file: String,
+
     #[clap(skip)]
     pub devfund_address: String,
 }

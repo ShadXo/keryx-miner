@@ -54,6 +54,9 @@ pub struct KeryxdHandler {
     /// `Some` → 10% of this miner's blue-block rewards go to this key (recoverable).
     /// `None` → 10% is burned (standard miner).
     escrow_pubkey: Option<String>,
+
+    /// Auto-claim module: present when `--escrow-privkey` is supplied.
+    escrow_watcher: Option<crate::escrow::EscrowWatcher>,
 }
 
 #[async_trait(?Send)]
@@ -90,11 +93,31 @@ impl KeryxdHandler {
         mine_when_not_synced: bool,
         block_template_ctr: Option<Arc<AtomicU16>>,
         escrow_pubkey: Option<String>,
+        escrow_privkey: Option<String>,
+        escrow_state_file: String,
     ) -> Result<Box<Self>, Error>
     where
         D: std::convert::TryInto<tonic::transport::Endpoint>,
         D::Error: Into<Error>,
     {
+        // If a privkey is provided, build the escrow watcher and derive the pubkey from it.
+        let (resolved_escrow_pubkey, escrow_watcher) = match escrow_privkey {
+            Some(ref privkey) => {
+                match crate::escrow::EscrowWatcher::new(privkey, &miner_address, escrow_state_file.into()) {
+                    Ok(watcher) => {
+                        let pk_hex = watcher.pubkey_hex();
+                        info!("Escrow auto-claim enabled: pubkey={}", pk_hex);
+                        (Some(pk_hex), Some(watcher))
+                    }
+                    Err(e) => {
+                        log::error!("Failed to initialise EscrowWatcher: {} — auto-claim disabled", e);
+                        (escrow_pubkey, None)
+                    }
+                }
+            }
+            None => (escrow_pubkey, None),
+        };
+
         let mut client = RpcClient::connect(address).await?;
         let (send_channel, recv) = mpsc::channel(2);
         send_channel.send(GetInfoRequestMessage {}.into()).await?;
@@ -115,7 +138,8 @@ impl KeryxdHandler {
             ai_request_queue: VecDeque::new(),
             ai_seen_prefixes: std::collections::HashSet::new(),
             inference_rx: None,
-            escrow_pubkey,
+            escrow_pubkey: resolved_escrow_pubkey,
+            escrow_watcher,
         }))
     }
 
@@ -250,15 +274,19 @@ impl KeryxdHandler {
 
     async fn handle_message(&mut self, msg: Payload, miner: &mut MinerManager) -> Result<(), Error> {
         match msg {
-            // BlockAdded: scan confirmed block for AiRequests that may have been
-            // confirmed before the miner saw them in the mempool.
+            // BlockAdded: scan confirmed block for AiRequests and escrow UTXOs.
             // Do NOT trigger a new block template here — NewBlockTemplate handles that.
             Payload::BlockAddedNotification(notif) => {
                 if let Some(block) = notif.block {
                     if !block.transactions.is_empty() {
-                        // Full block included — scan directly.
+                        // Full block — scan directly.
                         self.scan_txs_for_ai_requests(&block.transactions.clone());
                         self.try_start_inference();
+                        // Escrow: check for new escrow UTXOs and mature claims.
+                        let claim_tx = self.escrow_watcher.as_mut().and_then(|w| w.handle_block(&block));
+                        if let Some(tx) = claim_tx {
+                            self.client_send(KaspadMessage::submit_transaction(tx)).await?;
+                        }
                     } else {
                         // Transactions absent — fetch the full block from the node.
                         let hash = block
@@ -299,23 +327,36 @@ impl KeryxdHandler {
                 }
             }
             // GetBlock response: arrives after we requested a full block from BlockAdded.
-            // Scan its transactions for AiRequests.
+            // Scan its transactions for AiRequests and escrow UTXOs.
             Payload::GetBlockResponse(msg) => {
                 if let Some(e) = msg.error {
                     warn!("GetBlockResponse error: {}", e.message);
                 } else if let Some(block) = msg.block {
                     self.scan_txs_for_ai_requests(&block.transactions.clone());
                     self.try_start_inference();
+                    let claim_tx = self.escrow_watcher.as_mut().and_then(|w| w.handle_block(&block));
+                    if let Some(tx) = claim_tx {
+                        self.client_send(KaspadMessage::submit_transaction(tx)).await?;
+                    }
                 }
             }
             Payload::SubmitBlockResponse(res) => match res.error {
                 None => info!("block submitted successfully!"),
                 Some(e) => warn!("Failed submitting block: {:?}", e),
             },
-            Payload::SubmitTransactionResponse(res) => match res.error {
-                None => info!("OPoI: AiResponse tx submitted successfully"),
-                Some(e) => warn!("OPoI: failed submitting AiResponse tx: {:?}", e),
-            },
+            Payload::SubmitTransactionResponse(res) => {
+                // Route to escrow watcher if a claim TX is in flight; otherwise it's AiResponse.
+                let is_claim = self.escrow_watcher.as_ref().map_or(false, |w| w.pending_claim_txid.is_some());
+                if is_claim {
+                    let err = res.error.map(|e| e.message);
+                    self.escrow_watcher.as_mut().unwrap().on_submit_response(err);
+                } else {
+                    match res.error {
+                        None => info!("OPoI: AiResponse tx submitted successfully"),
+                        Some(e) => warn!("OPoI: failed submitting AiResponse tx: {:?}", e),
+                    }
+                }
+            }
             Payload::GetInfoResponse(info) => {
                 info!("Keryxd version: {}", info.server_version);
                 // Register for both notification types:

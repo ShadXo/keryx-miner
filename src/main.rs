@@ -24,6 +24,7 @@ use crate::target::Uint256;
 
 mod cli;
 mod client;
+mod escrow;
 mod keryxd_messages;
 mod miner;
 mod pow;
@@ -74,6 +75,8 @@ async fn get_client(
     mine_when_not_synced: bool,
     block_template_ctr: Arc<AtomicU16>,
     escrow_pubkey: Option<String>,
+    escrow_privkey: Option<String>,
+    escrow_state_file: String,
 ) -> Result<Box<dyn Client + 'static>, Error> {
     if keryxd_address.starts_with("stratum+tcp://") {
         let (_schema, address) = keryxd_address.split_once("://").unwrap();
@@ -91,6 +94,8 @@ async fn get_client(
             mine_when_not_synced,
             Some(block_template_ctr.clone()),
             escrow_pubkey,
+            escrow_privkey,
+            escrow_state_file,
         )
         .await?)
     } else {
@@ -109,6 +114,8 @@ async fn client_main(
         opt.mine_when_not_synced,
         block_template_ctr.clone(),
         opt.escrow_pubkey.clone(),
+        opt.escrow_privkey.clone(),
+        opt.escrow_state_file.clone(),
     )
     .await?;
 
