@@ -46,7 +46,7 @@ async-trait = "0.1"
 num = "0.4"
 nix = "0.25"
 hex = "0.4"
-keryx-inference = { path = "../keryx-node/inference" }
+keryx-inference = { path = "inference" }
 secp256k1 = { version = "0.29.0", features = ["global-context"] }
 semver = "1.0"
 # Phase-3 OPoI: SLM inference via candle
@@ -83,5 +83,5 @@ time = { version = "0.3", features = ["formatting"] }
 sha3 = { git = "https://github.com/elichai/hashes", branch = "cSHAKE" }
 
 [workspace]
-members = ["plugins/*"]
+members = ["inference", "plugins/*"]
 default-members = [".", "plugins/cuda", "plugins/opencl"]
