@@ -1682,7 +1682,7 @@ dependencies = [
 
 [[package]]
 name = "keryx-inference"
-version = "1.1.0"
+version = "1.1.1"
 dependencies = [
  "candle-core 0.9.2",
  "hex",
@@ -1691,7 +1691,7 @@ dependencies = [
 
 [[package]]
 name = "keryx-miner"
-version = "0.2.1-GPU-0.7"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "async-trait",

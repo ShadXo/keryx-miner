@@ -30,12 +30,27 @@ pub struct EscrowEntry {
     pub amount_sompi: u64,
     pub claimed: bool,
     pub slashed: bool,
+    /// Set when the claim was rejected because the coinbase's block was off the
+    /// selected chain (orphan). Unlike `slashed`, this is retriable — the entry
+    /// will be re-attempted once the block returns to the selected chain.
+    #[serde(default)]
+    pub orphan_slashed: bool,
+    /// Number of consecutive orphan rejections. After MAX_ORPHAN_RETRIES, the entry
+    /// is permanently slashed to avoid infinite retry loops on blocks that will never
+    /// return to the selected chain.
+    #[serde(default)]
+    pub orphan_retries: u8,
 }
 
 #[derive(Serialize, Deserialize, Default, Debug)]
 pub struct EscrowState {
     pub entries: Vec<EscrowEntry>,
 }
+
+/// DAA-score cooldown after an orphan rejection before retrying the claim.
+const ORPHAN_RETRY_COOLDOWN_BLOCKS: u64 = 100;
+/// After this many consecutive orphan rejections, give up and slash permanently.
+const MAX_ORPHAN_RETRIES: u8 = 10;
 
 pub struct EscrowWatcher {
     secp: secp256k1::Secp256k1<secp256k1::All>,
@@ -50,6 +65,10 @@ pub struct EscrowWatcher {
     state_path: PathBuf,
     /// Coinbase txid of the claim TX currently in flight (waiting for SubmitTransactionResponse).
     pub pending_claim_txid: Option<String>,
+    /// Daa score of the most recent block seen — used to set orphan-retry cooldowns.
+    last_daa_score: u64,
+    /// DAA score at which the current orphan-rejected claim may be retried.
+    orphan_retry_after_daa: Option<u64>,
 }
 
 impl EscrowWatcher {
@@ -90,6 +109,8 @@ impl EscrowWatcher {
             state,
             state_path,
             pending_claim_txid: None,
+            last_daa_score: 0,
+            orphan_retry_after_daa: None,
         })
     }
 
@@ -102,6 +123,7 @@ impl EscrowWatcher {
     /// Returns a claim TX to submit if one is ready; `None` otherwise.
     pub fn handle_block(&mut self, block: &crate::proto::RpcBlock) -> Option<RpcTransaction> {
         let daa_score = block.header.as_ref()?.daa_score;
+        self.last_daa_score = daa_score;
 
         // Find coinbase TX (no inputs).
         let coinbase = block.transactions.iter().find(|tx| tx.inputs.is_empty())?;
@@ -129,6 +151,8 @@ impl EscrowWatcher {
                         amount_sompi: output.amount,
                         claimed: false,
                         slashed: false,
+                        orphan_slashed: false,
+                        orphan_retries: 0,
                     });
                     self.save_state();
                 }
@@ -140,8 +164,18 @@ impl EscrowWatcher {
             return None;
         }
 
+        // Respect orphan-retry cooldown.
+        if let Some(retry_daa) = self.orphan_retry_after_daa {
+            if daa_score < retry_daa {
+                return None;
+            }
+            self.orphan_retry_after_daa = None;
+        }
+
         // +1 margin: BlockAddedNotification arrives before the virtual state DAA score updates,
         // so claiming exactly at confirm_daa + CHALLENGE_WINDOW_BLOCKS races the sequence lock check.
+        // Orphan-slashed entries are retried — their coinbase block may have returned to the
+        // selected chain after a reorg.
         let entry = self
             .state
             .entries
@@ -183,9 +217,33 @@ impl EscrowWatcher {
             Some(err_msg) => {
                 warn!("EscrowWatcher: claim rejected for coinbase={}…: {}", &txid[..16.min(txid.len())], err_msg);
                 if let Some(e) = self.state.entries.iter_mut().find(|e| e.coinbase_txid == txid) {
-                    // Sequence-lock rejections are timing races — retry on the next block.
+                    // Retriable rejections: sequence-lock timing races and orphan/dag-reorg
+                    // situations where the coinbase's block is off the selected chain.
                     // Any other rejection (double-spend, script failure) is a real slash.
-                    if !err_msg.contains("sequence lock") {
+                    let is_orphan = err_msg.contains("orphan");
+                    let is_seq_lock = err_msg.contains("sequence lock");
+                    if is_orphan {
+                        e.orphan_retries += 1;
+                        if e.orphan_retries >= MAX_ORPHAN_RETRIES {
+                            // Too many orphan rejections — this block is likely never
+                            // returning to the selected chain. Slash permanently.
+                            e.orphan_slashed = false;
+                            e.slashed = true;
+                            warn!(
+                                "EscrowWatcher: coinbase={}… slashed after {} orphan retries",
+                                &txid[..16.min(txid.len())],
+                                e.orphan_retries
+                            );
+                        } else {
+                            e.orphan_slashed = true;
+                            // Set cooldown: wait ORPHAN_RETRY_COOLDOWN_BLOCKS from the current
+                            // DAA score before retrying — the block may return to the selected chain.
+                            let retry_daa = self.last_daa_score + ORPHAN_RETRY_COOLDOWN_BLOCKS;
+                            self.orphan_retry_after_daa = Some(
+                                self.orphan_retry_after_daa.map_or(retry_daa, |prev| prev.max(retry_daa)),
+                            );
+                        }
+                    } else if !is_seq_lock {
                         e.slashed = true;
                     }
                 }
@@ -314,7 +372,7 @@ pub fn load_or_generate_key(path: &str) -> Result<String, String> {
 }
 
 fn load_state(path: &PathBuf) -> EscrowState {
-    match fs::read_to_string(path) {
+    let mut state = match fs::read_to_string(path) {
         Ok(s) => serde_json::from_str(&s).unwrap_or_else(|e| {
             warn!("EscrowWatcher: could not parse {}: {} — starting fresh", path.display(), e);
             EscrowState::default()
@@ -324,7 +382,21 @@ fn load_state(path: &PathBuf) -> EscrowState {
             warn!("EscrowWatcher: could not read {}: {} — starting fresh", path.display(), e);
             EscrowState::default()
         }
+    };
+
+    // Migration: before `orphan_slashed` was introduced, all claim rejections (including
+    // orphan/reorg) were permanently marked `slashed = true`. Convert those to retriable
+    // `orphan_slashed` so they get re-attempted once their block returns to the selected chain.
+    let migrated = state.entries.iter_mut().filter(|e| e.slashed && !e.claimed && !e.orphan_slashed).count();
+    if migrated > 0 {
+        for e in state.entries.iter_mut().filter(|e| e.slashed && !e.claimed) {
+            e.orphan_slashed = true;
+            e.slashed = false;
+        }
+        warn!("EscrowWatcher: migrated {} orphan-slashed entries (retriable retry)", migrated);
     }
+
+    state
 }
 
 // ── Script builders ───────────────────────────────────────────────────────────
