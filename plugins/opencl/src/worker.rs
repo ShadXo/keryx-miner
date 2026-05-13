@@ -318,7 +318,7 @@ impl OpenCLGPUWorker {
             matrix,
             target,
             events: Vec::<cl_event>::new(),
-            experimental_amd: ((experimental_amd | use_binary) & experimental_amd_use),
+            experimental_amd: (experimental_amd & experimental_amd_use),
         })
     }
 }
