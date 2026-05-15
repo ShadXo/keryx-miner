@@ -176,6 +176,7 @@ async fn main() -> Result<(), Error> {
             block_hash: String,
             confirm_daa: i64,
             amount_sompi: i64,
+            output_index: i64,
         }
 
         let url_clone = url.clone();
@@ -198,6 +199,7 @@ async fn main() -> Result<(), Error> {
                 block_hash: a.block_hash,
                 confirm_daa: a.confirm_daa as u64,
                 amount_sompi: a.amount_sompi as u64,
+                output_index: a.output_index as u32,
                 claimed: false,
                 slashed: false,
                 orphan_slashed: false,

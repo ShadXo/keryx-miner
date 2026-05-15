@@ -32,6 +32,11 @@ pub struct EscrowEntry {
     pub block_hash: String,
     pub confirm_daa: u64,
     pub amount_sompi: u64,
+    /// Index of the escrow output in the coinbase transaction.
+    /// Coinbases contain one escrow output per blue block in the mergeset, so
+    /// the index is NOT always 1 — it depends on fee outputs and mergeset size.
+    #[serde(default = "default_output_index")]
+    pub output_index: u32,
     pub claimed: bool,
     pub slashed: bool,
     #[serde(default)]
@@ -42,6 +47,10 @@ pub struct EscrowEntry {
     /// not blocked while this one waits — unlike the former global cooldown.
     #[serde(default)]
     pub orphan_retry_after_daa: Option<u64>,
+}
+
+fn default_output_index() -> u32 {
+    1
 }
 
 #[derive(Serialize, Deserialize, Default, Debug)]
@@ -65,8 +74,9 @@ pub struct EscrowWatcher {
     payout_spk_script_hex: String,
     pub state: EscrowState,
     state_path: PathBuf,
-    /// Coinbase txid of the claim TX currently in flight (waiting for SubmitTransactionResponse).
+    /// Outpoint (txid, output_index) of the claim TX currently in flight.
     pub pending_claim_txid: Option<String>,
+    pub pending_claim_output_index: Option<u32>,
     /// DAA score of the most recent block seen — used to set per-entry orphan cooldowns.
     last_daa_score: u64,
 }
@@ -109,6 +119,7 @@ impl EscrowWatcher {
             state,
             state_path,
             pending_claim_txid: None,
+            pending_claim_output_index: None,
             last_daa_score: 0,
         })
     }
@@ -156,16 +167,22 @@ impl EscrowWatcher {
             return None;
         }
 
-        // Output at index 1 holds the escrow cut (if the miner embedded /escrow:<pubkey>).
-        if let Some(output) = coinbase.outputs.get(1) {
+        // Scan all coinbase outputs — a multi-blue mergeset produces one escrow output
+        // per blue block, each at a different index.  Hardcoding index 1 would miss all
+        // escrow outputs beyond the first blue's pair.
+        let mut dirty = false;
+        for (out_idx, output) in coinbase.outputs.iter().enumerate() {
             if let Some(spk) = &output.script_public_key {
                 if spk.script_public_key.to_lowercase() == self.escrow_script_hex
                     && spk.version == 0
-                    && !self.state.entries.iter().any(|e| e.coinbase_txid == coinbase_txid)
+                    && !self.state.entries.iter().any(|e| {
+                        e.coinbase_txid == coinbase_txid && e.output_index == out_idx as u32
+                    })
                 {
                     info!(
-                        "EscrowWatcher: tracked escrow coinbase={}… daa={} amount={}",
+                        "EscrowWatcher: tracked escrow coinbase={}…[{}] daa={} amount={}",
                         &coinbase_txid[..16.min(coinbase_txid.len())],
+                        out_idx,
                         daa_score,
                         output.amount
                     );
@@ -174,15 +191,19 @@ impl EscrowWatcher {
                         block_hash: block_hash.clone(),
                         confirm_daa: daa_score,
                         amount_sompi: output.amount,
+                        output_index: out_idx as u32,
                         claimed: false,
                         slashed: false,
                         orphan_slashed: false,
                         orphan_retries: 0,
                         orphan_retry_after_daa: None,
                     });
-                    self.save_state();
+                    dirty = true;
                 }
             }
+        }
+        if dirty {
+            self.save_state();
         }
 
         // Only one claim TX in flight at a time.
@@ -208,10 +229,12 @@ impl EscrowWatcher {
         match self.build_claim_tx(&entry) {
             Ok(tx) => {
                 info!(
-                    "EscrowWatcher: claiming escrow coinbase={}… (matured at daa {})",
+                    "EscrowWatcher: claiming escrow coinbase={}…[{}] (matured at daa {})",
                     &entry.coinbase_txid[..16.min(entry.coinbase_txid.len())],
+                    entry.output_index,
                     entry.confirm_daa + CHALLENGE_WINDOW_BLOCKS
                 );
+                self.pending_claim_output_index = Some(entry.output_index);
                 self.pending_claim_txid = Some(entry.coinbase_txid);
                 Some(tx)
             }
@@ -228,16 +251,21 @@ impl EscrowWatcher {
             Some(t) => t,
             None => return,
         };
+        let out_idx = self.pending_claim_output_index.take().unwrap_or(1);
 
         match error {
             None => {
-                info!("EscrowWatcher: claim accepted for coinbase={}…", &txid[..16.min(txid.len())]);
-                if let Some(e) = self.state.entries.iter_mut().find(|e| e.coinbase_txid == txid) {
+                info!("EscrowWatcher: claim accepted for coinbase={}…[{}]", &txid[..16.min(txid.len())], out_idx);
+                if let Some(e) = self.state.entries.iter_mut().find(|e| {
+                    e.coinbase_txid == txid && e.output_index == out_idx
+                }) {
                     e.claimed = true;
                 }
             }
             Some(err_msg) => {
-                if let Some(e) = self.state.entries.iter_mut().find(|e| e.coinbase_txid == txid) {
+                if let Some(e) = self.state.entries.iter_mut().find(|e| {
+                    e.coinbase_txid == txid && e.output_index == out_idx
+                }) {
                     // Retriable rejections: sequence-lock timing races and orphan/dag-reorg
                     // situations where the coinbase's block is off the selected chain.
                     // Any other rejection (double-spend, script failure) is a real slash.
@@ -249,14 +277,16 @@ impl EscrowWatcher {
                             e.orphan_slashed = false;
                             e.slashed = true;
                             debug!(
-                                "EscrowWatcher: coinbase={}… slashed after {} orphan retries",
+                                "EscrowWatcher: coinbase={}…[{}] slashed after {} orphan retries",
                                 &txid[..16.min(txid.len())],
+                                out_idx,
                                 e.orphan_retries
                             );
                         } else {
                             debug!(
-                                "EscrowWatcher: claim rejected for coinbase={}… (orphan, retry {}/{})",
+                                "EscrowWatcher: claim rejected for coinbase={}…[{}] (orphan, retry {}/{})",
                                 &txid[..16.min(txid.len())],
+                                out_idx,
                                 e.orphan_retries,
                                 MAX_ORPHAN_RETRIES
                             );
@@ -267,13 +297,14 @@ impl EscrowWatcher {
                         }
                     } else if is_seq_lock {
                         debug!(
-                            "EscrowWatcher: claim rejected for coinbase={}… (sequence lock, will retry)",
-                            &txid[..16.min(txid.len())]
+                            "EscrowWatcher: claim rejected for coinbase={}…[{}] (sequence lock, will retry)",
+                            &txid[..16.min(txid.len())],
+                            out_idx,
                         );
                     } else {
                         warn!(
-                            "EscrowWatcher: claim rejected for coinbase={}…: {}",
-                            &txid[..16.min(txid.len())], err_msg
+                            "EscrowWatcher: claim rejected for coinbase={}…[{}]: {}",
+                            &txid[..16.min(txid.len())], out_idx, err_msg
                         );
                         e.slashed = true;
                     }
@@ -297,6 +328,7 @@ impl EscrowWatcher {
 
         let sighash = compute_sighash(
             &coinbase_bytes,
+            entry.output_index,
             entry.amount_sompi,
             &self.escrow_script,
             self.payout_spk_version,
@@ -320,7 +352,7 @@ impl EscrowWatcher {
             inputs: vec![RpcTransactionInput {
                 previous_outpoint: Some(RpcOutpoint {
                     transaction_id: entry.coinbase_txid.clone(),
-                    index: 1,
+                    index: entry.output_index,
                 }),
                 signature_script: hex::encode(&sig_script),
                 sequence: CHALLENGE_WINDOW_BLOCKS,
@@ -488,6 +520,7 @@ fn build_p2pk_script(pubkey: &[u8; 32]) -> Vec<u8> {
 /// All sub-hashes use Blake2b-256 keyed with `b"TransactionSigningHash"`.
 fn compute_sighash(
     coinbase_txid: &[u8; 32],
+    output_index: u32,
     escrow_amount: u64,
     escrow_script: &[u8],
     payout_spk_version: u16,
@@ -501,7 +534,7 @@ fn compute_sighash(
     let prev_out_hash = {
         let mut h = new_h();
         h.update(coinbase_txid);
-        h.update(&1u32.to_le_bytes());
+        h.update(&output_index.to_le_bytes());
         h.finalize()
     };
 
@@ -539,7 +572,7 @@ fn compute_sighash(
     h.update(sigops_hash.as_bytes());
     // Input-specific:
     h.update(coinbase_txid); // prev_outpoint.transaction_id
-    h.update(&1u32.to_le_bytes()); // prev_outpoint.index
+    h.update(&output_index.to_le_bytes()); // prev_outpoint.index
     h.update(&0u16.to_le_bytes()); // utxo spk version = 0
     h.update(&(escrow_script.len() as u64).to_le_bytes()); // write_var_bytes len
     h.update(escrow_script); // write_var_bytes data
