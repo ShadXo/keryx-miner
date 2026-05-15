@@ -162,24 +162,45 @@ impl<'gpu> CudaGPUWorker<'gpu> {
         let minor = device.get_attribute(DeviceAttribute::ComputeCapabilityMinor)?;
         let _module: Arc<Module>;
         info!("Device #{} compute version is {}.{}", device_id, major, minor);
+
+        let load_ptx = |ptx, label: &str| {
+            Module::from_ptx(ptx, &[ModuleJitOption::OptLevel(OptLevel::O4)]).map_err(|e| {
+                error!("Failed to load {} PTX (driver too old?): {}", label, e);
+                e
+            })
+        };
+
+        // For sm_89 (Ada/RTX 40) and sm_100 (Blackwell/RTX 50), the PTX was compiled with
+        // CUDA 13.2 (PTX ISA 9.2) which requires driver >= 570. If the driver is older, we
+        // fall back to sm_86 (CUDA 12.0 / PTX 8.0, driver >= 520) which runs on all these
+        // architectures via NVIDIA's backward-compatible PTX JIT.
         if major >= 10 {
             // sm_100+ (RTX 50 / Blackwell and future)
-            _module = Arc::new(Module::from_ptx(PTX_100, &[ModuleJitOption::OptLevel(OptLevel::O4)]).map_err(|e| {
-                error!("Error loading PTX. Make sure you have the updated driver for you devices");
-                e
-            })?);
+            _module = Arc::new(match load_ptx(PTX_100, "sm_100") {
+                Ok(m) => {
+                    info!("GPU #{} using optimised sm_100 PTX", device_id);
+                    m
+                }
+                Err(e) => {
+                    info!("GPU #{} falling back to sm_86 PTX (update driver to 570+ for full Blackwell optimisation)", device_id);
+                    load_ptx(PTX_86, "sm_86 (fallback)").map_err(|_| e)?
+                }
+            });
         } else if major == 9 || (major == 8 && minor >= 9) {
             // sm_89 (RTX 40 / Ada Lovelace)
-            _module = Arc::new(Module::from_ptx(PTX_89, &[ModuleJitOption::OptLevel(OptLevel::O4)]).map_err(|e| {
-                error!("Error loading PTX. Make sure you have the updated driver for you devices");
-                e
-            })?);
+            _module = Arc::new(match load_ptx(PTX_89, "sm_89") {
+                Ok(m) => {
+                    info!("GPU #{} using optimised sm_89 PTX", device_id);
+                    m
+                }
+                Err(e) => {
+                    info!("GPU #{} falling back to sm_86 PTX (update driver to 570+ for full Ada Lovelace optimisation)", device_id);
+                    load_ptx(PTX_86, "sm_86 (fallback)").map_err(|_| e)?
+                }
+            });
         } else if major == 8 && minor >= 6 {
             // sm_86 (RTX 30 / Ampere)
-            _module = Arc::new(Module::from_ptx(PTX_86, &[ModuleJitOption::OptLevel(OptLevel::O4)]).map_err(|e| {
-                error!("Error loading PTX. Make sure you have the updated driver for you devices");
-                e
-            })?);
+            _module = Arc::new(load_ptx(PTX_86, "sm_86")?);
         } else if major > 7 || (major == 7 && minor >= 5) {
             // sm_75 (RTX 20 / Turing)
             _module = Arc::new(Module::from_ptx(PTX_75, &[ModuleJitOption::OptLevel(OptLevel::O4)]).map_err(|e| {

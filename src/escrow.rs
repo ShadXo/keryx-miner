@@ -356,6 +356,28 @@ impl EscrowWatcher {
     }
 }
 
+/// Load the OPoI escrow private key from `path`. Fails if the file does not exist.
+/// Used by --recover-escrow where generating a new key would silently query with the wrong pubkey.
+pub fn load_key(path: &str) -> Result<String, String> {
+    let p = std::path::Path::new(path);
+    if !p.exists() {
+        return Err(format!(
+            "Escrow key file '{}' not found. Run the miner once to generate it, or pass --escrow-key-file <path>.",
+            path
+        ));
+    }
+    let s = fs::read_to_string(p)
+        .map_err(|e| format!("Failed to read escrow key file '{}': {}", path, e))?;
+    let privkey = s.trim().to_string();
+    if privkey.len() != 64 || !privkey.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(format!(
+            "Escrow key file '{}' must contain exactly 64 hex chars",
+            path
+        ));
+    }
+    Ok(privkey)
+}
+
 /// Load the OPoI escrow private key from `path`, generating a new one if absent.
 /// The file contains exactly 64 lowercase hex characters (32-byte Schnorr private key).
 pub fn load_or_generate_key(path: &str) -> Result<String, String> {

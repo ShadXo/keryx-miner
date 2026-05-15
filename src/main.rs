@@ -153,10 +153,10 @@ async fn main() -> Result<(), Error> {
     // Must run before escrow key loading to avoid creating a new random key on disk.
     // Uses escrow.key to derive the pubkey — only claimable UTXOs are returned.
     if opt.recover_escrow {
-        let escrow_privkey = match escrow::load_or_generate_key(&opt.escrow_key_file) {
+        let escrow_privkey = match escrow::load_key(&opt.escrow_key_file) {
             Ok(k) => k,
             Err(e) => {
-                error!("--recover-escrow requires a valid escrow key at '{}': {}", opt.escrow_key_file, e);
+                error!("{}", e);
                 return Err(e.into());
             }
         };
