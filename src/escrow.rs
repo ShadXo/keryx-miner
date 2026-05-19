@@ -234,7 +234,7 @@ impl EscrowWatcher {
 
         match self.build_claim_tx(&entry) {
             Ok(tx) => {
-                info!(
+                debug!(
                     "EscrowWatcher: claiming escrow coinbase={}…[{}] (matured at daa {})",
                     &entry.coinbase_txid[..16.min(entry.coinbase_txid.len())],
                     entry.output_index,
