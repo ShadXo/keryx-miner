@@ -181,11 +181,25 @@ fn load_engine(spec: &'static ModelSpec) -> Result<SlmEngine> {
 
 // ── Inference ────────────────────────────────────────────────────────────────
 
+fn format_prompt(engine: &SlmEngine, prompt: &str) -> String {
+    match engine.name {
+        // LLaMA-3-based models (DeepSeek-R1-Distill-Llama-8B)
+        "deepseek-r1-8b" => format!(
+            "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\n{}<|eot_id|>\
+             <|start_header_id|>user<|end_header_id|>\n\n{}<|eot_id|>\
+             <|start_header_id|>assistant<|end_header_id|>\n\n",
+            SYSTEM_PROMPT, prompt
+        ),
+        // Zephyr/TinyLlama chat template
+        _ => format!(
+            "<|system|>\n{}</s>\n<|user|>\n{}</s>\n<|assistant|>\n",
+            SYSTEM_PROMPT, prompt
+        ),
+    }
+}
+
 fn generate(engine: &mut SlmEngine, prompt: &str, max_new_tokens: usize) -> Result<String> {
-    let formatted = format!(
-        "<|system|>\n{}</s>\n<|user|>\n{}</s>\n<|assistant|>\n",
-        SYSTEM_PROMPT, prompt
-    );
+    let formatted = format_prompt(engine, prompt);
     let enc = engine.tokenizer.encode(formatted.as_str(), true)
         .map_err(|e| anyhow!("encode: {}", e))?;
     let mut all_tokens: Vec<u32> = enc.get_ids().to_vec();
