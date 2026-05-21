@@ -131,7 +131,7 @@ fn ensure_gguf(spec: &ModelSpec) -> Result<(std::path::PathBuf, std::path::PathB
 
 fn load_engine(spec: &'static ModelSpec) -> Result<SlmEngine> {
     log::info!("SlmEngine: loading '{}'…", spec.name);
-    let device = Device::Cpu;
+    let device = Device::new_cuda(0).unwrap_or(Device::Cpu);
 
     match spec.format {
         ModelFormat::Safetensors => {
