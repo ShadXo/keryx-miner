@@ -1,0 +1,43 @@
+/target
+/target-cuda
+models/
+escrow.key
+escrow_state.json
+.env
+
+target-hive/
+target-hiveos/
+target-hiveos-amd/
+target-hiveos-*/
+target-offline-*/
+hiveos/dist/
+hiveos/dist-amd/
+hiveos/dist-*/
+
+# AMD/OpenCL build output + runtime state (build-amd.sh / package-amd.sh)
+/dist-amd/
+/dist-universal/
+/dist-pkg/
+/keryx-miner-supr-*-universal.tar.gz
+/amd-glibc-build.log
+
+# ── Internal notes — NEVER commit to this PUBLIC repo ──────────────────────
+# Handoff / static-memory / optimization / deployment notes can carry infra
+# secrets (server IPs, wallets, ntfy topics). They belong in local files only.
+# (Operator-mandated after the 2026-06-21 HANDOFF_OPTIMIZATION.md leak.)
+HANDOFF*.md
+*HANDOFF*.md
+*handoff*.md
+*_handoff*
+MEMORY.md
+*-memory.md
+*_memory.md
+OPTIMIZATION_*.md
+*_OPTIMIZATION.md
+DEPLOY_NOTES*.md
+/handoff/
+/memory/
+/.claude/
+
+# release archives (build artifacts — never commit)
+*-nvidia-release.zip
