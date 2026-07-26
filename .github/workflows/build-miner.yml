@@ -1,0 +1,128 @@
+name: build-miner
+
+# Manual trigger only — no builds on push.
+on:
+  workflow_dispatch:
+    inputs:
+      pom_sm_list:
+        description: "PoM PTX ladder (nvcc 12.2 supports up to sm_90)"
+        default: "90,89,86,80,75"
+      llama_archs:
+        description: "llama.cpp CUDA archs (CMake syntax)"
+        default: "86-real;89-real;89-virtual"
+      neutralize_nextgen_fatbin:
+        description: "Skip the stale nextgen fatbin (REQUIRED for RTX 40xx/50xx)"
+        type: boolean
+        default: true
+
+env:
+  # Must match the pin in build.rs. Bump both together.
+  LLAMA_TAG: b10015
+  IMAGE: nvidia/cuda:12.2.2-devel-ubuntu20.04
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350   # hosted-runner hard cap is 360
+
+    steps:
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: true
+          docker-images: false   # we need docker
+
+      - uses: actions/checkout@v4
+
+      # The llama engine only changes when LLAMA_TAG or the arch list changes,
+      # so cache the .so itself rather than the multi-GB build tree.
+      - name: Cache llama engine
+        id: llama
+        uses: actions/cache@v4
+        with:
+          path: dist/libkeryx-llama.so
+          key: llama-${{ env.LLAMA_TAG }}-${{ inputs.llama_archs }}-cuda1222
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            .cargo-home/registry
+            .cargo-home/git
+            target
+          key: cargo-${{ github.sha }}
+          restore-keys: cargo-
+
+      - name: Build
+        run: |
+          mkdir -p dist
+          NG=""
+          if [ "${{ inputs.neutralize_nextgen_fatbin }}" = "true" ]; then
+            NG="/dev/null"
+          fi
+          docker run --rm -v "$PWD":/src -w /src \
+            -e CARGO_HOME=/src/.cargo-home \
+            -e CARGO_TARGET_DIR=/src/target \
+            -e POM_SM_LIST="${{ inputs.pom_sm_list }}" \
+            -e KERYX_LLAMA_ARCHS="${{ inputs.llama_archs }}" \
+            -e POM_FATBIN_NEXTGEN="$NG" \
+            -e LLAMA_TAG="$LLAMA_TAG" \
+            "$IMAGE" bash -euo pipefail -c '
+              export DEBIAN_FRONTEND=noninteractive
+              apt-get update -qq
+              apt-get install -y -qq curl git build-essential pkg-config \
+                libssl-dev ca-certificates protobuf-compiler >/dev/null
+
+              # focal ships cmake 3.16; llama.cpp needs newer (same pin Keryx uses)
+              curl -sL https://github.com/Kitware/CMake/releases/download/v3.28.6/cmake-3.28.6-linux-x86_64.tar.gz \
+                | tar xz -C /opt
+              export PATH=/opt/cmake-3.28.6-linux-x86_64/bin:/usr/local/cuda/bin:$PATH
+              export CUDA_HOME=/usr/local/cuda
+              export NVCC=/usr/local/cuda/bin/nvcc
+              export PROTOC=/usr/bin/protoc
+              git config --global --add safe.directory "*"
+
+              curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs \
+                | sh -s -- -y --profile minimal --default-toolchain stable >/dev/null
+              . "$CARGO_HOME/env"
+              rustc -vV
+
+              # Cached engine from a previous run: skip the ~1-2h llama.cpp compile.
+              if [ -f dist/libkeryx-llama.so ]; then
+                echo "::notice::reusing cached libkeryx-llama.so"
+                export KERYX_LLAMA_SKIP=1
+              fi
+
+              # keryxopencl is not in the plugin whitelist in main.rs, so skip it
+              # (avoids needing OpenCL headers).
+              cargo build --release -p keryx-miner -p keryxcuda
+
+              strip target/release/keryx-miner
+              if [ -f target/release/libkeryx-llama.so ]; then
+                cp target/release/libkeryx-llama.so dist/
+              fi
+
+              mkdir -p pkg
+              cp target/release/keryx-miner pkg/
+              cp target/release/libkeryxcuda.so pkg/
+              cp dist/libkeryx-llama.so pkg/
+              ls -la pkg/
+            '
+          sudo chown -R "$(id -u):$(id -g)" .
+
+      - name: Record build inputs
+        run: |
+          {
+            echo "commit:      $(git rev-parse HEAD)"
+            echo "pom_sm_list: ${{ inputs.pom_sm_list }}"
+            echo "llama_archs: ${{ inputs.llama_archs }}"
+            echo "nextgen fatbin neutralized: ${{ inputs.neutralize_nextgen_fatbin }}"
+            echo "toolchain:   CUDA 12.2.2 / ubuntu20.04 (glibc 2.31)"
+          } > pkg/BUILDINFO.txt
+          ldd --version | head -1 >> pkg/BUILDINFO.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: keryx-miner-${{ github.sha }}
+          path: pkg/
+          retention-days: 14
