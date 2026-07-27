@@ -1,0 +1,171 @@
+[package]
+name = "keryx-miner-supr"
+version = "0.9.4"
+edition = "2021"
+license = "MIT/Apache-2.0"
+repository = "https://github.com/suprnova/keryx-miner-supr"
+readme = "README.md"
+description = "Suprnova fork of the Keryx GPU miner — native sm_120, no devfund tax, faster kernels."
+categories = ["command-line-utilities"]
+keywords = ["blockchain", "cli"]
+include = [
+    "src/**/*.rs",
+    "src/**/*.s",
+    "proto/**",
+    "Cargo.toml",
+    "Cargo.lock",
+    "build.rs",
+    "LICENSE-MIT",
+    "LICENSE-APACHE",
+    "README.md",
+]
+
+[dependencies]
+tonic = "0.8"
+tokio = { version = "1.17", features = ["macros", "rt-multi-thread", "net", "io-util", "signal"] }
+prost = "0.11"
+futures-util = "0.3"
+tokio-stream = {version = "0.1", features = ["net"]}
+once_cell = "1"
+num_cpus = "1"
+rand = "0.8"
+blake2b_simd = "1.0.0"
+clap = { version = "3.0", features = ["color", "derive"]}
+log = "0.4"
+env_logger = "0.9"
+keccak = { version = "0.1", optional = true }
+parking = { package = "parking_lot", version = "0.12", optional = true }
+libloading = "0.7"
+tokio-util = {version = "0.7.0", features = ["codec"]}
+serde_json = "1.0"
+serde_repr = "0.1"
+serde =  {version="1.0", features=["derive"]}
+futures = "0.3.21"
+bytes = "1.1.0"
+async-trait = "0.1"
+num = "0.4"
+nix = "0.25"
+# TCP keepalive on the stratum socket (SO_KEEPALIVE) — keeps NAT/firewall state
+# warm and detects a half-open pool socket fast. socket2 is already in the tree
+# transitively (via tokio/mio); pin it as a direct dep so we can set keepalive.
+socket2 = "0.5"
+hex = "0.4"
+# Proof-of-Model: possession proof construction (borsh wire-format must match the node).
+borsh = { version = "1", features = ["derive"] }
+blake3 = "1"
+opencl3 = { version = "0.6", optional = true }
+keryx-inference = { path = "inference" }
+keryx-plugin-api = { path = "plugin-api" }
+# Optional: compile the CUDA worker straight into the binary instead of loading
+# libkeryxcuda.so at runtime. Enabled by the `static-cuda` feature for a
+# single-file build (HiveOS). No cycle because keryxcuda now depends on
+# keryx-plugin-api, not on this package.
+keryxcuda = { path = "plugins/cuda", optional = true }
+secp256k1 = { version = "0.29.0", features = ["global-context"] }
+semver = "1.0"
+# Phase-3 OPoI: SLM inference via candle.
+# suprnova test-fork: dropped `features = ["cuda"]` so the binary builds on a CUDA-less
+# host. At runtime the miner already detects no-CUDA via `GpuProbe::NoCuda` and falls back
+# to CPU. Only matters for LLM inference on AiRequest tasks; per-share `tag_fixed` MLP is
+# baked in from `inference/` and works either way.
+candle-core = { version = "0.9" }
+candle-transformers = { version = "0.9" }
+candle-nn = { version = "0.9" }
+tokenizers = { version = "0.20", default-features = false, features = ["onig"] }
+ureq = { version = "2", features = ["tls"] }
+base64 = "0.22"
+anyhow = "1"
+time = { version = "0.3", features = ["formatting", "macros"] }
+flate2 = "1.0"
+tar = "0.4"
+zip = { version = "2", default-features = false, features = ["deflate"] }
+
+# Keep the library crate name as `keryx_miner` (not the default
+# `keryx_miner_supr` derived from the package name) so `use keryx_miner::*`
+# in src/* and `keryx_miner = { path = "../../", package = "keryx-miner-supr" }`
+# in the plugin manifests keep working without a sed-pass over the source tree.
+[lib]
+name = "keryx_miner"
+path = "src/lib.rs"
+
+[[bin]]
+name = "keryx-miner-supr"
+path = "src/main.rs"
+
+[features]
+default = ["parking_lot"]
+parking_lot = ["parking", "tokio/parking_lot"]
+bench = []
+no-asm = ["keccak"]
+# Single self-contained binary: link the CUDA worker in statically (no
+# libkeryxcuda.so to ship). Build with `cargo build --release --features static-cuda`.
+static-cuda = ["keryxcuda"]
+# AMD PoM: link the OpenCL search driver into the main binary (build-amd enables this).
+pom-opencl = ["dep:opencl3"]
+# NVIDIA PoM (full parity): upstream's candle-CUDA `pom_gpu` driver (per-tensor gather + zero-dup
+# VRAM sharing with the inference engine) + build.rs compiles src/pom_mine.cu -> PTX. Enables
+# candle's CUDA backend (candle 0.9 -> cudarc 0.16). AMD/default stays candle-CPU.
+pom-cuda = ["candle-core/cuda", "candle-nn/cuda", "candle-transformers/cuda"]
+# Apple Silicon PoM (Metal): the walk runs as a Metal compute kernel over a self-packed MTLBuffer
+# (Phase 3a) and OPoI inference runs via the in-process llama.cpp Metal engine (Phase 3b —
+# `libkeryx-llama.dylib` next to the binary). Phase 3d dropped `candle-core/metal` etc.: candle is
+# no longer used on the Metal build for either the walk or inference. `candle-metal-kernels` and
+# `objc2-metal` stay (see the macOS-only dependency table below) — those are the MTL wrappers
+# `pom_gpu_metal` uses directly, independent of `candle-core`. macOS-only — never combine with
+# pom-cuda, and never enable on Linux/Windows. Ultimate fallback: if `libkeryx-llama.dylib` isn't
+# next to the binary, `slm::inference_device()` returns `Device::Cpu` so candle-CPU inference is
+# still available (slow, but never crashes for lack of a GPU inference path).
+pom-metal = []
+
+[target.'cfg(target_os = "windows")'.dependencies]
+keccak = "0.1"
+kernel32-sys = "0.2"
+win32console = "0.1"
+
+# Apple Silicon: the keccakf1600 asm is x86_64-only (build.rs), so ARM64 macOS uses the pure-Rust
+# keccak crate instead. Present on any non-x86_64, non-Windows target (i.e. aarch64-darwin).
+[target.'cfg(all(not(target_arch = "x86_64"), not(target_os = "windows")))'.dependencies]
+keccak = "0.1"
+
+# Stratum telemetry (mining.hello/mining.telemetry) GPU enumeration: NVML per-GPU
+# model/vram/driver/temp/power/clock. Same 0.12 the CUDA plugin already vendors, so no new
+# offline-vendor entry. dlopens libnvidia-ml at runtime → Nvml::init() returns Err gracefully on
+# AMD/CUDA-less hosts (telemetry GPU block is best-effort). Not on macOS (no NVIDIA there).
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+nvml-wrapper = "0.12"
+
+# macOS-only Metal plumbing for the PoM walk kernel: candle's Metal-buffer wrappers
+# (candle-metal-kernels re-exports the objc2-metal handles candle itself holds) + the raw
+# objc2-metal protocol traits. Compiled only on macOS; unused unless `pom-metal` is on.
+[target.'cfg(target_os = "macos")'.dependencies]
+candle-metal-kernels = "0.9"
+objc2-metal = "0.3"
+
+[profile.release]
+lto = true
+codegen-units = 1
+
+[build-dependencies]
+tonic-build = { version = "0.8", default-features = false, features = ["prost", "transport"] }
+cc = "1"
+time = { version = "0.3", features = ["formatting"] }
+
+[dev-dependencies]
+sha3 = { git = "https://github.com/elichai/hashes", branch = "cSHAKE" }
+
+[workspace]
+members = ["inference", "plugin-api", "plugins/*"]
+default-members = [".", "plugins/cuda", "plugins/opencl"]
+
+# Vendored candle-kernels with a one-line build.rs patch: the OPoI inference PTX
+# (build_ptx) is emitted at CUDA_COMPUTE_CAP (we ship 70 → forward-JITs sm_70→
+# sm_120, the whole fleet), while the dead-code MOE WMMA FFI lib (build_lib) is
+# pinned to sm_80 because its bf16 tensor-core fragments won't compile below 80.
+# Stock candle-kernels uses ONE compute_cap for both, which forced the floor to
+# sm_80 and broke GPU inference on Volta/Turing. See vendor/candle-kernels/build.rs.
+[patch.crates-io]
+candle-kernels = { path = "vendor/candle-kernels" }
+# vendor/candle-core removed in Phase 3d: it existed only to add `QTensor::metal_storage()` for
+# the macOS PoM walk's zero-dup borrow of candle's resident MTLBuffers. Phase 3a switched the walk
+# to a self-packed MTLBuffer, and Phase 3d dropped candle-core/metal from `pom-metal` entirely, so
+# the vendored patch was dead code. Everyone now uses stock candle-core 0.9.2 from crates.io.
