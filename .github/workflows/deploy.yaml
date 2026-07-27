@@ -1,8 +1,9 @@
-name: Publish release assets
+name: Build and upload assets
 
-# Replaces the old deploy.yaml, which could never have run: it targeted the retired
-# ubuntu-18.04 runner, built kaspa-miner packages, and used the archived
-# actions/upload-release-asset@v1.
+# Same name and path as the original, rewritten because that version could never have
+# run: it targeted the retired ubuntu-18.04 runner, built kaspa-miner packages, and used
+# the archived actions/upload-release-asset@v1. Keeping the path also means a future
+# upstream edit to deploy.yaml surfaces as an ordinary conflict on a file we own.
 #
 # Rather than duplicate the build logic, this calls the two build workflows and attaches
 # what they produce to the release. Both are built as `native` so the published binaries
