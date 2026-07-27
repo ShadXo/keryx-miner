@@ -12,9 +12,10 @@ on:
 
 env:
   LLAMA_TAG: b10015
-  # CUDA 12.2 rejects the cl.exe on current windows images, so this line is newer
-  # than the Linux build's. Resulting PTX wants a ~r555+ driver.
-  CUDA_VERSION: "12.9.1"
+  # CUDA 12.2 rejects the cl.exe on current windows images, so this is newer than
+  # the Linux build's. Keep it <= the CUDA version your Windows driver reports, or
+  # the kernels fail to load. Two-digit form resolves to the latest patch release.
+  CUDA_VERSION: "12.8"
 
 jobs:
   build:
@@ -29,11 +30,13 @@ jobs:
       - uses: ilammy/msvc-dev-cmd@v1   # puts cl.exe on PATH for nvcc
 
       - name: Install CUDA
-        uses: Jimver/cuda-toolkit@v0.2.19
+        uses: Jimver/cuda-toolkit@v0.2.35
         with:
           cuda: ${{ env.CUDA_VERSION }}
           method: network
-          # llama.cpp's CUDA backend needs the cublas dev libs, not just nvcc
+          # NOTE: sub-packages is documented as Linux+network only, so this is likely
+          # ignored on Windows and you get the full toolkit (~4 GB). If disk runs out,
+          # that is the first thing to attack.
           sub-packages: '["nvcc","cudart","cublas","cublas_dev","curand","curand_dev","thrust","visual_studio_integration"]'
 
       - uses: arduino/setup-protoc@v3
