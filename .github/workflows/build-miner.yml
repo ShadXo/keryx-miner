@@ -58,7 +58,10 @@ jobs:
           mkdir -p dist
           NG=""
           if [ "${{ inputs.neutralize_nextgen_fatbin }}" = "true" ]; then
-            NG="/dev/null"
+            # Must be a path that does NOT exist: build.rs fs::copy()s the file if
+            # it exists (and fs::copy rejects /dev/null), and only writes the empty
+            # placeholder we want when the path is missing.
+            NG="/src/cuda/__no_nextgen.fatbin"
           fi
           docker run --rm -v "$PWD":/src -w /src \
             -e CARGO_HOME=/src/.cargo-home \
