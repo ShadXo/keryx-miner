@@ -15,7 +15,7 @@ env:
   # CUDA 12.2 rejects the cl.exe on current windows images, so this is newer than
   # the Linux build's. Keep it <= the CUDA version your Windows driver reports, or
   # the kernels fail to load. Two-digit form resolves to the latest patch release.
-  CUDA_VERSION: "12.8"
+  CUDA_VERSION: "12.8.1"
 
 jobs:
   build:
