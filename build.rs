@@ -222,6 +222,11 @@ fn build_keryx_llama(nvcc: &str) -> Result<(), Box<dyn std::error::Error>> {
             .arg(format!("-L{}", cuda_home.join("lib64/stubs").display()))
             .arg(format!("-L{}", cuda_home.join("targets/x86_64-linux/lib/stubs").display()))
             .args(["-lcuda", "-lpthread", "-ldl"])
+            // Resolve libcudart.so.12 / libcublas.so.12 from the directory this .so lives in,
+            // so a package that bundles them works without the operator setting
+            // LD_LIBRARY_PATH. Mining rigs typically ship only the driver, not the CUDA
+            // runtime, and a failed dlopen here silently costs PoM its zero-dup gather.
+            .arg("-Wl,-rpath,$ORIGIN")
             .arg("-o").arg(&so),
     )?;
     Ok(())
