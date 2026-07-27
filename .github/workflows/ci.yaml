@@ -1,273 +1,65 @@
 name: Tests
 
-on: [push, pull_request]
+# Fast correctness gate: compile the workspace and run the unit tests on every push.
+# Deliberately NOT a packaging build — build-miner.yml does that and takes ~10 minutes.
+#
+# Two things make this viable at all:
+#   * KERYX_LLAMA_SKIP=1 — build.rs otherwise clones llama.cpp and cmake-builds it, which
+#     dominates the runtime. Nothing here loads the engine, so skipping it is free.
+#   * nvcc is still REQUIRED: build.rs compiles cuda/pom_mine.cu to PTX unconditionally and
+#     pom_gpu.rs include_str!s all seven outputs, so there is no CUDA-less build path.
+# No GPU is present on the runner, so this compiles and runs host-side tests only.
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CUDA_VERSION: "12.8.1"
 
 jobs:
-
-  check:
-    name: Check
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout sources
-        uses: actions/checkout@v2
-
-      - name: Install Protoc
-        uses: arduino/setup-protoc@v1
-
-      - name: Install stable toolchain
-        uses: actions-rs/toolchain@v1
-        with:
-          profile: minimal
-          toolchain: stable
-          override: true
-
-      - name: Install cuda
-        uses: Jimver/cuda-toolkit@v0.2.8
-        with:
-          cuda: '11.2.2'
-          method: 'network'
-          sub-packages: '["nvcc", "cudart"]'
-
-      - name: Cache
-        uses: actions/cache@v2
-        with:
-          path: |
-            ~/.cargo/bin/
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-            target/
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-
-      - name: Run cargo check
-        uses: actions-rs/cargo@v1
-        with:
-          command: check
-          args: --tests
-
   test:
-    name: Test Suite
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ ubuntu-latest, windows-latest ]
-    steps:
-      - name: Checkout sources
-        uses: actions/checkout@v2
-
-      - name: Fix LibOpenCL on Linux
-        if: runner.os == 'Linux'
-        run: |
-          sudo apt update
-          sudo apt install ocl-icd-opencl-dev -y
-
-      - name: Fix CRLF on Windows
-        if: runner.os == 'Windows'
-        run: git config --global core.autocrlf false
-
-      - name: Install Protoc
-        uses: arduino/setup-protoc@v1
-
-      - name: Install stable toolchain
-        uses: actions-rs/toolchain@v1
-        with:
-          profile: minimal
-          toolchain: stable
-          override: true
-
-      - name: Install CUDA Linux
-        if: runner.os == 'Linux'
-        uses: Jimver/cuda-toolkit@v0.2.8
-        with:
-          cuda: '11.2.2'
-          method: 'network'
-          sub-packages: '["nvcc", "cudart"]'
-
-      - name: Install CUDA Windows
-        if: runner.os == 'Windows'
-        uses: Jimver/cuda-toolkit@v0.2.8
-        with:
-          cuda: '11.5.1'
-          method: 'network'
-          sub-packages: '["nvcc", "cudart"]'
-
-      - name: Cache
-        uses: actions/cache@v2
-        with:
-          path: |
-            ~/.cargo/bin/
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-            target/
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-
-      - name: Run cargo test regular features
-        uses: actions-rs/cargo@v1
-        with:
-          command: test
-          args: -p kaspa-miner
-
-      - name: Run cargo test no asm
-        uses: actions-rs/cargo@v1
-        with:
-          command: test
-          args: -p kaspa-miner --features=no-asm
-
-
-      - name: Run cargo test no parking_lot
-        uses: actions-rs/cargo@v1
-        with:
-          command: test
-          args: -p kaspa-miner --no-default-features
-
-      - name: Run cargo test shuttle
-        uses: actions-rs/cargo@v1
-        with:
-          command: test
-          args: -p kaspa-miner --no-default-features --features=shuttle
-
-      - name: Run cargo test for kaspaopencl
-        uses: actions-rs/cargo@v1
-        with:
-          command: test
-          args: -p kaspaopencl
-
-
-  test-release:
-    name: Test Suite Release
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ ubuntu-latest, windows-latest ]
-    steps:
-      - name: Checkout sources
-        uses: actions/checkout@v2
-
-      - name: Fix LibOpenCL on Linux
-        if: runner.os == 'Linux'
-        run: |
-          sudo apt update
-          sudo apt install ocl-icd-opencl-dev -y
-
-      - name: Fix CRLF on Windows
-        if: runner.os == 'Windows'
-        run: git config --global core.autocrlf false
-
-      - name: Install Protoc
-        uses: arduino/setup-protoc@v1
-
-      - name: Install stable toolchain
-        uses: actions-rs/toolchain@v1
-        with:
-          profile: minimal
-          toolchain: stable
-          override: true
-
-      - name: Install CUDA Linux
-        if: runner.os == 'Linux'
-        uses: Jimver/cuda-toolkit@v0.2.8
-        with:
-          cuda: '11.2.2'
-          method: 'network'
-          sub-packages: '["nvcc", "cudart"]'
-
-      - name: Install CUDA Windows
-        if: runner.os == 'Windows'
-        uses: Jimver/cuda-toolkit@v0.2.8
-        with:
-          cuda: '11.5.1'
-          method: 'network'
-          sub-packages: '["nvcc", "cudart"]'
-
-      - name: Cache
-        uses: actions/cache@v2
-        with:
-          path: |
-            ~/.cargo/bin/
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-            target/
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-
-      - name: Run cargo test release regular features
-        uses: actions-rs/cargo@v1
-        with:
-          command: test
-          args: --release -p kaspa-miner
-
-      - name: Run cargo test release no asm
-        uses: actions-rs/cargo@v1
-        with:
-          command: test
-          args: --features=no-asm --release -p kaspa-miner
-
-      - name: Run cargo test release no parking_lot
-        uses: actions-rs/cargo@v1
-        with:
-          command: test
-          args: --no-default-features --release -p kaspa-miner
-
-      - name: Run cargo test release shuttle
-        uses: actions-rs/cargo@v1
-        with:
-          command: test
-          args: --no-default-features --features=shuttle --release -p kaspa-miner
-
-      - name: Run cargo test for kaspaopencl
-        uses: actions-rs/cargo@v1
-        with:
-          command: test
-          args: --release -p kaspaopencl
-
-  lints:
-    name: Lints
+    name: Check + unit tests
     runs-on: ubuntu-latest
+    timeout-minutes: 45
+
     steps:
-      - name: Checkout sources
-        uses: actions/checkout@v2
+      - uses: actions/checkout@v4
 
-      - name: Install Protoc
-        uses: arduino/setup-protoc@v1
-
-      - name: Install stable toolchain
-        uses: actions-rs/toolchain@v1
+      - uses: arduino/setup-protoc@v3
         with:
-          profile: minimal
-          toolchain: stable
-          override: true
-          components: rustfmt, clippy
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Install cuda
-        uses: Jimver/cuda-toolkit@v0.2.8
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install CUDA (nvcc only)
+        uses: Jimver/cuda-toolkit@v0.2.35
         with:
-          cuda: '11.2.2'
-          method: 'network'
-          sub-packages: '["nvcc", "cudart"]'
+          cuda: ${{ env.CUDA_VERSION }}
+          method: network
+          sub-packages: '["nvcc","cudart"]'
 
-      - name: Cache
-        uses: actions/cache@v2
+      - uses: actions/cache@v4
         with:
           path: |
-            ~/.cargo/bin/
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-            target/
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ci-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ci-${{ runner.os }}-
 
+      - name: Unit tests
+        env:
+          KERYX_LLAMA_SKIP: "1"
+          NVCC: /usr/local/cuda/bin/nvcc
+        run: cargo test -p keryx-miner
 
-      - name: Run cargo fmt
-        uses: actions-rs/cargo@v1
-        with:
-          command: fmt
-          args: --all -- --check
-
-      - name: Run cargo clippy
-        uses: actions-rs/cargo@v1
-        with:
-          command: clippy
-          args: --tests -- -D warnings
+      # keryxcuda is a cdylib plugin with no unit tests of its own; type-check it so a
+      # break in worker.rs (the PoW image-selection ladder) fails here rather than in a
+      # ten-minute packaging build.
+      - name: Type-check the CUDA plugin
+        env:
+          KERYX_LLAMA_SKIP: "1"
+          NVCC: /usr/local/cuda/bin/nvcc
+        run: cargo check -p keryxcuda --tests

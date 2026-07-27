@@ -3,9 +3,14 @@ name: build-miner
 on:
   workflow_dispatch:
     inputs:
+      # Matches build.rs's own default. 89-virtual PTX only JITs FORWARD, so dropping
+      # 75-real/80-real leaves Turing and A100 with no loadable llama image at all — no OPoI
+      # inference, and PoM uploads its own weight copy instead of the zero-dup gather.
+      # Narrow it deliberately (e.g. "86-real;89-real;89-virtual") for a faster, smaller
+      # build when you know the target fleet.
       llama_archs:
-        description: "llama.cpp CUDA archs (CMake syntax)"
-        default: "86-real;89-real;89-virtual"
+        description: "llama.cpp CUDA archs (CMake syntax). Narrow it to shrink the build if your fleet has no Turing/A100."
+        default: "75-real;80-real;86-real;89-real;89-virtual"
       nextgen_kernel:
         description: "How RTX 40xx/50xx get the new PoM kernel"
         type: choice

@@ -6,9 +6,12 @@ name: build-miner-windows
 on:
   workflow_dispatch:
     inputs:
+      # Matches build.rs's own default — see the note in build-miner.yml: 89-virtual PTX
+      # JITs forward only, so omitting 75-real/80-real leaves Turing and A100 unable to
+      # load the llama engine at all.
       llama_archs:
-        description: "llama.cpp CUDA archs (CMake syntax)"
-        default: "86-real;89-real;89-virtual"
+        description: "llama.cpp CUDA archs (CMake syntax). Narrow it to shrink the build if your fleet has no Turing/A100."
+        default: "75-real;80-real;86-real;89-real;89-virtual"
       nextgen_kernel:
         description: "How RTX 40xx/50xx get the new PoM kernel"
         type: choice
