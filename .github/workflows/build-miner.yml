@@ -145,7 +145,6 @@ jobs:
               cp target/release/keryx-miner pkg/
               cp target/release/libkeryxcuda.so pkg/
               cp dist/libkeryx-llama.so pkg/
-              cp Cargo.lock pkg/
               # Must be sampled INSIDE the container: the "Record build inputs" step
               # runs on the ubuntu-latest host, whose glibc (2.39) is not what these
               # binaries were linked against and wrongly implies HiveOS breakage.

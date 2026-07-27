@@ -99,13 +99,24 @@ jobs:
           Copy-Item target\release\keryx-miner.exe pkg\
           Copy-Item target\release\keryxcuda.dll   pkg\
           Copy-Item target\release\keryx-llama.dll pkg\
-          Copy-Item Cargo.lock pkg\
           # cudart is linked statically by nvcc, but cublas is not - ship the
           # redist DLLs so the box doesn't need a CUDA toolkit installed.
           Copy-Item "$env:CUDA_PATH\bin\cublas64_12.dll"   pkg\ -ErrorAction SilentlyContinue
           Copy-Item "$env:CUDA_PATH\bin\cublasLt64_12.dll" pkg\ -ErrorAction SilentlyContinue
           Copy-Item "$env:CUDA_PATH\bin\curand64_10.dll"   pkg\ -ErrorAction SilentlyContinue
           Get-ChildItem pkg
+
+      # Mirrors the Linux job's BUILDINFO.txt so both packages record what produced them.
+      - name: Record build inputs
+        shell: pwsh
+        run: |
+          @(
+            "commit:         $(git rev-parse HEAD)"
+            "nextgen kernel: ${{ inputs.nextgen_kernel }}"
+            "llama archs:    ${{ inputs.llama_archs }}"
+            "toolchain:      CUDA $env:CUDA_VERSION / windows-2022 MSVC"
+          ) | Set-Content pkg\BUILDINFO.txt -Encoding utf8
+          Get-Content pkg\BUILDINFO.txt
 
       - uses: actions/upload-artifact@v4
         with:
