@@ -149,7 +149,11 @@ jobs:
               # Must be sampled INSIDE the container: the "Record build inputs" step
               # runs on the ubuntu-latest host, whose glibc (2.39) is not what these
               # binaries were linked against and wrongly implies HiveOS breakage.
-              ldd --version | head -1 > pkg/.glibc
+              # No pipe here on purpose — this script runs under `set -o pipefail`,
+              # and `ldd --version | head -1` exits 141 when head closes the pipe.
+              ldd --version > pkg/.glibc.tmp 2>&1
+              head -1 pkg/.glibc.tmp > pkg/.glibc
+              rm -f pkg/.glibc.tmp
               ls -la pkg/
             '
           sudo chown -R "$(id -u):$(id -g)" .
