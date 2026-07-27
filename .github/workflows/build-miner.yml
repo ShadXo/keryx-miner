@@ -145,28 +145,9 @@ jobs:
               cp target/release/keryx-miner pkg/
               cp target/release/libkeryxcuda.so pkg/
               cp dist/libkeryx-llama.so pkg/
-              # Must be sampled INSIDE the container: the "Record build inputs" step
-              # runs on the ubuntu-latest host, whose glibc (2.39) is not what these
-              # binaries were linked against and wrongly implies HiveOS breakage.
-              # No pipe here on purpose — this script runs under `set -o pipefail`,
-              # and `ldd --version | head -1` exits 141 when head closes the pipe.
-              ldd --version > pkg/.glibc.tmp 2>&1
-              head -1 pkg/.glibc.tmp > pkg/.glibc
-              rm -f pkg/.glibc.tmp
               ls -la pkg/
             '
           sudo chown -R "$(id -u):$(id -g)" .
-
-      - name: Record build inputs
-        run: |
-          {
-            echo "commit:         $(git rev-parse HEAD)"
-            echo "nextgen kernel: ${{ inputs.nextgen_kernel }}"
-            echo "llama archs:    ${{ inputs.llama_archs }}"
-            echo "toolchain:      CUDA 12.2.2 / ubuntu20.04"
-            echo "build glibc:    $(cat pkg/.glibc)"
-          } > pkg/BUILDINFO.txt
-          rm -f pkg/.glibc
 
       - uses: actions/upload-artifact@v4
         with:
