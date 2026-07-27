@@ -73,7 +73,8 @@ jobs:
           '
           sudo chown "$(id -u):$(id -g)" keryx-nextgen.fatbin keryx-cuda-sm120.ptx
           ls -la keryx-nextgen.fatbin keryx-cuda-sm120.ptx
-          head -3 keryx-cuda-sm120.ptx | tail -1
+          # Must read 8.7 (CUDA 12.8). 8.8 means the wrong toolkit and no r570 support.
+          grep -m1 '^\.version' keryx-cuda-sm120.ptx
 
       - uses: actions/upload-artifact@v4
         with:

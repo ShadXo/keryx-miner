@@ -66,6 +66,40 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "nvcc -fatbin failed" }
           Get-Item pom_mine_nextgen.fatbin | Select-Object Name,Length
 
+      # Same treatment for the PoW (KeryxHash) plugin. Its COMMITTED resources are built with
+      # CUDA 12.9, so keryx-cuda-sm120.ptx is ISA 8.8 and needs driver r575+; on r570 a
+      # Blackwell card fails every nextgen image and the loader walks down to JIT'd sm_86.
+      # The runner's 12.8 toolkit emits ISA 8.7 plus native SASS that r570 accepts.
+      # Arch set mirrors the committed fatbin exactly: ptx_89 sass_89 sass_90 sass_100 sass_120.
+      # NOTE: every -gencode value is quoted — PowerShell would otherwise try to read the
+      # comma as an array separator.
+      - name: Compile PoW nextgen fatbin + sm_120 PTX
+        if: inputs.nextgen_kernel == 'native'
+        shell: pwsh
+        run: |
+          $nvcc = "$env:CUDA_PATH\bin\nvcc.exe"
+          $src  = "plugins\cuda\kaspa-cuda-native\src"
+          Push-Location $src
+          & $nvcc -fatbin -O3 `
+            -gencode "arch=compute_89,code=[compute_89,sm_89]" `
+            -gencode "arch=compute_90,code=sm_90" `
+            -gencode "arch=compute_100,code=sm_100" `
+            -gencode "arch=compute_120,code=sm_120" `
+            kaspa-cuda.cu -o keryx-nextgen.fatbin
+          if ($LASTEXITCODE -ne 0) { Pop-Location; throw "nvcc -fatbin (PoW) failed" }
+          & $nvcc -ptx -O3 -arch=compute_120 kaspa-cuda.cu -o keryx-cuda-sm120.ptx
+          if ($LASTEXITCODE -ne 0) { Pop-Location; throw "nvcc -ptx (PoW) failed" }
+          Pop-Location
+          # worker.rs include_bytes!/include_str!s these from the source tree, so overwriting
+          # them before cargo build is what swaps in the r570-compatible images.
+          Copy-Item "$src\keryx-nextgen.fatbin" plugins\cuda\resources\keryx-nextgen.fatbin -Force
+          Copy-Item "$src\keryx-cuda-sm120.ptx" plugins\cuda\resources\keryx-cuda-sm120.ptx -Force
+          Get-Item plugins\cuda\resources\keryx-nextgen.fatbin, plugins\cuda\resources\keryx-cuda-sm120.ptx |
+            Select-Object Name,Length
+          # Must read 8.7 (CUDA 12.8). 8.8 would mean the wrong toolkit and no r570 support.
+          Select-String -Path plugins\cuda\resources\keryx-cuda-sm120.ptx -Pattern '^\.version' |
+            Select-Object -First 1 -ExpandProperty Line
+
       - uses: dtolnay/rust-toolchain@stable
 
       - name: Cache cargo
@@ -101,9 +135,15 @@ jobs:
           Copy-Item target\release\keryx-llama.dll pkg\
           # cudart is linked statically by nvcc, but cublas is not - ship the
           # redist DLLs so the box doesn't need a CUDA toolkit installed.
-          Copy-Item "$env:CUDA_PATH\bin\cublas64_12.dll"   pkg\ -ErrorAction SilentlyContinue
-          Copy-Item "$env:CUDA_PATH\bin\cublasLt64_12.dll" pkg\ -ErrorAction SilentlyContinue
-          Copy-Item "$env:CUDA_PATH\bin\curand64_10.dll"   pkg\ -ErrorAction SilentlyContinue
+          # keryx-llama.dll cannot load without cublas/cublasLt, and a silently missing DLL
+          # only shows up as a runtime load failure on the miner, so fail the build instead.
+          foreach ($dll in @('cublas64_12.dll','cublasLt64_12.dll')) {
+            $p = Join-Path $env:CUDA_PATH "bin\$dll"
+            if (-not (Test-Path $p)) { throw "required redist DLL missing: $p" }
+            Copy-Item $p pkg\
+          }
+          # curand is not in keryx-llama.dll's import table; ship it if present, no more.
+          Copy-Item "$env:CUDA_PATH\bin\curand64_10.dll" pkg\ -ErrorAction SilentlyContinue
           Get-ChildItem pkg
 
       - uses: actions/upload-artifact@v4
