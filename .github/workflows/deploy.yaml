@@ -27,14 +27,16 @@ jobs:
     uses: ./.github/workflows/build-miner.yml
     with:
       nextgen_kernel: native
-      # ON for releases: a downloader is far likelier to have a bare driver than the
-      # full CUDA toolkit, and without these libkeryx-llama.so cannot load.
-      bundle_cuda_runtime: true
+      # OFF on Linux. The miner auto-installs the CUDA libs via apt on first run, and
+      # a host that cannot use apt can dispatch build-miner.yml with the flag on.
+      bundle_cuda_runtime: false
 
   windows:
     uses: ./.github/workflows/build-miner-windows.yml
     with:
       nextgen_kernel: native
+      # ON on Windows: there is no apt fallback there, and a box with only the NVIDIA
+      # driver has no cublas, so keryx-llama.dll could not load without these.
       bundle_cuda_runtime: true
 
   publish:
