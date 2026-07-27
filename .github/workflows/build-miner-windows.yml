@@ -26,6 +26,20 @@ on:
         type: boolean
         default: true
 
+  # Mirrors the dispatch inputs so release.yaml can reuse this build. nextgen_kernel is
+  # `string` here because workflow_call has no `choice` type.
+  workflow_call:
+    inputs:
+      llama_archs:
+        type: string
+        default: "75-real;80-real;86-real;89-real;89-virtual"
+      nextgen_kernel:
+        type: string
+        default: ptx
+      bundle_cuda_runtime:
+        type: boolean
+        default: true
+
 env:
   LLAMA_TAG: b10015
   # CUDA 12.2 rejects the cl.exe on current windows images, so this is newer than
