@@ -26,7 +26,7 @@ on:
         type: boolean
         default: true
 
-  # Mirrors the dispatch inputs so release.yaml can reuse this build. nextgen_kernel is
+  # Mirrors the dispatch inputs so deploy.yaml can reuse this build. nextgen_kernel is
   # `string` here because workflow_call has no `choice` type.
   workflow_call:
     inputs:
