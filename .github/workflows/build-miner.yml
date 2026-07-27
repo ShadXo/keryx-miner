@@ -21,7 +21,7 @@ on:
         type: boolean
         default: false
 
-  # Lets release.yaml reuse this build instead of duplicating it. Inputs must mirror the
+  # Lets deploy.yaml reuse this build instead of duplicating it. Inputs must mirror the
   # workflow_dispatch set above; note nextgen_kernel is `string` here because workflow_call
   # has no `choice` type.
   workflow_call:
