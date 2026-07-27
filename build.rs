@@ -142,22 +142,37 @@ fn build_keryx_llama(nvcc: &str) -> Result<(), Box<dyn std::error::Error>> {
     // to newer architectures such as Blackwell. Override for machine-specific builds.
     let archs = env::var("KERYX_LLAMA_ARCHS")
         .unwrap_or_else(|_| "75-real;80-real;86-real;89-real;89-virtual".to_string());
+    let mut cfg = std::process::Command::new("cmake");
+    cfg.arg("-S").arg(&src)
+        .arg("-B").arg(&build_dir)
+        .args([
+            "-DGGML_CUDA=ON",
+            &format!("-DCMAKE_CUDA_ARCHITECTURES={archs}"),
+            "-DBUILD_SHARED_LIBS=OFF",
+            "-DCMAKE_POSITION_INDEPENDENT_CODE=ON",
+            "-DLLAMA_CURL=OFF",
+            "-DGGML_NATIVE=OFF",
+            // No-AVX CPU baseline (mirrors hiveos/build-keryx-llama.sh): BMI2/AVX code
+            // traps with SIGILL on pre-Haswell CPUs, and the CPU path is only a fallback —
+            // GPU inference is unaffected by these flags.
+            "-DGGML_AVX=OFF",
+            "-DGGML_AVX2=OFF",
+            "-DGGML_FMA=OFF",
+            "-DGGML_F16C=OFF",
+            "-DGGML_BMI2=OFF",
+            "-DGGML_CUDA_NCCL=OFF",
+            "-DCMAKE_BUILD_TYPE=Release",
+            &format!("-DCMAKE_CUDA_COMPILER={nvcc}"),
+        ]);
+    if env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
+        // -march=nehalem pins a no-AVX/no-BMI ISA baseline for everything the GGML guards
+        // miss (and for toolchains whose default baseline is above x86-64). MSVC has no
+        // -march and defaults to SSE2, so Windows needs no pin.
+        cfg.args(["-DCMAKE_C_FLAGS=-march=nehalem", "-DCMAKE_CXX_FLAGS=-march=nehalem"]);
+    }
     run(
         "cmake configure of llama.cpp (if it cannot detect a GPU, set KERYX_LLAMA_ARCHS explicitly)",
-        std::process::Command::new("cmake")
-            .arg("-S").arg(&src)
-            .arg("-B").arg(&build_dir)
-            .args([
-                "-DGGML_CUDA=ON",
-                &format!("-DCMAKE_CUDA_ARCHITECTURES={archs}"),
-                "-DBUILD_SHARED_LIBS=OFF",
-                "-DCMAKE_POSITION_INDEPENDENT_CODE=ON",
-                "-DLLAMA_CURL=OFF",
-                "-DGGML_NATIVE=OFF",
-                "-DGGML_CUDA_NCCL=OFF",
-                "-DCMAKE_BUILD_TYPE=Release",
-                &format!("-DCMAKE_CUDA_COMPILER={nvcc}"),
-            ]),
+        &mut cfg,
     )?;
     let jobs = env::var("NUM_JOBS").unwrap_or_else(|_| "8".to_string());
     run(
@@ -203,7 +218,9 @@ fn build_keryx_llama(nvcc: &str) -> Result<(), Box<dyn std::error::Error>> {
     run(
         "link of libkeryx-llama.so",
         std::process::Command::new("g++")
-            .args(["-O2", "-std=c++17", "-shared", "-fPIC", "-fopenmp", "tools/keryx-llama/keryx_llama.cpp"])
+            // -march=nehalem: same no-AVX/no-BMI baseline as the static libs (WRAPFLAGS in
+            // hiveos/build-keryx-llama.sh) so the wrapper itself cannot SIGILL pre-Haswell.
+            .args(["-O2", "-std=c++17", "-march=nehalem", "-shared", "-fPIC", "-fopenmp", "tools/keryx-llama/keryx_llama.cpp"])
             .arg("-I").arg(src.join("include"))
             .arg("-I").arg(src.join("ggml/include"))
             .arg("-I").arg(src.join("src"))

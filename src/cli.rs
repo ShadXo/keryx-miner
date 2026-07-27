@@ -41,6 +41,16 @@ pub struct Opt {
     pub very_high: bool,
 
     #[clap(
+        long = "force-model",
+        value_name = "TIER[,TIER...]",
+        help = "Force the model tier per GPU (CUDA-driver order, CSV): e.g. --force-model light,very-high \
+                → GPU0=light, GPU1=very-high. Names: very-light|light|default|high|very-high. Bypasses the \
+                per-card VRAM check (an undersized card will OOM); unlisted/extra cards keep auto best-fit.",
+        help_heading = "OPoI / Inference"
+    )]
+    pub force_model: Option<String>,
+
+    #[clap(
         long = "ipfs-url",
         help = "IPFS Kubo API URL for uploading inference results",
         help_heading = "OPoI / Inference",
