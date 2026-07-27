@@ -14,10 +14,14 @@ on:
         type: choice
         options: [ptx, native]
         default: ptx
+      # Default ON, unlike the Linux workflow. A Windows box has the NVIDIA driver but
+      # normally NOT the CUDA toolkit, so keryx-llama.dll cannot load without these and
+      # OPoI inference dies. This package has always shipped them; turn it off only when
+      # you know the target already has the CUDA runtime on PATH.
       bundle_cuda_runtime:
-        description: "Ship cublas/cublasLt DLLs beside the exe, for boxes with a driver but no CUDA toolkit. Adds ~610 MB zipped (cublasLt alone is 675 MB)."
+        description: "Ship cublas/cublasLt DLLs beside the exe (needed unless the box has the CUDA toolkit). Adds ~610 MB."
         type: boolean
-        default: false
+        default: true
 
 env:
   LLAMA_TAG: b10015
