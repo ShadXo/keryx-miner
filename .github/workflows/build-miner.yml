@@ -11,6 +11,10 @@ on:
         type: choice
         options: [ptx, native]
         default: ptx
+      bundle_cuda_runtime:
+        description: "Ship libcudart/libcublas next to the binary (rigs with driver only). Adds ~600 MB."
+        type: boolean
+        default: true
 
 # NOTE: POM_SM_LIST is deliberately NOT set. pom_gpu.rs include_str!s all seven
 # PTX files unconditionally, so trimming the list breaks the build.
@@ -50,10 +54,34 @@ jobs:
           sudo chown "$(id -u):$(id -g)" pom_mine_nextgen.fatbin
           ls -la pom_mine_nextgen.fatbin
 
+      # PoW (KeryxHash) nextgen images. The COMMITTED ones are built with CUDA 12.9, so their
+      # sm_100/sm_120 PTX is ISA 8.8 and needs driver >= r575; on r570 a Blackwell card fails
+      # every nextgen image and walks the ladder down to JIT'd sm_86. Rebuilding here with the
+      # 12.8 toolkit emits ISA 8.7 / native SASS that an r570 driver accepts.
+      # Arch set mirrors the committed fatbin exactly: ptx_89 sass_89 sass_90 sass_100 sass_120.
+      - name: Compile PoW nextgen fatbin + sm_120 PTX
+        run: |
+          docker run --rm -v "$PWD":/src -w /src "$FATBIN_IMAGE" bash -euo pipefail -c '
+            cd plugins/cuda/kaspa-cuda-native/src
+            nvcc -fatbin -O3 \
+              -gencode "arch=compute_89,code=[compute_89,sm_89]" \
+              -gencode arch=compute_90,code=sm_90 \
+              -gencode arch=compute_100,code=sm_100 \
+              -gencode arch=compute_120,code=sm_120 \
+              kaspa-cuda.cu -o /src/keryx-nextgen.fatbin
+            nvcc -ptx -O3 -arch=compute_120 kaspa-cuda.cu -o /src/keryx-cuda-sm120.ptx
+          '
+          sudo chown "$(id -u):$(id -g)" keryx-nextgen.fatbin keryx-cuda-sm120.ptx
+          ls -la keryx-nextgen.fatbin keryx-cuda-sm120.ptx
+          head -3 keryx-cuda-sm120.ptx | tail -1
+
       - uses: actions/upload-artifact@v4
         with:
           name: nextgen-fatbin
-          path: pom_mine_nextgen.fatbin
+          path: |
+            pom_mine_nextgen.fatbin
+            keryx-nextgen.fatbin
+            keryx-cuda-sm120.ptx
 
   build:
     needs: [fatbin]
@@ -77,11 +105,24 @@ jobs:
           name: nextgen-fatbin
           path: .
 
+      # worker.rs pulls these in with include_bytes!/include_str! straight from the source
+      # tree, so overwriting them before cargo build is what swaps in the r570-compatible
+      # images. (PoM takes the env-var route instead — build.rs copies POM_FATBIN_NEXTGEN.)
+      - name: Install rebuilt PoW images
+        if: inputs.nextgen_kernel == 'native'
+        run: |
+          cp keryx-nextgen.fatbin  plugins/cuda/resources/keryx-nextgen.fatbin
+          cp keryx-cuda-sm120.ptx  plugins/cuda/resources/keryx-cuda-sm120.ptx
+          ls -la plugins/cuda/resources/keryx-nextgen.fatbin plugins/cuda/resources/keryx-cuda-sm120.ptx
+
       - name: Cache llama engine
         uses: actions/cache@v4
         with:
           path: dist/libkeryx-llama.so
-          key: llama-${{ env.LLAMA_TAG }}-${{ inputs.llama_archs }}-cuda1222
+          # Bump the suffix whenever build.rs changes how the .so is LINKED — a cache hit sets
+          # KERYX_LLAMA_SKIP=1 and reuses the old binary, so a link-flag change (here:
+          # -rpath,$ORIGIN) would otherwise never reach the shipped artifact.
+          key: llama-${{ env.LLAMA_TAG }}-${{ inputs.llama_archs }}-cuda1222-rpath1
 
       - name: Cache cargo
         uses: actions/cache@v4
@@ -145,6 +186,16 @@ jobs:
               cp target/release/keryx-miner pkg/
               cp target/release/libkeryxcuda.so pkg/
               cp dist/libkeryx-llama.so pkg/
+              # libkeryx-llama.so has DT_NEEDED on libcudart.so.12 and libcublas.so.12 (which
+              # itself needs libcublasLt.so.12). Rigs usually carry only the driver, so the
+              # dlopen fails, OPoI inference is unavailable, and PoM falls back to uploading a
+              # SECOND copy of the weights instead of the zero-dup gather. The .so is linked
+              # with -rpath,$ORIGIN, so these are found simply by sitting beside it.
+              if [ "${{ inputs.bundle_cuda_runtime }}" = "true" ]; then
+                for lib in libcudart.so.12 libcublas.so.12 libcublasLt.so.12; do
+                  cp -L "/usr/local/cuda/lib64/$lib" pkg/
+                done
+              fi
               ls -la pkg/
             '
           sudo chown -R "$(id -u):$(id -g)" .

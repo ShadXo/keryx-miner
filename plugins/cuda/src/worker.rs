@@ -207,16 +207,21 @@ impl<'gpu> CudaGPUWorker<'gpu> {
                     selection_path = "nextgen-fatbin".to_string();
                     true
                 }
-                Err(_) => match load_fatbin(FATBIN_LEGACY, "legacy (fallback)") {
-                    Ok(m) => {
-                        info!("GPU #{} using legacy fatbin fallback", device_id);
-                        _module = Some(Arc::new(m));
-                        selected_module = "fatbin:legacy".to_string();
-                        selection_path = "nextgen-fatbin->legacy-fatbin".to_string();
-                        true
-                    }
-                    Err(_) => false,
-                },
+                // Deliberately NOT falling back to the legacy fatbin on a nextgen card. That
+                // image carries sm_86 SASS plus compute_86 PTX, so it loads on every newer
+                // GPU and would mark the module resolved — pre-empting the PTX ladder below,
+                // which ships a NATIVE image for every nextgen cc (sm_89/90/100/120). Ada and
+                // Blackwell cards were silently running JIT'd sm_86 at roughly half their
+                // native throughput because of this. Nothing is lost by skipping it: the
+                // ladder's own last resort is sm_86 PTX, which is the same code the driver
+                // would have JIT'd out of the legacy fatbin anyway.
+                Err(_) => {
+                    info!(
+                        "GPU #{} nextgen fatbin unavailable — falling through to the PTX ladder (native sm_89/90/100/120)",
+                        device_id
+                    );
+                    false
+                }
             }
         } else {
             match load_fatbin(FATBIN_LEGACY, "legacy") {
@@ -233,14 +238,16 @@ impl<'gpu> CudaGPUWorker<'gpu> {
 
         if !fatbin_loaded {
         selection_path = if is_nextgen_cc {
-            "fatbin-miss(nextgen+legacy)->ptx".to_string()
+            "fatbin-miss(nextgen)->ptx".to_string()
         } else {
             "fatbin-miss(legacy)->ptx".to_string()
         };
-        // For sm_89 (Ada/RTX 40) and sm_100 (Blackwell/RTX 50), the PTX was compiled with
-        // CUDA 13.2 (PTX ISA 9.2) which requires driver >= 570. If the driver is older, we
-        // fall back to sm_86 (CUDA 12.0 / PTX 8.0, driver >= 520) which runs on all these
-        // architectures via NVIDIA's backward-compatible PTX JIT.
+        // ISA versions of the shipped PTX, read from their `.version` directives:
+        //   sm_100 / sm_120 -> 8.8 (CUDA 12.9, needs driver >= r575)
+        //   every other one -> 8.2 (CUDA 12.2, needs driver >= r525)
+        // So on an r570 driver the sm_120 PTX does NOT load and a Blackwell card walks the
+        // ladder down to sm_86. Shipping a nextgen fatbin built with a toolkit <= the target
+        // driver is what actually fixes that — see the `pow-fatbin` job in build-miner.yml.
         if major >= 12 {
             // sm_120 (consumer Blackwell — GeForce RTX 5090 etc.). NVIDIA splits
             // sm_100 (datacenter Blackwell — H100/B100) and sm_120 (consumer) as
