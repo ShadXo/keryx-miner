@@ -1,43 +1,77 @@
 name: build-miner
 
-# Manual trigger only — no builds on push.
 on:
   workflow_dispatch:
     inputs:
       llama_archs:
         description: "llama.cpp CUDA archs (CMake syntax)"
         default: "86-real;89-real;89-virtual"
-      neutralize_nextgen_fatbin:
-        description: "Skip the stale nextgen fatbin (REQUIRED for RTX 40xx/50xx)"
-        type: boolean
-        default: true
+      nextgen_kernel:
+        description: "How RTX 40xx/50xx get the new PoM kernel"
+        type: choice
+        options: [ptx, native]
+        default: ptx
 
 # NOTE: POM_SM_LIST is deliberately NOT set. pom_gpu.rs include_str!s all seven
-# PTX files unconditionally, so trimming the list breaks the compile.
+# PTX files unconditionally, so trimming the list breaks the build.
 
 env:
-  # Must match the pin in build.rs. Bump both together.
   LLAMA_TAG: b10015
-  IMAGE: nvidia/cuda:12.2.2-devel-ubuntu20.04
+  BUILD_IMAGE: nvidia/cuda:12.2.2-devel-ubuntu20.04   # glibc 2.31, gcc 9
+  # Must be <= the CUDA version your DRIVER reports (see "CUDA driver API version"
+  # in the miner log). A fatbin from a newer toolkit fails with "device kernel
+  # image is invalid". 12.8 toolkit -> needs driver r570+.
+  FATBIN_IMAGE: nvidia/cuda:12.8.2-devel-ubuntu20.04
 
 jobs:
-  build:
+  # Only runs for nextgen_kernel=native. The shipped cuda/pom_mine_nextgen.fatbin
+  # is stale (predates the ILP x2 commit); this rebuilds it from current source.
+  fatbin:
+    if: inputs.nextgen_kernel == 'native'
     runs-on: ubuntu-latest
-    timeout-minutes: 350   # hosted-runner hard cap is 360
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compile nextgen fatbin
+        run: |
+          docker run --rm -v "$PWD":/src -w /src "$FATBIN_IMAGE" \
+            nvcc -fatbin -O3 \
+              -gencode arch=compute_89,code=sm_89 \
+              -gencode arch=compute_100,code=sm_100 \
+              -gencode arch=compute_120,code=sm_120 \
+              -gencode arch=compute_120,code=compute_120 \
+              cuda/pom_mine.cu -o pom_mine_nextgen.fatbin
+          sudo chown "$(id -u):$(id -g)" pom_mine_nextgen.fatbin
+          ls -la pom_mine_nextgen.fatbin
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nextgen-fatbin
+          path: pom_mine_nextgen.fatbin
+
+  build:
+    needs: [fatbin]
+    if: always() && needs.fatbin.result != 'failure'
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
 
     steps:
       - name: Free disk space
         uses: jlumbroso/free-disk-space@main
         with:
           tool-cache: true
-          docker-images: false   # we need docker
+          docker-images: false
 
       - uses: actions/checkout@v4
 
-      # The llama engine only changes when LLAMA_TAG or the arch list changes,
-      # so cache the .so itself rather than the multi-GB build tree.
+      - name: Fetch native fatbin
+        if: inputs.nextgen_kernel == 'native'
+        uses: actions/download-artifact@v4
+        with:
+          name: nextgen-fatbin
+          path: .
+
       - name: Cache llama engine
-        id: llama
         uses: actions/cache@v4
         with:
           path: dist/libkeryx-llama.so
@@ -56,11 +90,15 @@ jobs:
       - name: Build
         run: |
           mkdir -p dist
-          NG=""
-          if [ "${{ inputs.neutralize_nextgen_fatbin }}" = "true" ]; then
-            # Must be a path that does NOT exist: build.rs fs::copy()s the file if
-            # it exists (and fs::copy rejects /dev/null), and only writes the empty
-            # placeholder we want when the path is missing.
+          # ptx  -> empty image, load fails, falls through to the PTX ladder
+          # native -> freshly compiled SASS from the fatbin job
+          #
+          # For ptx the path must NOT exist: build.rs fs::copy()s the file when it
+          # exists (and fs::copy rejects /dev/null), and only writes the empty
+          # placeholder we want when the path is missing.
+          if [ "${{ inputs.nextgen_kernel }}" = "native" ]; then
+            NG="pom_mine_nextgen.fatbin"
+          else
             NG="/src/cuda/__no_nextgen.fatbin"
           fi
           docker run --rm -v "$PWD":/src -w /src \
@@ -68,14 +106,12 @@ jobs:
             -e CARGO_TARGET_DIR=/src/target \
             -e KERYX_LLAMA_ARCHS="${{ inputs.llama_archs }}" \
             -e POM_FATBIN_NEXTGEN="$NG" \
-            -e LLAMA_TAG="$LLAMA_TAG" \
-            "$IMAGE" bash -euo pipefail -c '
+            "$BUILD_IMAGE" bash -euo pipefail -c '
               export DEBIAN_FRONTEND=noninteractive
               apt-get update -qq
               apt-get install -y -qq curl git build-essential pkg-config \
                 libssl-dev ca-certificates protobuf-compiler >/dev/null
 
-              # focal ships cmake 3.16; llama.cpp needs newer (same pin Keryx uses)
               curl -sL https://github.com/Kitware/CMake/releases/download/v3.28.6/cmake-3.28.6-linux-x86_64.tar.gz \
                 | tar xz -C /opt
               export PATH=/opt/cmake-3.28.6-linux-x86_64/bin:/usr/local/cuda/bin:$PATH
@@ -89,25 +125,21 @@ jobs:
               . "$CARGO_HOME/env"
               rustc -vV
 
-              # Cached engine from a previous run: skip the ~1-2h llama.cpp compile.
               if [ -f dist/libkeryx-llama.so ]; then
                 echo "::notice::reusing cached libkeryx-llama.so"
                 export KERYX_LLAMA_SKIP=1
               fi
 
-              # keryxopencl is not in the plugin whitelist in main.rs, so skip it
-              # (avoids needing OpenCL headers).
               cargo build --release -p keryx-miner -p keryxcuda
 
               strip target/release/keryx-miner
-              if [ -f target/release/libkeryx-llama.so ]; then
-                cp target/release/libkeryx-llama.so dist/
-              fi
+              [ -f target/release/libkeryx-llama.so ] && cp target/release/libkeryx-llama.so dist/
 
               mkdir -p pkg
               cp target/release/keryx-miner pkg/
               cp target/release/libkeryxcuda.so pkg/
               cp dist/libkeryx-llama.so pkg/
+              cp Cargo.lock pkg/
               ls -la pkg/
             '
           sudo chown -R "$(id -u):$(id -g)" .
@@ -115,15 +147,15 @@ jobs:
       - name: Record build inputs
         run: |
           {
-            echo "commit:      $(git rev-parse HEAD)"
-            echo "llama_archs: ${{ inputs.llama_archs }}"
-            echo "nextgen fatbin neutralized: ${{ inputs.neutralize_nextgen_fatbin }}"
-            echo "toolchain:   CUDA 12.2.2 / ubuntu20.04 (glibc 2.31)"
+            echo "commit:         $(git rev-parse HEAD)"
+            echo "nextgen kernel: ${{ inputs.nextgen_kernel }}"
+            echo "llama archs:    ${{ inputs.llama_archs }}"
+            echo "toolchain:      CUDA 12.2.2 / ubuntu20.04"
           } > pkg/BUILDINFO.txt
           ldd --version | head -1 >> pkg/BUILDINFO.txt
 
       - uses: actions/upload-artifact@v4
         with:
-          name: keryx-miner-${{ github.sha }}
+          name: keryx-miner-${{ inputs.nextgen_kernel }}-${{ github.sha }}
           path: pkg/
           retention-days: 14
