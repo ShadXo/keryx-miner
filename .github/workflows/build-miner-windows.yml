@@ -14,6 +14,10 @@ on:
         type: choice
         options: [ptx, native]
         default: ptx
+      bundle_cuda_runtime:
+        description: "Ship cublas/cublasLt DLLs beside the exe, for boxes with a driver but no CUDA toolkit. Adds ~610 MB zipped (cublasLt alone is 675 MB)."
+        type: boolean
+        default: false
 
 env:
   LLAMA_TAG: b10015
@@ -133,17 +137,22 @@ jobs:
           Copy-Item target\release\keryx-miner.exe pkg\
           Copy-Item target\release\keryxcuda.dll   pkg\
           Copy-Item target\release\keryx-llama.dll pkg\
-          # cudart is linked statically by nvcc, but cublas is not - ship the
-          # redist DLLs so the box doesn't need a CUDA toolkit installed.
-          # keryx-llama.dll cannot load without cublas/cublasLt, and a silently missing DLL
-          # only shows up as a runtime load failure on the miner, so fail the build instead.
-          foreach ($dll in @('cublas64_12.dll','cublasLt64_12.dll')) {
-            $p = Join-Path $env:CUDA_PATH "bin\$dll"
-            if (-not (Test-Path $p)) { throw "required redist DLL missing: $p" }
-            Copy-Item $p pkg\
+          # cudart is linked statically by nvcc, but cublas is not. keryx-llama.dll cannot load
+          # without cublas/cublasLt, so a box with only the NVIDIA driver (no CUDA toolkit)
+          # needs them shipped -- at the cost of ~610 MB, nearly all of it cublasLt. Opt-in:
+          # without it OPoI inference is unavailable and PoM uploads its own weight copy,
+          # while mining itself still runs.
+          if ("${{ inputs.bundle_cuda_runtime }}" -eq "true") {
+            foreach ($dll in @('cublas64_12.dll','cublasLt64_12.dll')) {
+              $p = Join-Path $env:CUDA_PATH "bin\$dll"
+              # A silently missing DLL only surfaces as a runtime load failure on the miner,
+              # so fail the build instead.
+              if (-not (Test-Path $p)) { throw "required redist DLL missing: $p" }
+              Copy-Item $p pkg\
+            }
+            # curand is not in keryx-llama.dll's import table; ship it if present, no more.
+            Copy-Item "$env:CUDA_PATH\bin\curand64_10.dll" pkg\ -ErrorAction SilentlyContinue
           }
-          # curand is not in keryx-llama.dll's import table; ship it if present, no more.
-          Copy-Item "$env:CUDA_PATH\bin\curand64_10.dll" pkg\ -ErrorAction SilentlyContinue
           Get-ChildItem pkg
 
       - uses: actions/upload-artifact@v4
