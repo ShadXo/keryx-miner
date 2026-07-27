@@ -1,0 +1,73 @@
+name: Publish release assets
+
+# Replaces the old deploy.yaml, which could never have run: it targeted the retired
+# ubuntu-18.04 runner, built kaspa-miner packages, and used the archived
+# actions/upload-release-asset@v1.
+#
+# Rather than duplicate the build logic, this calls the two build workflows and attaches
+# what they produce to the release. Both are built as `native` so the published binaries
+# carry real sm_120 SASS rather than JIT'd PTX.
+
+on:
+  release:
+    types: [published]
+  # Re-run against an existing tag, e.g. when a build was fixed after publishing.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing release tag to attach assets to"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  linux:
+    uses: ./.github/workflows/build-miner.yml
+    with:
+      nextgen_kernel: native
+      # ON for releases: a downloader is far likelier to have a bare driver than the
+      # full CUDA toolkit, and without these libkeryx-llama.so cannot load.
+      bundle_cuda_runtime: true
+
+  windows:
+    uses: ./.github/workflows/build-miner-windows.yml
+    with:
+      nextgen_kernel: native
+      bundle_cuda_runtime: true
+
+  publish:
+    needs: [linux, windows]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dl
+
+      - name: Repack and attach to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          TAG="${{ github.event.release.tag_name || inputs.tag }}"
+          if [ -z "$TAG" ]; then echo "no tag resolved"; exit 1; fi
+          mkdir -p out
+
+          # download-artifact lays each artifact out as dl/<artifact-name>/<files>. Repack
+          # the two package artifacts under stable, tag-derived names — the raw artifact
+          # names carry a commit SHA, which is not what belongs on a release page.
+          # The nextgen-fatbin artifact is a build intermediate and is deliberately skipped.
+          shopt -s nullglob
+          for d in dl/keryx-miner-*; do
+            base="$(basename "$d")"
+            case "$base" in
+              *win64*) name="keryx-miner-${TAG}-win64-x86_64.zip" ;;
+              *)       name="keryx-miner-${TAG}-linux-x86_64.zip" ;;
+            esac
+            ( cd "$d" && zip -qr "../../out/$name" . )
+            echo "packed $name"
+          done
+
+          ls -la out/
+          [ -n "$(ls -A out/)" ] || { echo "no assets produced"; exit 1; }
+          gh release upload "$TAG" out/* --repo "$GITHUB_REPOSITORY" --clobber

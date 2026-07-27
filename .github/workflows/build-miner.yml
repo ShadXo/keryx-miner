@@ -21,6 +21,21 @@ on:
         type: boolean
         default: false
 
+  # Lets release.yaml reuse this build instead of duplicating it. Inputs must mirror the
+  # workflow_dispatch set above; note nextgen_kernel is `string` here because workflow_call
+  # has no `choice` type.
+  workflow_call:
+    inputs:
+      llama_archs:
+        type: string
+        default: "75-real;80-real;86-real;89-real;89-virtual"
+      nextgen_kernel:
+        type: string
+        default: ptx
+      bundle_cuda_runtime:
+        type: boolean
+        default: false
+
 # NOTE: POM_SM_LIST is deliberately NOT set. pom_gpu.rs include_str!s all seven
 # PTX files unconditionally, so trimming the list breaks the build.
 
