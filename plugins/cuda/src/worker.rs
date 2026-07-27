@@ -454,7 +454,15 @@ impl<'gpu> CudaGPUWorker<'gpu> {
             _context,
             _module,
             start_event: Event::new(EventFlags::DEFAULT)?,
-            stop_event: Event::new(EventFlags::DEFAULT)?,
+            // cuEventSynchronize only sleeps if the EVENT carries BLOCKING_SYNC; the
+            // context's SCHED_BLOCKING_SYNC does not apply to event sync. Without this
+            // the wait below busy-waits a full core per GPU regardless of the flag,
+            // which is what --cuda-no-blocking-sync was supposed to control.
+            stop_event: Event::new(if blocking_sync {
+                EventFlags::BLOCKING_SYNC
+            } else {
+                EventFlags::DEFAULT
+            })?,
             workload: chosen_workload as usize,
             stream,
             rand_state,
