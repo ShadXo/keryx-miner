@@ -42,12 +42,69 @@ __device__ __forceinline__ bool pom_le_leq(const unsigned long long a[4],
 // H5.1: the seed fold reads its own word set (s0..s3, host-salted per era) while the pow fold
 // keeps p0..p3 — pre-H5.1 the host passes identical words, keeping behavior bit-identical.
 //
+// ILP1 — one nonce per thread. The host launches `batch` threads for this entry point.
+// This is the DEFAULT: ILP x2 only pays off where a single nonce/thread leaves outstanding-miss
+// slots unused (GDDR6X-class parts). On hardware that already saturates them it is a regression,
+// so `pom_mine_ilp2` below is opt-in per device — see `autotune_block` in src/pom_gpu.rs.
+extern "C" __global__ void pom_mine(const unsigned long long* bases, const unsigned long long* prefix,
+                                    unsigned int T, unsigned long long n_total_chunks, unsigned int K,
+                                    unsigned long long p0, unsigned long long p1, unsigned long long p2, unsigned long long p3,
+                                    unsigned long long s0, unsigned long long s1, unsigned long long s2, unsigned long long s3,
+                                    unsigned long long time_,
+                                    unsigned long long t0, unsigned long long t1, unsigned long long t2, unsigned long long t3,
+                                    unsigned long long nonce_base, unsigned long long n_nonces,
+                                    unsigned long long* winner, unsigned int walk_v2) {
+    unsigned long long tid = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= n_nonces) return;
+    unsigned long long nonce = nonce_base + tid;
+
+    unsigned long long state = pom_seed_fold(nonce, time_, s0, s1, s2, s3);
+    unsigned long long off = state % n_total_chunks;
+    for (unsigned int i = 0; i < K; i++) {
+        unsigned int lo = 0, hi = T;
+        while (lo + 1 < hi) {
+            unsigned int mid = (lo + hi) >> 1;
+            if (prefix[mid] <= off) lo = mid; else hi = mid;
+        }
+        unsigned long long local = off - prefix[lo];
+        // 128-bit vector loads: read the 32-byte chunk as 2x ulonglong2 (a.x,a.y,c.x,c.y = w0..w3)
+        // issued before the era branch. BYTE-EXACT vs the 4x u64 form — same words, same order,
+        // walk result is bit-identical. On latency-bound GDDR6X parts this is the difference
+        // between ~17 and ~25 MH/s on a 3090 (measured 2026-07-26); ~+1.8% on H200/HBM.
+        const ulonglong2* p = (const ulonglong2*)bases[lo];
+        unsigned long long base2 = local * 2ULL;
+        ulonglong2 a = p[base2], c = p[base2 + 1];
+        unsigned long long h = state;
+        if (walk_v2) {
+            // H5 non-foldable walk: chain mix64 through each chunk word so all 32 bytes are
+            // load-bearing (closes the pre-H5 XOR-fold that let a miner hold a 4x-smaller table).
+            // walk_v2 is uniform across all threads -> no warp divergence.
+            h = mix64(h ^ a.x); h = mix64(h ^ a.y); h = mix64(h ^ c.x); h = mix64(h ^ c.y);
+            state = h;
+        } else {
+            // Pre-H5 fold (frozen — validates all blocks below H5_ACTIVATION_DAA).
+            h ^= a.x; h ^= a.y; h ^= c.x; h ^= c.y;
+            state = mix64(h);
+        }
+        off = state % n_total_chunks;
+    }
+    unsigned long long pv[4];
+    pom_pow_fold(state, p0, p1, p2, p3, pv);
+    if (pom_le_leq(pv, t0, t1, t2, t3)) {
+        atomicMin(winner, nonce);
+    }
+}
+
 // ILP x2: each thread grinds TWO nonces with their walk steps interleaved. The walk is
 // memory-latency bound (a 3090 sits at ~24% of its bandwidth at 1 nonce/thread), so the
 // second walk's search/mix work overlaps the first walk's DRAM fetch and vice versa.
 // Byte-exact per nonce: each walk's math is untouched, only the instruction scheduling
 // interleaves. The host launches ceil(batch/2) threads (grid calc in src/pom_gpu.rs).
-extern "C" __global__ void pom_mine(const unsigned long long* bases, const unsigned long long* prefix,
+//
+// NOT universally faster — the extra live state costs registers, so parts that already keep
+// enough misses in flight lose throughput. Selected per device by the startup sweep, never
+// unconditionally.
+extern "C" __global__ void pom_mine_ilp2(const unsigned long long* bases, const unsigned long long* prefix,
                                     unsigned int T, unsigned long long n_total_chunks, unsigned int K,
                                     unsigned long long p0, unsigned long long p1, unsigned long long p2, unsigned long long p3,
                                     unsigned long long s0, unsigned long long s1, unsigned long long s2, unsigned long long s3,
