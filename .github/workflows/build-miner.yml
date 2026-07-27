@@ -123,7 +123,7 @@ jobs:
           # Bump the suffix whenever build.rs changes how the .so is LINKED — a cache hit sets
           # KERYX_LLAMA_SKIP=1 and reuses the old binary, so a link-flag change (here:
           # -rpath,$ORIGIN) would otherwise never reach the shipped artifact.
-          key: llama-${{ env.LLAMA_TAG }}-${{ inputs.llama_archs }}-cuda1222-rpath1
+          key: llama-${{ env.LLAMA_TAG }}-${{ inputs.llama_archs }}-cuda1222-rpath1-nehalem1
 
       - name: Cache cargo
         uses: actions/cache@v4
