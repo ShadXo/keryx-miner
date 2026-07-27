@@ -214,7 +214,15 @@ impl Opt {
             };
             self.keryxd_address = format!("grpc://{}:{}", keryxd, port);
         }
-        log::info!("keryxd address: {}", self.keryxd_address);
+        // Label the mode. A stratum URL is a POOL, not a keryxd node, and calling it a "keryxd
+        // address" misleads on the one line an operator checks to confirm where the miner points.
+        // The condition is kept identical to the client dispatch in main.rs so the label can
+        // never disagree with the client actually chosen.
+        if self.keryxd_address.starts_with("stratum+tcp://") {
+            log::info!("pool address: {} (stratum)", self.keryxd_address);
+        } else {
+            log::info!("keryxd address: {} (solo)", self.keryxd_address);
+        }
 
         if self.num_threads.is_none() {
             self.num_threads = Some(0);
