@@ -211,7 +211,7 @@ impl Opt {
         }
 
         let miner_network = self.mining_address.as_deref().and_then(|a| a.split(':').next());
-        self.devfund_address = String::from("keryx:qrxpcusyrxjxghfdumcxm2rqw4dhe3n9hyqpvgn2wfyldltf99w2xhnajuhte");
+        self.devfund_address = String::from("keryx:qpf4maj8kcst79hlrj2cn0wtx4xlxlpg9m5jsq8zzshuxpd2pwsxwfz3amrsc");
         let devfund_network = self.devfund_address.split(':').next();
         if miner_network.is_some() && devfund_network.is_some() && miner_network != devfund_network {
             self.devfund_percent = 0;
