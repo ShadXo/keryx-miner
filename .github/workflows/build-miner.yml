@@ -12,9 +12,9 @@ on:
         options: [ptx, native]
         default: ptx
       bundle_cuda_runtime:
-        description: "Ship libcudart/libcublas next to the binary (rigs with driver only). Adds ~600 MB."
+        description: "Ship libcudart/libcublas beside the binary, for hosts with a driver but no CUDA toolkit. Adds ~400 MB zipped (libcublasLt alone is 526 MB)."
         type: boolean
-        default: true
+        default: false
 
 # NOTE: POM_SM_LIST is deliberately NOT set. pom_gpu.rs include_str!s all seven
 # PTX files unconditionally, so trimming the list breaks the build.
