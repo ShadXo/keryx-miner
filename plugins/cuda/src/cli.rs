@@ -34,7 +34,7 @@ pub struct OverClock {
 pub struct CudaOpt {
     #[clap(long = "cuda-device", use_delimiter = true, help = "Which CUDA GPUs to use [default: all]")]
     pub cuda_device: Option<Vec<u16>>,
-    #[clap(long = "cuda-workload", help = "Ratio of nonces to GPU possible parrallel run [default: 64]")]
+    #[clap(long = "cuda-workload", help = "Ratio of nonces to GPU possible parrallel run [default: 1024]")]
     pub cuda_workload: Option<Vec<f32>>,
     #[clap(
         long = "cuda-workload-absolute",

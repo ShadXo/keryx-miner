@@ -254,14 +254,18 @@ fn select_pom_kernel(device_id: usize) -> Result<LoadedPomKernel> {
     FATBIN_STATUS_LOGGED.call_once(|| {
         let legacy = FATBIN_LEGACY.len();
         let nextgen = FATBIN_NEXTGEN.len();
+        // Reports only what is EMBEDDED. It used to claim the PTX ladder was "currently
+        // active" whenever a fatbin was merely non-empty, which reads as though the fatbins
+        // were being ignored — the opposite of what select_pom_kernel does, since it tries
+        // them first. What each GPU actually loaded is the per-device line below.
         if legacy > 0 || nextgen > 0 {
             info!(
-                "PoM: prebuilt fatbins detected (legacy={} bytes, nextgen={} bytes); PTX fallback ladder currently active",
+                "PoM: embedded images — legacy fatbin {} bytes, nextgen fatbin {} bytes (PTX ladder is the fallback); per-GPU selection logged separately",
                 legacy,
                 nextgen
             );
         } else {
-            info!("PoM: no prebuilt fatbins detected; using PTX fallback ladder");
+            info!("PoM: no fatbins embedded — every GPU will use the PTX fallback ladder");
         }
     });
 
