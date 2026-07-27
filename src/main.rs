@@ -538,25 +538,15 @@ async fn run() -> Result<(), Error> {
     let matches = app.get_matches();
 
     let mut opt: Opt = Opt::from_arg_matches(&matches)?;
-    opt.process()?;
 
-    // Model storage root is configurable: explicit --models-dir wins, otherwise
-    // --hiveos defaults to a stable shared HiveOS path.
-    if let Some(dir) = opt.models_dir.as_ref() {
-        std::env::set_var("KERYX_MODELS_DIR", dir);
-    } else if opt.hiveos && std::env::var_os("KERYX_MODELS_DIR").is_none() {
-        std::env::set_var("KERYX_MODELS_DIR", "/hive/miners/custom/models");
-    }
-
+    // Logging is initialised BEFORE opt.process(). process() emits the resolved node/pool
+    // address and the devfund network-mismatch warning; with the init after it, both went to a
+    // logger that did not exist yet and were silently dropped — precisely the two lines an
+    // operator reads to confirm where the miner points and whether the devfund got disabled.
+    // Nothing here depends on process(): log_level() reads --debug, is_tty comes from the
+    // terminal, and the plain-log path comes from clap or the environment. process() only
+    // mutates the testnet gates, keryxd_address, num_threads and devfund_*.
     let is_tty = std::io::stdout().is_terminal();
-    let shutdown_requested = Arc::new(AtomicBool::new(false));
-    {
-        let shutdown_requested = Arc::clone(&shutdown_requested);
-        tokio::spawn(async move {
-            let _ = tokio::signal::ctrl_c().await;
-            shutdown_requested.store(true, Ordering::Release);
-        });
-    }
     let ui_state = if is_tty { Some(Arc::new(UiState::new())) } else { None };
     let plain_log_path = opt
         .plain_log_file
@@ -573,6 +563,25 @@ async fn run() -> Result<(), Error> {
             }
         });
     init_logging(opt.log_level(), ui_state.clone(), !is_tty, plain_log_file)?;
+
+    opt.process()?;
+
+    // Model storage root is configurable: explicit --models-dir wins, otherwise
+    // --hiveos defaults to a stable shared HiveOS path.
+    if let Some(dir) = opt.models_dir.as_ref() {
+        std::env::set_var("KERYX_MODELS_DIR", dir);
+    } else if opt.hiveos && std::env::var_os("KERYX_MODELS_DIR").is_none() {
+        std::env::set_var("KERYX_MODELS_DIR", "/hive/miners/custom/models");
+    }
+
+    let shutdown_requested = Arc::new(AtomicBool::new(false));
+    {
+        let shutdown_requested = Arc::clone(&shutdown_requested);
+        tokio::spawn(async move {
+            let _ = tokio::signal::ctrl_c().await;
+            shutdown_requested.store(true, Ordering::Release);
+        });
+    }
     plugin_manager.set_log_sink(Some(plugin_log_sink));
     for warning in plugin_manager.drain_startup_warnings() {
         warn!("{}", warning);
