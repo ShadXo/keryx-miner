@@ -1,0 +1,85 @@
+name: build-miner-windows
+
+# UNVERIFIED. The Linux workflow was written against a read of build.rs; this one
+# follows the same logic but the MSVC path has not been exercised. Expect to iterate.
+
+on:
+  workflow_dispatch:
+    inputs:
+      llama_archs:
+        description: "llama.cpp CUDA archs (CMake syntax)"
+        default: "86-real;89-real;89-virtual"
+
+env:
+  LLAMA_TAG: b10015
+  # CUDA 12.2 rejects the cl.exe on current windows images, so this line is newer
+  # than the Linux build's. Resulting PTX wants a ~r555+ driver.
+  CUDA_VERSION: "12.9.1"
+
+jobs:
+  build:
+    runs-on: windows-2022
+    timeout-minutes: 350
+
+    steps:
+      - uses: actions/checkout@v4
+        # build.rs shells out to git for llama.cpp; keep CRLF out of the sources
+      - run: git config --global core.autocrlf false
+
+      - uses: ilammy/msvc-dev-cmd@v1   # puts cl.exe on PATH for nvcc
+
+      - name: Install CUDA
+        uses: Jimver/cuda-toolkit@v0.2.19
+        with:
+          cuda: ${{ env.CUDA_VERSION }}
+          method: network
+          # llama.cpp's CUDA backend needs the cublas dev libs, not just nvcc
+          sub-packages: '["nvcc","cudart","cublas","cublas_dev","curand","curand_dev","thrust","visual_studio_integration"]'
+
+      - uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-win-${{ github.sha }}
+          restore-keys: cargo-win-
+
+      - name: Build
+        shell: pwsh
+        env:
+          KERYX_LLAMA_ARCHS: ${{ inputs.llama_archs }}
+          # Path must NOT exist -> build.rs writes an empty placeholder, the stale
+          # nextgen fatbin is skipped, and the PTX ladder is used instead.
+          POM_FATBIN_NEXTGEN: cuda\__no_nextgen.fatbin
+        run: |
+          $env:NVCC = "$env:CUDA_PATH\bin\nvcc.exe"
+          cargo build --release -p keryx-miner -p keryxcuda
+
+      - name: Package
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force pkg | Out-Null
+          Copy-Item target\release\keryx-miner.exe pkg\
+          Copy-Item target\release\keryxcuda.dll   pkg\
+          Copy-Item target\release\keryx-llama.dll pkg\
+          Copy-Item Cargo.lock pkg\
+          # cudart is linked statically by nvcc, but cublas is not - ship the
+          # redist DLLs so the box doesn't need a CUDA toolkit installed.
+          Copy-Item "$env:CUDA_PATH\bin\cublas64_12.dll"   pkg\ -ErrorAction SilentlyContinue
+          Copy-Item "$env:CUDA_PATH\bin\cublasLt64_12.dll" pkg\ -ErrorAction SilentlyContinue
+          Copy-Item "$env:CUDA_PATH\bin\curand64_10.dll"   pkg\ -ErrorAction SilentlyContinue
+          Get-ChildItem pkg
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: keryx-miner-win64-${{ github.sha }}
+          path: pkg/
+          retention-days: 14
