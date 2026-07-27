@@ -99,11 +99,36 @@ ldconfig -p | grep -q libcublas.so.12 || { echo "libcublas still not in loader c
 ldconfig -p | grep -q libcurand.so   || { echo "libcurand still not in loader cache"; exit 1; }
 ldconfig -p | grep -q libcudart.so.12 || { echo "libcudart still not in loader cache"; exit 1; }
 rm -f cuda-keyring.deb"#;
-    Command::new("bash")
+    let output = match Command::new("bash")
         .args(["-c", script])
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+    {
+        Ok(output) => output,
+        Err(e) => {
+            error!("CUDA lib auto-install failed to launch: {e}");
+            return false;
+        }
+    };
+
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        if !line.trim().is_empty() {
+            info!("CUDA install: {line}");
+        }
+    }
+    for line in String::from_utf8_lossy(&output.stderr).lines() {
+        if !line.trim().is_empty() {
+            warn!("CUDA install: {line}");
+        }
+    }
+
+    if output.status.success() {
+        true
+    } else {
+        error!("CUDA lib auto-install failed with status {}", output.status);
+        false
+    }
 }
 
 #[cfg(target_os = "windows")]
@@ -263,16 +288,33 @@ fn tier_rank(t: keryx_miner::models::Tier) -> u8 {
     }
 }
 
+/// Parse a `--force-model` tier name. None on an unrecognised token.
+fn parse_tier_name(s: &str) -> Option<keryx_miner::models::Tier> {
+    use keryx_miner::models::Tier;
+    match s.trim().to_ascii_lowercase().as_str() {
+        "very-light" | "verylight" | "very_light" => Some(Tier::VeryLight),
+        "light" => Some(Tier::Light),
+        "default" => Some(Tier::Default),
+        "high" => Some(Tier::High),
+        "very-high" | "veryhigh" | "very_high" => Some(Tier::VeryHigh),
+        _ => None,
+    }
+}
+
 /// Assign each CUDA device the highest PoM tier that (a) is ≤ the `ceiling` flag and (b) fits its
 /// VRAM — so a heterogeneous rig mines a different tier per GPU instead of the lowest common
 /// denominator, small cards downgrade instead of failing, and big cards are not pushed past the
 /// user's ceiling. VRAM is CUDA-driver-sourced (`query_all_gpus_vram`), so `device_id`s match the
 /// devices the walk loads onto. Empty when PoM is disabled on this network; a single device-0 entry
 /// (highest tier ≤ ceiling) when no CUDA device is enumerated, so the fallback walk still has a tier.
+/// `forced` (from `--force-model`, indexed by device id) wins per-card over both the ceiling and
+/// the VRAM floor — the tier is still proven by the walk on the real weights, so forcing is only
+/// ever self-penalising (OOM / partial-possession slowdown / bigger burn on a smaller tier).
 /// Returns `(device_id, hardware_tier, spec)` per GPU: the stable VRAM-picked hardware tier and
 /// the single model that tier mines and serves.
 fn assign_pom_tiers(
     ceiling: keryx_miner::models::Tier,
+    forced: &[Option<keryx_miner::models::Tier>],
 ) -> Vec<(u32, keryx_miner::models::Tier, &'static keryx_miner::models::ModelSpec)> {
     if keryx_miner::pom::pom_activation_daa() == u64::MAX {
         return Vec::new(); // PoM disabled on this network — serve only, don't mine possession.
@@ -291,11 +333,32 @@ fn assign_pom_tiers(
 
     let devices = keryx_miner::pom_gpu::query_all_gpus_vram();
     if devices.is_empty() {
+        // No enumeration: a forced first entry still wins for the fallback device-0 tier.
+        if let Some(t) = forced.first().copied().flatten() {
+            log::warn!("No CUDA device enumerated for PoM tier assignment — assigning the forced tier to device 0 (fallback).");
+            return vec![(0u32, t, keryx_miner::models::spec_for_tier(t))];
+        }
         log::warn!("No CUDA device enumerated for PoM tier assignment — assigning the ceiling tier to device 0 (fallback).");
         return candidates.first().map(|(_, t, s)| vec![(0u32, *t, *s)]).unwrap_or_default();
     }
     let mut out = Vec::with_capacity(devices.len());
     for (id, vram_mb) in devices {
+        match forced.get(id as usize).copied() {
+            Some(Some(t)) => {
+                let spec = keryx_miner::models::spec_for_tier(t);
+                log::info!(
+                    "PoM: GPU {} → {} (--force-model; VRAM floor bypassed — an undersized card will OOM loading it).",
+                    id, spec.dir_name
+                );
+                out.push((id as u32, t, spec));
+                continue;
+            }
+            Some(None) => log::warn!(
+                "PoM: GPU {}: --force-model entry unrecognised — using auto (names: very-light|light|default|high|very-high).",
+                id
+            ),
+            None => {}
+        }
         match pick(vram_mb) {
             Some((t, spec)) => out.push((id as u32, t, spec)),
             None => log::warn!("PoM: GPU {} ({} MB VRAM) fits no tier ≤ the ceiling — it will not mine PoM.", id, vram_mb),
@@ -656,9 +719,24 @@ async fn run() -> Result<(), Error> {
     //   --high       → Qwen3.6-27B
     //   --very-high  → Kimi-Linear-48B
 
+    // Per-card tier overrides (--force-model, CUDA-driver order). Parsed once here — the power
+    // warning below and the per-GPU assignment both need them.
+    let forced_tiers: Vec<Option<keryx_miner::models::Tier>> = opt
+        .force_model
+        .as_deref()
+        .map(|s| s.split(',').map(parse_tier_name).collect())
+        .unwrap_or_default();
+    if let Some(raw) = opt.force_model.as_deref() {
+        info!("--force-model: {} — per-card tier override (VRAM floor bypassed; unlisted/extra cards use auto).", raw.trim());
+    }
+    let forced_max_rank = forced_tiers.iter().flatten().map(|t| tier_rank(*t)).max();
+
     // Warn if GPU power limit is below safe threshold for the selected model tier.
     // Low PL causes CUDA FIFO instability (Xid 32) under large GEMM workloads.
-    check_gpu_power_limit(opt.high || opt.very_high, opt.very_high);
+    check_gpu_power_limit(
+        opt.high || opt.very_high || forced_max_rank.is_some_and(|r| r >= 3),
+        opt.very_high || forced_max_rank.is_some_and(|r| r >= 4),
+    );
 
     let tier = if opt.very_high {
         info!("--very-high mode: top tier — mines Kimi-Linear-48B under PoM.");
@@ -678,8 +756,9 @@ async fn run() -> Result<(), Error> {
     };
     // Per-GPU PoM assignment: each CUDA device mines the highest tier ≤ the flag ceiling that its
     // VRAM holds (small cards downgrade instead of failing; big cards are not pushed past the
-    // ceiling). VRAM is CUDA-driver-sourced so device_ids match the devices the walk loads onto.
-    let pom_assignments = assign_pom_tiers(tier);
+    // ceiling). --force-model entries win per-card over both. VRAM is CUDA-driver-sourced so
+    // device_ids match the devices the walk loads onto.
+    let pom_assignments = assign_pom_tiers(tier, &forced_tiers);
     // The served/announced lineup (ai:cap) = the current-era models across all GPUs.
     let specs = lineup_from_assignments(&pom_assignments, tier);
     keryx_miner::slm::init_supported(specs);
