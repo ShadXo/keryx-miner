@@ -26,6 +26,11 @@ env:
 jobs:
   # Only runs for nextgen_kernel=native. The shipped cuda/pom_mine_nextgen.fatbin
   # is stale (predates the ILP x2 commit); this rebuilds it from current source.
+  #
+  # The gencode set must cover every cc that pom_gpu.rs::is_nextgen_device routes
+  # here (major > 8, or 8.9) — that includes sm_90. compute_120 PTX cannot JIT
+  # *down* to Hopper, so omitting sm_90 makes the nextgen load fail there and the
+  # card silently drops to the legacy fatbin's sm_86 PTX at reduced throughput.
   fatbin:
     if: inputs.nextgen_kernel == 'native'
     runs-on: ubuntu-latest
@@ -37,6 +42,7 @@ jobs:
           docker run --rm -v "$PWD":/src -w /src "$FATBIN_IMAGE" \
             nvcc -fatbin -O3 \
               -gencode arch=compute_89,code=sm_89 \
+              -gencode arch=compute_90,code=sm_90 \
               -gencode arch=compute_100,code=sm_100 \
               -gencode arch=compute_120,code=sm_120 \
               -gencode arch=compute_120,code=compute_120 \
@@ -140,6 +146,10 @@ jobs:
               cp target/release/libkeryxcuda.so pkg/
               cp dist/libkeryx-llama.so pkg/
               cp Cargo.lock pkg/
+              # Must be sampled INSIDE the container: the "Record build inputs" step
+              # runs on the ubuntu-latest host, whose glibc (2.39) is not what these
+              # binaries were linked against and wrongly implies HiveOS breakage.
+              ldd --version | head -1 > pkg/.glibc
               ls -la pkg/
             '
           sudo chown -R "$(id -u):$(id -g)" .
@@ -151,8 +161,9 @@ jobs:
             echo "nextgen kernel: ${{ inputs.nextgen_kernel }}"
             echo "llama archs:    ${{ inputs.llama_archs }}"
             echo "toolchain:      CUDA 12.2.2 / ubuntu20.04"
+            echo "build glibc:    $(cat pkg/.glibc)"
           } > pkg/BUILDINFO.txt
-          ldd --version | head -1 >> pkg/BUILDINFO.txt
+          rm -f pkg/.glibc
 
       - uses: actions/upload-artifact@v4
         with:

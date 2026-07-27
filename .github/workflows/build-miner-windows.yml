@@ -9,6 +9,11 @@ on:
       llama_archs:
         description: "llama.cpp CUDA archs (CMake syntax)"
         default: "86-real;89-real;89-virtual"
+      nextgen_kernel:
+        description: "How RTX 40xx/50xx get the new PoM kernel"
+        type: choice
+        options: [ptx, native]
+        default: ptx
 
 env:
   LLAMA_TAG: b10015
@@ -43,6 +48,24 @@ jobs:
         with:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
 
+      # Without this the PoM nextgen fatbin is empty and cc 12.0 falls through the
+      # PTX ladder to sm_90 PTX (POM_SM_LIST tops out at 90 — there is no sm_120
+      # PoM PTX), so a 50-series card JITs instead of running native SASS.
+      # nvcc needs cl.exe, which msvc-dev-cmd put on PATH above.
+      - name: Compile nextgen fatbin
+        if: inputs.nextgen_kernel == 'native'
+        shell: pwsh
+        run: |
+          & "$env:CUDA_PATH\bin\nvcc.exe" -fatbin -O3 `
+            -gencode arch=compute_89,code=sm_89 `
+            -gencode arch=compute_90,code=sm_90 `
+            -gencode arch=compute_100,code=sm_100 `
+            -gencode arch=compute_120,code=sm_120 `
+            -gencode arch=compute_120,code=compute_120 `
+            cuda\pom_mine.cu -o pom_mine_nextgen.fatbin
+          if ($LASTEXITCODE -ne 0) { throw "nvcc -fatbin failed" }
+          Get-Item pom_mine_nextgen.fatbin | Select-Object Name,Length
+
       - uses: dtolnay/rust-toolchain@stable
 
       - name: Cache cargo
@@ -59,9 +82,12 @@ jobs:
         shell: pwsh
         env:
           KERYX_LLAMA_ARCHS: ${{ inputs.llama_archs }}
-          # Path must NOT exist -> build.rs writes an empty placeholder, the stale
-          # nextgen fatbin is skipped, and the PTX ladder is used instead.
-          POM_FATBIN_NEXTGEN: cuda\__no_nextgen.fatbin
+          # native -> freshly compiled SASS from the step above (path is relative to
+          #           the root package dir, which is where build.rs runs).
+          # ptx    -> path must NOT exist, so build.rs writes an empty placeholder,
+          #           the stale committed nextgen fatbin is skipped, and the PTX
+          #           ladder is used instead.
+          POM_FATBIN_NEXTGEN: ${{ inputs.nextgen_kernel == 'native' && 'pom_mine_nextgen.fatbin' || 'cuda\__no_nextgen.fatbin' }}
         run: |
           $env:NVCC = "$env:CUDA_PATH\bin\nvcc.exe"
           cargo build --release -p keryx-miner -p keryxcuda
@@ -83,6 +109,6 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: keryx-miner-win64-${{ github.sha }}
+          name: keryx-miner-win64-${{ inputs.nextgen_kernel }}-${{ github.sha }}
           path: pkg/
           retention-days: 14
