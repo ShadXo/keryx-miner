@@ -49,11 +49,21 @@ jobs:
           key: ci-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: ci-${{ runner.os }}-
 
+      # Two upstream tests are skipped, NOT fixed. src/pow/heavy_hash.rs is byte-identical
+      # to upstream and contains wave_mix (Keryx's ARX post-processing on top of the kaspa
+      # PoW), but test_heavy_hash and test_generate_matrix still assert kaspa-era hardcoded
+      # vectors from before that change, so they fail on a clean upstream checkout too.
+      # Regenerating the expected values from the current implementation would make them
+      # assert only that the code equals itself — worthless for a consensus hash — so they
+      # stay skipped until upstream supplies real post-wave_mix vectors.
       - name: Unit tests
         env:
           KERYX_LLAMA_SKIP: "1"
           NVCC: /usr/local/cuda/bin/nvcc
-        run: cargo test -p keryx-miner
+        run: |
+          cargo test -p keryx-miner -- \
+            --skip pow::heavy_hash::tests::test_heavy_hash \
+            --skip pow::heavy_hash::tests::test_generate_matrix
 
       # keryxcuda is a cdylib plugin with no unit tests of its own; type-check it so a
       # break in worker.rs (the PoW image-selection ladder) fails here rather than in a
