@@ -77,7 +77,7 @@ jobs:
       - name: Compile nextgen fatbin
         run: |
           docker run --rm -v "$PWD":/src -w /src "$FATBIN_IMAGE" \
-            nvcc -fatbin -O3 \
+            nvcc -fatbin -O3 -Xptxas -v \
               -gencode arch=compute_89,code=sm_89 \
               -gencode arch=compute_90,code=sm_90 \
               -gencode arch=compute_100,code=sm_100 \
@@ -100,7 +100,7 @@ jobs:
       - name: Compile legacy fatbin
         run: |
           docker run --rm -v "$PWD":/src -w /src "$FATBIN_IMAGE" \
-            nvcc -fatbin -O3 -Wno-deprecated-gpu-targets \
+            nvcc -fatbin -O3 -Wno-deprecated-gpu-targets -Xptxas -v \
               -gencode arch=compute_61,code=sm_61 \
               -gencode arch=compute_70,code=sm_70 \
               -gencode arch=compute_75,code=sm_75 \
