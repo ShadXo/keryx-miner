@@ -41,8 +41,9 @@
 //   verified reciprocal flat (reverted in effd557), and the kernel already at maximum occupancy
 //   (26 registers, zero spill -- see -Xptxas -v in the build log).
 //
-//   PoM kernel optimisation is CLOSED except for the open question below. The levers that move
-//   this workload are memory clock and model tier, neither of which lives in the kernel.
+//   PoM kernel optimisation is CLOSED -- every branch ruled out by a measurement rather than an
+//   inference. The levers that move this workload are memory clock and model tier, neither of
+//   which lives in the kernel.
 // ---------------------------------------------------------------------------------------------
 //
 // Three kernels, same 32-byte random reads over the same ~8 GB footprint:
