@@ -12,11 +12,13 @@ on:
       llama_archs:
         description: "llama.cpp CUDA archs (CMake syntax). Narrow it to shrink the build if your fleet has no Turing/A100."
         default: "75-real;80-real;86-real;89-real;89-virtual"
+      # Defaults to native — see the note in build-miner.yml: `ptx` empties the nextgen fatbin
+      # and the PTX ladder stops at sm_90, so Blackwell would JIT instead of running SASS.
       nextgen_kernel:
         description: "How RTX 40xx/50xx get the new PoM kernel"
         type: choice
-        options: [ptx, native]
-        default: ptx
+        options: [native, ptx]
+        default: native
       # Default ON, unlike the Linux workflow. A Windows box has the NVIDIA driver but
       # normally NOT the CUDA toolkit, so keryx-llama.dll cannot load without these and
       # OPoI inference dies. This package has always shipped them; turn it off only when
@@ -35,7 +37,7 @@ on:
         default: "75-real;80-real;86-real;89-real;89-virtual"
       nextgen_kernel:
         type: string
-        default: ptx
+        default: native
       bundle_cuda_runtime:
         type: boolean
         default: true

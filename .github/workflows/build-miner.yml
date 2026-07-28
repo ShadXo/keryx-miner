@@ -11,11 +11,14 @@ on:
       llama_archs:
         description: "llama.cpp CUDA archs (CMake syntax). Narrow it to shrink the build if your fleet has no Turing/A100."
         default: "75-real;80-real;86-real;89-real;89-virtual"
+      # Defaults to native: `ptx` empties the nextgen fatbin, which sends every cc >= 8.9 card
+      # down the PTX ladder — and that ladder tops out at sm_90, so Blackwell JITs instead of
+      # running SASS. `ptx` stays available for debugging the fallback path itself.
       nextgen_kernel:
         description: "How RTX 40xx/50xx get the new PoM kernel"
         type: choice
-        options: [ptx, native]
-        default: ptx
+        options: [native, ptx]
+        default: native
       bundle_cuda_runtime:
         description: "Ship libcudart/libcublas beside the binary, for hosts with a driver but no CUDA toolkit. Adds ~400 MB zipped (libcublasLt alone is 526 MB)."
         type: boolean
@@ -31,7 +34,7 @@ on:
         default: "75-real;80-real;86-real;89-real;89-virtual"
       nextgen_kernel:
         type: string
-        default: ptx
+        default: native
       bundle_cuda_runtime:
         type: boolean
         default: false
@@ -41,7 +44,12 @@ on:
 
 env:
   LLAMA_TAG: b10015
-  BUILD_IMAGE: nvidia/cuda:12.2.2-devel-ubuntu20.04   # glibc 2.31, gcc 9
+  # ubuntu20.04 is what pins glibc to 2.31 (HiveOS compatibility) — the CUDA version is
+  # independent of it. 12.8 rather than 12.2 because build.rs compiles the PoM PTX ladder with
+  # THIS toolkit: nvcc 12.2 emits PTX ISA 8.2 from a compiler that has never heard of sm_120, and
+  # JIT-ing that onto Blackwell is measurably slower than ISA 8.7. Only reachable when the
+  # nextgen fatbin fails to load, but there is no reason to leave the fallback crippled.
+  BUILD_IMAGE: nvidia/cuda:12.8.2-devel-ubuntu20.04   # glibc 2.31, gcc 9
   # Must be <= the CUDA version your DRIVER reports (see "CUDA driver API version"
   # in the miner log). A fatbin from a newer toolkit fails with "device kernel
   # image is invalid". 12.8 toolkit -> needs driver r570+.
@@ -143,7 +151,7 @@ jobs:
           # Bump the suffix whenever build.rs changes how the .so is LINKED — a cache hit sets
           # KERYX_LLAMA_SKIP=1 and reuses the old binary, so a link-flag change (here:
           # -rpath,$ORIGIN) would otherwise never reach the shipped artifact.
-          key: llama-${{ env.LLAMA_TAG }}-${{ inputs.llama_archs }}-cuda1222-rpath1-nehalem1
+          key: llama-${{ env.LLAMA_TAG }}-${{ inputs.llama_archs }}-cuda1282-rpath1-nehalem1
 
       - name: Cache cargo
         uses: actions/cache@v4
