@@ -6,16 +6,40 @@
 // maximum occupancy (26 registers, zero spill). That is consistent with being at a hardware
 // ceiling, but "consistent with" is not a measurement. This measures it.
 //
+// ---------------------------------------------------------------------------------------------
+// MEASURED 2026-07-28 -- RTX 5070 Ti (sm_120, 70 SMs), CUDA 13.x toolkit, driver API 13.3
+//   ./bench_walk_mem      # 258040832 chunks (8.26 GB), 1<<20 threads, 256 steps
+//
+//     chase (dependent)   : 342.5 GB/s  (25.08 ms)
+//     indep (independent) : 317.5 GB/s  (27.06 ms)
+//     miner, same card    : ~315   GB/s
+//
+//   * 342.5 GB/s is the CEILING for this access pattern -- 38% of the 896 GB/s datasheet figure.
+//     Random 32-byte reads over 8 GB do not reach sequential peak: that is DRAM row cycling and
+//     access granularity, not an inefficiency anywhere in the kernel.
+//   * The miner runs at 92% of that ceiling. The ENTIRE cost of the walk's math -- four chained
+//     mix64, the 64-bit modulo, and the ~9-load binary search -- is 8.7%.
+//   * indep <= chase, so memory-level parallelism is NOT the limit. Independent access with many
+//     misses in flight per thread buys nothing over a strict pointer chase, and anything that adds
+//     MLP (ILP variants, higher occupancy, more threads) therefore cannot help.
+//
+//   Consistent with every other measurement on this card: ILP x2 flat (38.4 vs 38.6), block size
+//   64/128/256 flat (three different winners, same throughput), replacing the 64-bit modulo with a
+//   verified reciprocal flat (reverted in effd557), and the kernel already at maximum occupancy
+//   (26 registers, zero spill -- see -Xptxas -v in the build log).
+//
+//   PoM kernel optimisation is CLOSED except for the open question below. The levers that move
+//   this workload are memory clock and model tier, neither of which lives in the kernel.
+// ---------------------------------------------------------------------------------------------
+//
 // Three kernels, same 32-byte random reads over the same ~8 GB footprint:
 //
 //   chase        DEPENDENT. The next index is READ from the chunk, so each thread has exactly one
 //                outstanding miss at a time -- the walk's shape, since its next offset cannot be
 //                known until the current chunk arrives. No modulo, no search, no mix64: pure
-//                memory. Measured 342.5 GB/s on a 5070 Ti; that is the ceiling.
+//                memory. This is what sets the ceiling above.
 //
 //   indep        INDEPENDENT. The index is COMPUTED, so many misses can be in flight per thread.
-//                Measured 317.5 -- no faster than chase, so memory-level parallelism is NOT the
-//                limit and nothing that adds it can help.
 //
 //   chase+search chase plus the miner's tensor lookup: binary search prefix[], index off bases[].
 //                Still no mix64, no modulo. The delta against chase isolates the cost of the ~9
