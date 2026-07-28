@@ -575,10 +575,22 @@ impl PomGpuMiner {
     /// guards). Byte-exact — neither knob changes results, only occupancy and scheduling — so
     /// no re-validation of the walk is needed afterwards.
     ///
-    /// Both defaults matter: a hardcoded 256 leaves real throughput on Ampere (optima cluster at
-    /// 64 and 1024), and unconditional ILP x2 is a regression on parts that already keep enough
-    /// misses in flight. `KERYX_POM_BLOCK=<n>` forces a block size and skips the sweep;
-    /// `KERYX_POM_ILP2=0|1` forces the ILP choice; `KERYX_POM_NO_AUTOTUNE=1` keeps the defaults.
+    /// The BLOCK sweep earns its place; the ILP probe has not yet. Measured:
+    ///
+    ///   RTX 3080  (sm_86, GDDR6X)  block 1024, stably across restarts -- 4x the 256 default.
+    ///                              Matches ocminer/keryx-miner-supr's note (sm_86 3070: 64/1024).
+    ///   RTX 5070 Ti (sm_120)       flat. Three restarts picked 64, 128 and 256 at the same
+    ///                              throughput, i.e. the sweep is choosing noise there -- harmless,
+    ///                              since every candidate is equivalent on that part.
+    ///
+    /// So a hardcoded block size would cost real throughput on Ampere while gaining nothing on
+    /// Blackwell, which is exactly the case for measuring per device rather than guessing.
+    ///
+    /// ILP x2, by contrast, has never been selected on any card measured -- see the note in
+    /// cuda/pom_mine.cu. The probe is kept because the kernel is upstream's and costs ~0.4s once.
+    ///
+    /// `KERYX_POM_BLOCK=<n>` forces a block size and skips the sweep; `KERYX_POM_ILP2=0|1` forces
+    /// the ILP choice; `KERYX_POM_NO_AUTOTUNE=1` keeps the defaults.
     fn autotune_block(&self, device_id: u32) {
         if let Ok(s) = std::env::var("KERYX_POM_BLOCK") {
             if let Some(n) = s.trim().parse::<u32>().ok().filter(|n| (1..=1024).contains(n)) {
