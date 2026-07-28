@@ -5,6 +5,27 @@
 
 #include <cstdint>
 
+// `off = state % n_total_chunks` sits on the walk's serial dependency chain, once per step,
+// 256 steps per nonce. n_total_chunks is a runtime kernel argument, so nvcc cannot fold it into
+// a multiply and emits the full emulated 64-bit modulo (~70-100 instructions).
+//
+// Replace it with a precomputed reciprocal: the host passes m = floor(2^(64+s)/d) with
+// s = floor(log2(d)) - 1, which guarantees m < 2^64 and makes the quotient an UNDER-estimate by
+// at most 1 (see pom_gpu.rs::modulus_magic). Two conditional subtracts then land the remainder
+// in [0, d). Byte-exact: it computes the same value `%` does, just without dividing.
+//
+// m == 0 means "host self-test failed" and falls back to the real modulo. The flag is uniform
+// across every thread in the launch, so the branch never diverges.
+__device__ __forceinline__ unsigned long long pom_mod(
+    unsigned long long x, unsigned long long d, unsigned long long m, unsigned int s) {
+    if (m == 0ULL) return x % d;
+    unsigned long long q = __umul64hi(x, m) >> s;
+    unsigned long long r = x - q * d;
+    if (r >= d) r -= d;
+    if (r >= d) r -= d;
+    return r;
+}
+
 __device__ __forceinline__ unsigned long long mix64(unsigned long long x) {
     x ^= x >> 30; x *= 0xbf58476d1ce4e5b9ULL;
     x ^= x >> 27; x *= 0x94d049bb133111ebULL;
@@ -53,13 +74,14 @@ extern "C" __global__ void pom_mine(const unsigned long long* bases, const unsig
                                     unsigned long long time_,
                                     unsigned long long t0, unsigned long long t1, unsigned long long t2, unsigned long long t3,
                                     unsigned long long nonce_base, unsigned long long n_nonces,
-                                    unsigned long long* winner, unsigned int walk_v2) {
+                                    unsigned long long* winner, unsigned int walk_v2,
+                                    unsigned long long mod_m, unsigned int mod_s) {
     unsigned long long tid = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
     if (tid >= n_nonces) return;
     unsigned long long nonce = nonce_base + tid;
 
     unsigned long long state = pom_seed_fold(nonce, time_, s0, s1, s2, s3);
-    unsigned long long off = state % n_total_chunks;
+    unsigned long long off = pom_mod(state, n_total_chunks, mod_m, mod_s);
     for (unsigned int i = 0; i < K; i++) {
         unsigned int lo = 0, hi = T;
         while (lo + 1 < hi) {
@@ -86,7 +108,7 @@ extern "C" __global__ void pom_mine(const unsigned long long* bases, const unsig
             h ^= a.x; h ^= a.y; h ^= c.x; h ^= c.y;
             state = mix64(h);
         }
-        off = state % n_total_chunks;
+        off = pom_mod(state, n_total_chunks, mod_m, mod_s);
     }
     unsigned long long pv[4];
     pom_pow_fold(state, p0, p1, p2, p3, pv);
@@ -111,7 +133,8 @@ extern "C" __global__ void pom_mine_ilp2(const unsigned long long* bases, const 
                                     unsigned long long time_,
                                     unsigned long long t0, unsigned long long t1, unsigned long long t2, unsigned long long t3,
                                     unsigned long long nonce_base, unsigned long long n_nonces,
-                                    unsigned long long* winner, unsigned int walk_v2) {
+                                    unsigned long long* winner, unsigned int walk_v2,
+                                    unsigned long long mod_m, unsigned int mod_s) {
     unsigned long long tid = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
     unsigned long long i0 = tid * 2ULL;
     if (i0 >= n_nonces) return;
@@ -124,8 +147,8 @@ extern "C" __global__ void pom_mine_ilp2(const unsigned long long* bases, const 
 
     unsigned long long state0 = pom_seed_fold(nonce0, time_, s0, s1, s2, s3);
     unsigned long long state1 = pom_seed_fold(nonce1, time_, s0, s1, s2, s3);
-    unsigned long long off0 = state0 % n_total_chunks;
-    unsigned long long off1 = state1 % n_total_chunks;
+    unsigned long long off0 = pom_mod(state0, n_total_chunks, mod_m, mod_s);
+    unsigned long long off1 = pom_mod(state1, n_total_chunks, mod_m, mod_s);
     for (unsigned int i = 0; i < K; i++) {
         unsigned int lo0 = 0, hi0 = T;
         while (lo0 + 1 < hi0) {
@@ -163,8 +186,8 @@ extern "C" __global__ void pom_mine_ilp2(const unsigned long long* bases, const 
             h1 ^= a1.x; h1 ^= a1.y; h1 ^= c1.x; h1 ^= c1.y;
             state0 = mix64(h0); state1 = mix64(h1);
         }
-        off0 = state0 % n_total_chunks;
-        off1 = state1 % n_total_chunks;
+        off0 = pom_mod(state0, n_total_chunks, mod_m, mod_s);
+        off1 = pom_mod(state1, n_total_chunks, mod_m, mod_s);
     }
     unsigned long long pv[4];
     pom_pow_fold(state0, p0, p1, p2, p3, pv);
