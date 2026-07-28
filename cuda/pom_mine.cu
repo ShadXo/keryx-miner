@@ -43,9 +43,9 @@ __device__ __forceinline__ bool pom_le_leq(const unsigned long long a[4],
 // keeps p0..p3 — pre-H5.1 the host passes identical words, keeping behavior bit-identical.
 //
 // ILP1 — one nonce per thread. The host launches `batch` threads for this entry point.
-// This is the DEFAULT: ILP x2 only pays off where a single nonce/thread leaves outstanding-miss
-// slots unused (GDDR6X-class parts). On hardware that already saturates them it is a regression,
-// so `pom_mine_ilp2` below is opt-in per device — see `autotune_block` in src/pom_gpu.rs.
+// This is the DEFAULT, and on every card measured so far it is also what the startup sweep picks
+// — see the note on `pom_mine_ilp2` below. Selection is per device (`autotune_block` in
+// src/pom_gpu.rs), so a part where ILP x2 does win will still get it.
 extern "C" __global__ void pom_mine(const unsigned long long* bases, const unsigned long long* prefix,
                                     unsigned int T, unsigned long long n_total_chunks, unsigned int K,
                                     unsigned long long p0, unsigned long long p1, unsigned long long p2, unsigned long long p3,
@@ -101,9 +101,26 @@ extern "C" __global__ void pom_mine(const unsigned long long* bases, const unsig
 // Byte-exact per nonce: each walk's math is untouched, only the instruction scheduling
 // interleaves. The host launches ceil(batch/2) threads (grid calc in src/pom_gpu.rs).
 //
-// NOT universally faster — the extra live state costs registers, so parts that already keep
-// enough misses in flight lose throughput. Selected per device by the startup sweep, never
-// unconditionally.
+// Its premise -- that a walk reaching only ~24% of a 3090's bandwidth must be threads idling with
+// spare memory capacity -- turned out not to hold. The observation was right (a 3080 measures 26%
+// of spec, a 5070 Ti 35%), but tools/bench_walk_mem.cu shows independent access with many misses
+// in flight per thread is NO faster than a strict pointer chase: memory-level parallelism is not
+// what limits this walk, so giving each thread a second nonce cannot recover the gap.
+//
+// Measured, ILP1 vs ILP2 (Mnonce/s):
+//     RTX 5070 Ti  GDDR7    38.4 / 38.6      flat
+//     RTX 3080     GDDR6X   24.5 / 24.2      ILP1 ahead -- and GDDR6X is the class this targeted
+//     RTX 3070     GDDR6     ~0 delta        (ocminer/keryx-miner-supr)
+//     RTX 5090     GDDR7    ILP2 -6%         (ocminer/keryx-miner-supr)
+//
+// Note the ~+47% GDDR6X figure often quoted alongside this belongs to the VECTORIZED CHUNK READ
+// (02fe488, ~17 -> ~25 MH/s on a 3090), not to ILP x2 (7464a0b), which shipped without a measurement.
+// The vectorized read is in both kernels and does work.
+//
+// Kept because it is upstream's kernel and dropping it would deepen the divergence for no gain;
+// the sweep simply never selects it. Selected per device, never unconditionally -- shipping it
+// unconditionally is what produced the half-range bug, since the host switched to ceil(batch/2)
+// threads while the nextgen fatbin was left holding a one-nonce-per-thread kernel.
 extern "C" __global__ void pom_mine_ilp2(const unsigned long long* bases, const unsigned long long* prefix,
                                     unsigned int T, unsigned long long n_total_chunks, unsigned int K,
                                     unsigned long long p0, unsigned long long p1, unsigned long long p2, unsigned long long p3,
