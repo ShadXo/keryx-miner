@@ -6,32 +6,37 @@
 // maximum occupancy (26 registers, zero spill). That is consistent with being at a hardware
 // ceiling, but "consistent with" is not a measurement. This measures it.
 //
-// Two kernels, same 32-byte random reads over the same ~8 GB footprint:
+// Three kernels, same 32-byte random reads over the same ~8 GB footprint:
 //
-//   chase  DEPENDENT. The next index is READ from the chunk, so each thread has exactly one
-//          outstanding miss at a time -- the same shape as the walk, whose next offset cannot be
-//          known until the current chunk comes back. No modulo, no binary search, no mix64 in the
-//          loop: pure memory.
+//   chase        DEPENDENT. The next index is READ from the chunk, so each thread has exactly one
+//                outstanding miss at a time -- the walk's shape, since its next offset cannot be
+//                known until the current chunk arrives. No modulo, no search, no mix64: pure
+//                memory. Measured 342.5 GB/s on a 5070 Ti; that is the ceiling.
 //
-//   indep  INDEPENDENT. The index is COMPUTED, so a thread can have many misses in flight at once.
-//          This is what the memory system can do when the dependency chain is removed.
+//   indep        INDEPENDENT. The index is COMPUTED, so many misses can be in flight per thread.
+//                Measured 317.5 -- no faster than chase, so memory-level parallelism is NOT the
+//                limit and nothing that adds it can help.
 //
-// Reading the result against the miner's ~315 GB/s:
+//   chase+search chase plus the miner's tensor lookup: binary search prefix[], index off bases[].
+//                Still no mix64, no modulo. The delta against chase isolates the cost of the ~9
+//                dependent prefix[] loads, which is the last unexplained piece of the miner's
+//                8.7% shortfall (315 vs 342.5).
 //
-//   chase ~= 315          the walk is at the dependent-access ceiling; the kernel is done.
-//   chase >> 315          the walk's own math is costing throughput after all -- go look again.
-//   indep >> chase        the limit is the serial chain (outstanding misses per thread), not
-//                         granularity or DRAM efficiency. More memory-level parallelism would pay,
-//                         which is worth knowing since ILP x2 keeps total MLP flat by halving the
-//                         thread count -- it never actually tested this.
-//   indep ~= chase        the limit is the memory system itself (access granularity, row
-//                         cycling, TLB), and nothing in software reaches it.
+// Why that third one is the question: removing the 64-bit modulo from the real kernel measured
+// EXACTLY zero. If the shortfall were arithmetic that should have moved. It did not -- pointing at
+// load-issue pressure instead, ~11 loads per step against 2.
+//
+//   chase+search ~= 318   the search IS the shortfall. A bucket index (host-built chunk-range ->
+//                         tensor table, collapsing ~9 dependent loads to 1 plus a short scan)
+//                         would recover most of it, and is worth the consensus-code risk.
+//   chase+search ~= 340   the search is free; the remainder is mix64, which consensus fixes.
+//                         PoM kernel optimisation is then finished for good.
 //
 // Build (nvcc that knows your arch -- 12.8+ for sm_120):
 //   nvcc -O3 -arch=sm_120 tools/bench_walk_mem.cu -o bench_walk_mem
 // Run (needs ~8.3 GB free, so stop the miner or point it at an idle GPU):
 //   ./bench_walk_mem            # defaults to the tier-2 chunk count
-//   ./bench_walk_mem <chunks> <threads> <steps> <device>
+//   ./bench_walk_mem <chunks> <threads> <steps> <device> <tensors>
 
 #include <cstdio>
 #include <cstdlib>
@@ -89,6 +94,36 @@ __global__ void indep(const ulonglong2* buf, unsigned int K,
     if (acc == 0xDEADBEEFULL) out[0] = acc;
 }
 
+// chase + the miner's tensor lookup, and nothing else. Same pointer chase, but the chunk address
+// is resolved the way pom_mine resolves it: binary search prefix[] for the owning tensor, then
+// index off bases[]. No mix64, no modulo -- so the delta against `chase` is the cost of the
+// ~9 dependent prefix[] loads plus the bases[] load, isolated from every other difference.
+//
+// This matters because removing the 64-bit modulo from the real kernel measured EXACTLY zero.
+// If the walk's 8.7% shortfall against `chase` were arithmetic, that should have moved. It did
+// not, which points at load-issue pressure instead: ~11 loads per step versus 2.
+__global__ void chase_search(const ulonglong2* buf, unsigned int K, unsigned long long* out,
+                             unsigned long long n, const unsigned long long* prefix,
+                             const unsigned long long* bases, unsigned int T) {
+    unsigned long long tid = blockIdx.x * (unsigned long long)blockDim.x + threadIdx.x;
+    unsigned long long idx = mix64(tid) % n;
+    unsigned long long acc = 0;
+    for (unsigned int k = 0; k < K; k++) {
+        unsigned int lo = 0, hi = T;
+        while (lo + 1 < hi) {
+            unsigned int mid = (lo + hi) >> 1;
+            if (prefix[mid] <= idx) lo = mid; else hi = mid;
+        }
+        unsigned long long local = idx - prefix[lo];
+        const ulonglong2* p = (const ulonglong2*)bases[lo];
+        ulonglong2 a = p[2 * local];
+        ulonglong2 c = p[2 * local + 1];
+        acc ^= a.y ^ c.x ^ c.y;
+        idx = a.x;
+    }
+    if (acc == 0xDEADBEEFULL) out[0] = idx;
+}
+
 static double gbps(double bytes, float ms) { return bytes / (ms * 1e-3) / 1e9; }
 
 int main(int argc, char** argv) {
@@ -96,16 +131,17 @@ int main(int argc, char** argv) {
     unsigned long long threads = (argc > 2) ? strtoull(argv[2], nullptr, 10) : (1ULL << 20);
     unsigned int       K       = (argc > 3) ? (unsigned)atoi(argv[3]) : 256u;
     int                dev     = (argc > 4) ? atoi(argv[4]) : 0;
+    unsigned int       T       = (argc > 5) ? (unsigned)atoi(argv[5]) : 400u;   // tensor count
 
     CK(cudaSetDevice(dev));
     cudaDeviceProp p{};
     CK(cudaGetDeviceProperties(&p, dev));
 
-    // Peak = bus width x memory clock x 2 (DDR). Reported for context only.
-    double peak = (double)p.memoryBusWidth / 8.0 * (double)p.memoryClockRate * 1e3 * 2.0 / 1e9;
+    // No spec-peak lookup: cudaDeviceProp::memoryClockRate was deprecated in CUDA 12 and REMOVED
+    // in 13, so reading it will not compile on a current toolkit. Only these four fields are
+    // relied on. Compare the absolute GB/s below against the card's datasheet figure.
     size_t bytes = (size_t)n * 32;
     printf("device      : %s (sm_%d%d, %d SMs)\n", p.name, p.major, p.minor, p.multiProcessorCount);
-    printf("spec peak   : %.0f GB/s\n", peak);
     printf("footprint   : %.2f GB (%llu chunks x 32 B)\n", bytes / 1e9, n);
     printf("launch      : %llu threads x %u steps\n\n", threads, K);
 
@@ -125,6 +161,24 @@ int main(int argc, char** argv) {
     while (mask * 2 <= n) mask *= 2;
     mask -= 1;   // largest power-of-two footprint that fits, so `indep` can mask instead of divide
 
+    // Tensor table for chase_search: T contiguous spans over the same buffer. Real tensors vary in
+    // size, but the search cost is log2(T) either way, and T is what sets that.
+    unsigned long long* prefix_d = nullptr;
+    unsigned long long* bases_d = nullptr;
+    {
+        unsigned long long* hp = (unsigned long long*)malloc((T + 1) * sizeof(unsigned long long));
+        unsigned long long* hb = (unsigned long long*)malloc(T * sizeof(unsigned long long));
+        for (unsigned int j = 0; j <= T; j++) hp[j] = (unsigned long long)((__int128)n * j / T);
+        for (unsigned int j = 0; j < T; j++)
+            hb[j] = (unsigned long long)(uintptr_t)(buf + 2 * hp[j]);
+        CK(cudaMalloc(&prefix_d, (T + 1) * sizeof(unsigned long long)));
+        CK(cudaMalloc(&bases_d, T * sizeof(unsigned long long)));
+        CK(cudaMemcpy(prefix_d, hp, (T + 1) * sizeof(unsigned long long), cudaMemcpyHostToDevice));
+        CK(cudaMemcpy(bases_d, hb, T * sizeof(unsigned long long), cudaMemcpyHostToDevice));
+        free(hp);
+        free(hb);
+    }
+
     cudaEvent_t t0, t1;
     CK(cudaEventCreate(&t0));
     CK(cudaEventCreate(&t1));
@@ -132,13 +186,16 @@ int main(int argc, char** argv) {
     unsigned int grid = (unsigned int)((threads + block - 1) / block);
     double moved = (double)threads * K * 32.0;
 
-    for (int which = 0; which < 2; which++) {
-        const char* name = which == 0 ? "chase (dependent)  " : "indep (independent)";
+    for (int which = 0; which < 3; which++) {
+        const char* name = which == 0 ? "chase (dependent)  "
+                         : which == 1 ? "indep (independent)"
+                                      : "chase + tensor srch";
         float best = 1e30f;
         for (int rep = 0; rep < 4; rep++) {   // first rep warms caches/TLB; keep the best of the rest
             CK(cudaEventRecord(t0));
-            if (which == 0) chase<<<grid, block>>>(buf, K, out, n);
-            else            indep<<<grid, block>>>(buf, K, out, mask);
+            if (which == 0)      chase<<<grid, block>>>(buf, K, out, n);
+            else if (which == 1) indep<<<grid, block>>>(buf, K, out, mask);
+            else                 chase_search<<<grid, block>>>(buf, K, out, n, prefix_d, bases_d, T);
             CK(cudaEventRecord(t1));
             CK(cudaEventSynchronize(t1));
             CK(cudaGetLastError());
@@ -146,11 +203,12 @@ int main(int argc, char** argv) {
             CK(cudaEventElapsedTime(&ms, t0, t1));
             if (rep > 0 && ms < best) best = ms;
         }
-        printf("%s : %7.1f GB/s  (%.1f%% of spec, %6.2f ms)\n",
-               name, gbps(moved, best), 100.0 * gbps(moved, best) / peak, best);
+        printf("%s : %7.1f GB/s  (%6.2f ms)\n", name, gbps(moved, best), best);
     }
 
     printf("\nminer for comparison: ~315 GB/s at 38.4 Mnonce/s x 256 steps x 32 B\n");
+    cudaFree(prefix_d);
+    cudaFree(bases_d);
     cudaFree(buf);
     cudaFree(out);
     return 0;
