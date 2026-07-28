@@ -152,6 +152,8 @@ impl LoadedPomKernel {
         start: u64,
         batch: u64,
         walk_v2: u32,
+        mod_m: u64,
+        mod_s: u32,
         block: u32,
         want_ilp2: bool,
     ) -> Result<Option<u64>> {
@@ -174,7 +176,7 @@ impl LoadedPomKernel {
         let (prefix_ptr, _prefix_guard) = prefix_dev.device_ptr(stream);
         let (winner_ptr, _winner_guard) = winner.device_ptr(stream);
 
-        let mut params: [*mut c_void; 22] = [
+        let mut params: [*mut c_void; 24] = [
             (&bases_ptr as *const _ as *mut c_void),
             (&prefix_ptr as *const _ as *mut c_void),
             (&t_count as *const _ as *mut c_void),
@@ -197,6 +199,8 @@ impl LoadedPomKernel {
             (&batch as *const _ as *mut c_void),
             (&winner_ptr as *const _ as *mut c_void),
             (&walk_v2 as *const _ as *mut c_void),
+            (&mod_m as *const _ as *mut c_void),
+            (&mod_s as *const _ as *mut c_void),
         ];
 
         unsafe { result::launch_kernel(function, cfg.grid_dim, cfg.block_dim, cfg.shared_mem_bytes, stream.cu_stream(), &mut params) }?;
@@ -341,6 +345,91 @@ fn select_pom_kernel(device_id: usize) -> Result<LoadedPomKernel> {
     Err(anyhow!("PoM GPU: no compatible PTX image for this device/driver"))
 }
 
+/// Reciprocal for `x % d` on the GPU: returns `(m, s)` such that
+/// `q = (umulhi(x, m) >> s)` under-estimates `x / d` by at most 1, so the kernel recovers the
+/// exact remainder with at most two conditional subtracts (see `pom_mod` in cuda/pom_mine.cu).
+///
+/// `s = floor(log2(d)) - 1` is what keeps `m = floor(2^(64+s)/d)` inside 64 bits: `2^s < d`
+/// implies `m < 2^64`. Taking the FLOOR (never a rounded-up magic) is what guarantees the
+/// estimate is low rather than high — an over-estimate would wrap the subtraction and the
+/// conditional fixups could not recover it.
+///
+/// Returns `None` when the shortcut does not apply (`d < 4`, or a power of two, where `%` is
+/// already a mask); the kernel then falls back to a real modulo.
+fn modulus_magic(d: u64) -> Option<(u64, u32)> {
+    if d < 4 || d.is_power_of_two() {
+        return None;
+    }
+    let s = (63 - d.leading_zeros()).checked_sub(1)?;
+    let m = ((1u128 << (64 + s)) / d as u128) as u64;
+    Some((m, s))
+}
+
+/// Proves the reciprocal against the real `%` before it is ever used to mine.
+///
+/// This is consensus-adjacent arithmetic: a remainder that is wrong for even one input walks the
+/// wrong chunk, which yields a wrong `final_state` and a block the node rejects with
+/// `PomFinalStateMismatch`. Rather than trust the derivation, check it — every boundary that
+/// could break the estimate, plus a deterministic sweep — and refuse the shortcut on any
+/// mismatch. The cost is microseconds, once per miner build.
+fn verify_modulus_magic(d: u64, m: u64, s: u32) -> bool {
+    let apply = |x: u64| -> u64 {
+        let q = ((x as u128 * m as u128) >> 64) as u64 >> s;
+        let mut r = x.wrapping_sub(q.wrapping_mul(d));
+        if r >= d {
+            r -= d;
+        }
+        if r >= d {
+            r -= d;
+        }
+        r
+    };
+    let mut probes: Vec<u64> = vec![
+        0,
+        1,
+        d - 1,
+        d,
+        d + 1,
+        2 * d - 1,
+        2 * d,
+        u64::MAX,
+        u64::MAX - 1,
+        u64::MAX / d * d,
+        u64::MAX / d * d - 1,
+    ];
+    for bit in 0..64u32 {
+        probes.push(1u64 << bit);
+        probes.push((1u64 << bit).wrapping_sub(1));
+        probes.push((1u64 << bit).wrapping_add(1));
+    }
+    // Deterministic pseudo-random sweep (xorshift64*) — no rand dependency, same every run.
+    let mut x: u64 = 0x9E3779B97F4A7C15;
+    for _ in 0..200_000 {
+        x ^= x >> 12;
+        x ^= x << 25;
+        x ^= x >> 27;
+        probes.push(x.wrapping_mul(0x2545F4914F6CDD1D));
+    }
+    probes.into_iter().all(|p| apply(p) == p % d)
+}
+
+/// Derives the reciprocal and refuses it unless it reproduces `%` exactly. `(0, 0)` tells the
+/// kernel to divide for real — correct, just slower — so a rejected magic costs throughput and
+/// never correctness.
+fn verified_modulus_magic(d: u64) -> (u64, u32) {
+    match modulus_magic(d) {
+        Some((m, s)) if verify_modulus_magic(d, m, s) => {
+            info!("PoM: modulus {} reciprocal verified (m={}, s={}) — walk skips the 64-bit divide", d, m, s);
+            (m, s)
+        }
+        Some((m, s)) => {
+            warn!("PoM: modulus {} reciprocal (m={}, s={}) FAILED self-test — using the real modulo", d, m, s);
+            (0, 0)
+        }
+        None => (0, 0),
+    }
+}
+
 fn words4(b: &[u8; 32]) -> [u64; 4] {
     let mut w = [0u64; 4];
     for (i, wi) in w.iter_mut().enumerate() {
@@ -393,6 +482,10 @@ pub struct PomGpuMiner {
     /// ILP x2 regresses parts that already saturate their outstanding-miss slots. Forced by
     /// `KERYX_POM_ILP2`.
     use_ilp2: AtomicBool,
+    /// Verified reciprocal for `% n_total_chunks`, fixed for the life of this miner because the
+    /// modulus is. `(0, 0)` means the self-test rejected it and the kernel divides for real.
+    mod_m: u64,
+    mod_s: u32,
     _uploads: Vec<CudaSlice<u8>>, // tensors we uploaded ourselves, kept alive for the gather
 }
 
@@ -437,6 +530,7 @@ impl PomGpuMiner {
         let prefix_dev = stream.clone_htod(prefix.as_slice())?;
         // Load the best prebuilt module for this card and keep the raw CUfunction cached.
         let kernel = select_pom_kernel(device_id)?;
+        let (mod_m, mod_s) = verified_modulus_magic(n_total_chunks);
 
         Ok(Self {
             ctx,
@@ -446,6 +540,8 @@ impl PomGpuMiner {
             prefix_dev,
             t_count: bases.len() as u32,
             n_total_chunks,
+            mod_m,
+            mod_s,
             block_dim: AtomicU32::new(POM_DEFAULT_BLOCK),
             use_ilp2: AtomicBool::new(false),
             _uploads: uploads,
@@ -523,6 +619,7 @@ impl PomGpuMiner {
         let bases_dev = stream.clone_htod(bases.as_slice())?;
         let prefix_dev = stream.clone_htod(prefix.as_slice())?;
         let kernel = select_pom_kernel(device_id)?;
+        let (mod_m, mod_s) = verified_modulus_magic(n_total_chunks);
 
         Ok(Self {
             ctx,
@@ -532,6 +629,8 @@ impl PomGpuMiner {
             prefix_dev,
             t_count: bases.len() as u32,
             n_total_chunks,
+            mod_m,
+            mod_s,
             block_dim: AtomicU32::new(POM_DEFAULT_BLOCK),
             use_ilp2: AtomicBool::new(false),
             _uploads: uploads,
@@ -565,6 +664,8 @@ impl PomGpuMiner {
             start,
             batch,
             walk_v2 as u32,
+            self.mod_m,
+            self.mod_s,
             self.block_dim.load(Ordering::Relaxed),
             self.use_ilp2.load(Ordering::Relaxed),
         )
@@ -1134,6 +1235,37 @@ mod tests {
     // CI/unit-test environments. `remove_device_entry` holds the entire scoping logic that
     // `uninstall` delegates to, so this still covers the behavior that matters: only the targeted
     // device's entry is removed, every other device's entry survives untouched.
+
+    // The reciprocal replaces `%` on the walk's critical path. A remainder that is wrong for even
+    // one input walks the wrong chunk and the node rejects the block, so pin the arithmetic here
+    // as well as at runtime.
+
+    #[test]
+    fn modulus_magic_matches_real_modulo_for_realistic_chunk_counts() {
+        // Real N values: ~4.6 GB, ~8.3 GB and ~29.7 GB of weights at 32 bytes per chunk, plus the
+        // exact count this fork has been mining (tier 2, GLM-4-9B).
+        for d in [143_750_000u64, 258_040_832, 928_125_000, 77_600_000, 1_000_003] {
+            let (m, s) = modulus_magic(d).expect("a realistic chunk count has a reciprocal");
+            assert!(verify_modulus_magic(d, m, s), "reciprocal failed self-test for d={d}");
+        }
+    }
+
+    #[test]
+    fn modulus_magic_declines_cases_it_cannot_serve() {
+        // Powers of two are already a mask, and tiny moduli leave no room for the shift.
+        for d in [0u64, 1, 2, 3, 4, 1024, 1 << 40] {
+            assert_eq!(modulus_magic(d), None, "expected no reciprocal for d={d}");
+        }
+    }
+
+    #[test]
+    fn modulus_magic_is_exact_across_the_full_u64_range() {
+        // verify_modulus_magic sweeps boundaries and 200k pseudo-random inputs; run it against a
+        // modulus with an awkward bit pattern (not near a power of two) to exercise the fixups.
+        let d = 0x0003_A5F1_7B2C_9DE7u64;
+        let (m, s) = modulus_magic(d).unwrap();
+        assert!(verify_modulus_magic(d, m, s));
+    }
 
     #[test]
     fn remove_device_entry_only_clears_target_device() {
