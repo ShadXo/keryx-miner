@@ -27,9 +27,9 @@ jobs:
     uses: ./.github/workflows/build-miner.yml
     with:
       nextgen_kernel: native
-      # OFF on Linux. The miner auto-installs the CUDA libs via apt on first run, and
-      # a host that cannot use apt can dispatch build-miner.yml with the flag on.
-      bundle_cuda_runtime: false
+      # ON for both platforms. Whoever downloads a release is likelier to have a bare driver
+      # than the full CUDA toolkit, and the miner's apt fallback needs root and working repos.
+      bundle_cuda_runtime: true
 
   windows:
     uses: ./.github/workflows/build-miner-windows.yml
