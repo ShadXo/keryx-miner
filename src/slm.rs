@@ -445,6 +445,20 @@ pub fn load_and_run_inference(model_id: &[u8; 32], prompt: &str, max_tokens: usi
     let gguf = gguf_path_for(spec).to_string_lossy().into_owned();
 
     if !crate::llama_engine::active_for(&gguf, dev_id as usize) {
+        // Bail BEFORE evicting anything if the engine library has already proven unusable
+        // (absent, un-dlopen-able, wrong ABI). Eviction is only worth paying for when the swap
+        // can actually succeed: `uninstall` drops the device's miner, and the next mining tick
+        // rebuilds it — which without the engine means `load_raw` re-reading the whole GGUF from
+        // disk and re-uploading it. Doing that per request, while still dropping the response,
+        // cost far more than the inference was worth. The first request still tries and is what
+        // sets the flag.
+        if crate::llama_engine::library_unusable() {
+            log::warn!(
+                "SlmEngine: llama engine unusable (see the earlier load warning) — not evicting the gpu{} miner; response dropped",
+                dev_id
+            );
+            return None;
+        }
         // The engine hosts another model (or nothing). Inference has priority: release the
         // device's miner to make room, swap the engine to the requested model. The possession
         // walk rebuilds over the mining model at the next `ensure_installed`.

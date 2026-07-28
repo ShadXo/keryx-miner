@@ -12,6 +12,7 @@
 //! untouched; `ensure_installed_inner`'s N-guard cross-checks the gather against the host index.
 
 use std::ffi::{c_char, c_int, c_void, CStr, CString};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 type AbiFn = unsafe extern "C" fn() -> c_int;
@@ -34,6 +35,27 @@ struct Engine {
 }
 // The wrapper serializes generation internally; tensor info is read-only after load.
 unsafe impl Send for Engine {}
+
+/// Set once the shared library itself is known to be unusable for the life of the process:
+/// absent, un-`dlopen`-able (a missing `libcudart.so.12` on a driver-only rig does this),
+/// missing symbols, or the wrong ABI. Deliberately NOT set for a failed model load, which is
+/// usually transient (VRAM freed later) and must stay retryable.
+///
+/// Callers use this to avoid paying for an engine that cannot come up. `slm.rs` evicts the
+/// device's PoM miner BEFORE swapping the engine, so without this flag every inference request
+/// on a rig with a broken .so dropped the miner, failed to load, dropped the response, and left
+/// the next mining tick to re-upload the whole model — repeatedly, for nothing.
+static LIB_UNUSABLE: AtomicBool = AtomicBool::new(false);
+
+/// Whether the engine library has already proven permanently unusable. False also means
+/// "not yet tried", so the first attempt still runs and is what sets the flag.
+pub fn library_unusable() -> bool {
+    LIB_UNUSABLE.load(Ordering::Relaxed)
+}
+
+fn mark_library_unusable() {
+    LIB_UNUSABLE.store(true, Ordering::Relaxed);
+}
 
 fn engine() -> &'static Mutex<Option<Engine>> {
     static E: OnceLock<Mutex<Option<Engine>>> = OnceLock::new();
@@ -86,13 +108,17 @@ pub fn ensure_loaded(gguf: &str, gpu: usize) -> bool {
     if let Some(e) = g.as_ref() {
         return e.gguf == gguf && e.gpu == gpu;
     }
-    let Some(so) = so_path() else { return false };
+    let Some(so) = so_path() else {
+        mark_library_unusable();
+        return false;
+    };
     // Never unloaded (the old dlopen path never dlclosed either): the Engine keeps raw fn
     // pointers into the library for the life of the process, so leak it deliberately.
     let lib: &'static libloading::Library = match unsafe { libloading::Library::new(&so) } {
         Ok(l) => Box::leak(Box::new(l)),
         Err(e) => {
             log::warn!("llama engine: load({}) failed: {} — inference unavailable.", so.display(), e);
+            mark_library_unusable();
             return false;
         }
     };
@@ -106,11 +132,13 @@ pub fn ensure_loaded(gguf: &str, gpu: usize) -> bool {
             sym::<FreeFn>(lib, "keryx_llama_free"),
         ) else {
             log::warn!("llama engine: {} is missing symbols — inference unavailable.", so.display());
+            mark_library_unusable();
             return false;
         };
         let got = abi();
         if got != ABI {
             log::warn!("llama engine: {} ABI {} != expected {} — inference unavailable.", so.display(), got, ABI);
+            mark_library_unusable();
             return false;
         }
         let cg = match CString::new(gguf) {
