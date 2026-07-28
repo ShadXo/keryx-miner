@@ -82,6 +82,29 @@ jobs:
           sudo chown "$(id -u):$(id -g)" pom_mine_nextgen.fatbin
           ls -la pom_mine_nextgen.fatbin
 
+      # The LEGACY image needs rebuilding for the same reason as nextgen, and it is easy to
+      # miss because the bug is silent. Every cc < 8.9 card loads this one, and the committed
+      # copy is upstream's — where `pom_mine` IS the ILP x2 kernel. In this fork `pom_mine` is
+      # ILP1 and the two-nonce variant is `pom_mine_ilp2`, so shipping upstream's image leaves
+      # our host launching `batch` threads at a kernel that grinds two nonces each: coverage
+      # stays correct (the kernel's own i0 >= n_nonces guard stops the overshoot) but half the
+      # threads exit immediately and the autotune cannot offer ILP2 at all. Building it here
+      # gives Ampere both entry points and a real measurement, exactly like Blackwell.
+      # -Wno-deprecated-gpu-targets: sm_61/70 are deprecated in 12.x (removed in 13.x) and
+      # warn loudly; still fully supported by this toolkit.
+      - name: Compile legacy fatbin
+        run: |
+          docker run --rm -v "$PWD":/src -w /src "$FATBIN_IMAGE" \
+            nvcc -fatbin -O3 -Wno-deprecated-gpu-targets \
+              -gencode arch=compute_61,code=sm_61 \
+              -gencode arch=compute_70,code=sm_70 \
+              -gencode arch=compute_75,code=sm_75 \
+              -gencode arch=compute_80,code=sm_80 \
+              -gencode "arch=compute_86,code=[compute_86,sm_86]" \
+              cuda/pom_mine.cu -o pom_mine_legacy.fatbin
+          sudo chown "$(id -u):$(id -g)" pom_mine_legacy.fatbin
+          ls -la pom_mine_legacy.fatbin
+
       # PoW (KeryxHash) nextgen images. The COMMITTED ones are built with CUDA 12.9, so their
       # sm_100/sm_120 PTX is ISA 8.8 and needs driver >= r575; on r570 a Blackwell card fails
       # every nextgen image and walks the ladder down to JIT'd sm_86. Rebuilding here with the
@@ -109,6 +132,7 @@ jobs:
           name: nextgen-fatbin
           path: |
             pom_mine_nextgen.fatbin
+            pom_mine_legacy.fatbin
             keryx-nextgen.fatbin
             keryx-cuda-sm120.ptx
 
@@ -174,14 +198,19 @@ jobs:
           # placeholder we want when the path is missing.
           if [ "${{ inputs.nextgen_kernel }}" = "native" ]; then
             NG="pom_mine_nextgen.fatbin"
+            LEG="pom_mine_legacy.fatbin"
           else
             NG="/src/cuda/__no_nextgen.fatbin"
+            # ptx mode keeps the committed legacy image (build.rs's own default path), so the
+            # fallback path is exercised as shipped rather than as rebuilt.
+            LEG="cuda/pom_mine_legacy.fatbin"
           fi
           docker run --rm -v "$PWD":/src -w /src \
             -e CARGO_HOME=/src/.cargo-home \
             -e CARGO_TARGET_DIR=/src/target \
             -e KERYX_LLAMA_ARCHS="${{ inputs.llama_archs }}" \
             -e POM_FATBIN_NEXTGEN="$NG" \
+            -e POM_FATBIN_LEGACY="$LEG" \
             "$BUILD_IMAGE" bash -euo pipefail -c '
               export DEBIAN_FRONTEND=noninteractive
               apt-get update -qq

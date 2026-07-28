@@ -93,6 +93,24 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "nvcc -fatbin failed" }
           Get-Item pom_mine_nextgen.fatbin | Select-Object Name,Length
 
+      # Legacy image, for the same reason — see the note in build-miner.yml. Every cc < 8.9
+      # card loads it, and the committed copy is upstream's, where `pom_mine` is the ILP x2
+      # kernel rather than this fork's ILP1. Shipping it would leave Ampere unable to select
+      # ILP2 at all and launching twice the threads it uses.
+      - name: Compile legacy fatbin
+        if: inputs.nextgen_kernel == 'native'
+        shell: pwsh
+        run: |
+          & "$env:CUDA_PATH\bin\nvcc.exe" -fatbin -O3 -Wno-deprecated-gpu-targets `
+            -gencode "arch=compute_61,code=sm_61" `
+            -gencode "arch=compute_70,code=sm_70" `
+            -gencode "arch=compute_75,code=sm_75" `
+            -gencode "arch=compute_80,code=sm_80" `
+            -gencode "arch=compute_86,code=[compute_86,sm_86]" `
+            cuda\pom_mine.cu -o pom_mine_legacy.fatbin
+          if ($LASTEXITCODE -ne 0) { throw "nvcc -fatbin (legacy) failed" }
+          Get-Item pom_mine_legacy.fatbin | Select-Object Name,Length
+
       # Same treatment for the PoW (KeryxHash) plugin. Its COMMITTED resources are built with
       # CUDA 12.9, so keryx-cuda-sm120.ptx is ISA 8.8 and needs driver r575+; on r570 a
       # Blackwell card fails every nextgen image and the loader walks down to JIT'd sm_86.
@@ -149,6 +167,9 @@ jobs:
           #           the stale committed nextgen fatbin is skipped, and the PTX
           #           ladder is used instead.
           POM_FATBIN_NEXTGEN: ${{ inputs.nextgen_kernel == 'native' && 'pom_mine_nextgen.fatbin' || 'cuda\__no_nextgen.fatbin' }}
+          # native -> rebuilt from this fork's source, so it carries both kernel entry points.
+          # ptx    -> build.rs's own default path, i.e. the committed image, unchanged.
+          POM_FATBIN_LEGACY: ${{ inputs.nextgen_kernel == 'native' && 'pom_mine_legacy.fatbin' || 'cuda\pom_mine_legacy.fatbin' }}
         run: |
           $env:NVCC = "$env:CUDA_PATH\bin\nvcc.exe"
           cargo build --release -p keryx-miner -p keryxcuda
