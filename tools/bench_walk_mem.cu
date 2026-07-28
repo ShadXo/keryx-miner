@@ -10,18 +10,31 @@
 // MEASURED 2026-07-28 -- RTX 5070 Ti (sm_120, 70 SMs), CUDA 13.x toolkit, driver API 13.3
 //   ./bench_walk_mem      # 258040832 chunks (8.26 GB), 1<<20 threads, 256 steps
 //
-//     chase (dependent)   : 342.5 GB/s  (25.08 ms)
-//     indep (independent) : 317.5 GB/s  (27.06 ms)
+//     chase (dependent)   : 343.6 GB/s  (25.00 ms)
+//     indep (independent) : 317.6 GB/s  (27.05 ms)
+//     chase + tensor srch : 367.5 GB/s  (23.38 ms)
 //     miner, same card    : ~315   GB/s
 //
-//   * 342.5 GB/s is the CEILING for this access pattern -- 38% of the 896 GB/s datasheet figure.
-//     Random 32-byte reads over 8 GB do not reach sequential peak: that is DRAM row cycling and
-//     access granularity, not an inefficiency anywhere in the kernel.
-//   * The miner runs at 92% of that ceiling. The ENTIRE cost of the walk's math -- four chained
-//     mix64, the 64-bit modulo, and the ~9-load binary search -- is 8.7%.
+//   * ~343-367 GB/s is the CEILING for this access pattern -- roughly 38-41% of the 896 GB/s
+//     datasheet figure. Random 32-byte reads over 8 GB do not reach sequential peak: that is DRAM
+//     row cycling and access granularity, not an inefficiency anywhere in the kernel.
 //   * indep <= chase, so memory-level parallelism is NOT the limit. Independent access with many
 //     misses in flight per thread buys nothing over a strict pointer chase, and anything that adds
 //     MLP (ILP variants, higher occupancy, more threads) therefore cannot help.
+//   * The TENSOR LOOKUP IS FREE. chase+search touches identical addresses in identical order --
+//     bases[lo] + 2*local resolves to exactly buf + 2*idx -- yet doing strictly MORE work came out
+//     7% ahead of the plain chase. No confident explanation; the likeliest is that the extra ~9
+//     cached loads space out the DRAM requests and a less bursty stream hits fewer bank/row
+//     conflicts, which would also explain indep (the burstiest) coming in lowest. Either way the
+//     conclusion does not rest on the explanation: the ~9 dependent prefix[] loads are not what
+//     separates the miner from the ceiling.
+//
+//   That closes the last open idea. A bucket index (host-built chunk-range -> tensor table,
+//   collapsing the binary search to one load plus a short scan) was the remaining candidate and
+//   would have been the most invasive edit considered, in consensus-critical code. TESTED AND
+//   REJECTED here -- do not rebuild the case for it without a measurement that contradicts this.
+//   What is left between the miner and the ceiling is the four chained mix64, which consensus
+//   fixes and no implementation may change.
 //
 //   Consistent with every other measurement on this card: ILP x2 flat (38.4 vs 38.6), block size
 //   64/128/256 flat (three different winners, same throughput), replacing the 64-bit modulo with a
@@ -42,19 +55,9 @@
 //   indep        INDEPENDENT. The index is COMPUTED, so many misses can be in flight per thread.
 //
 //   chase+search chase plus the miner's tensor lookup: binary search prefix[], index off bases[].
-//                Still no mix64, no modulo. The delta against chase isolates the cost of the ~9
-//                dependent prefix[] loads, which is the last unexplained piece of the miner's
-//                8.7% shortfall (315 vs 342.5).
-//
-// Why that third one is the question: removing the 64-bit modulo from the real kernel measured
-// EXACTLY zero. If the shortfall were arithmetic that should have moved. It did not -- pointing at
-// load-issue pressure instead, ~11 loads per step against 2.
-//
-//   chase+search ~= 318   the search IS the shortfall. A bucket index (host-built chunk-range ->
-//                         tensor table, collapsing ~9 dependent loads to 1 plus a short scan)
-//                         would recover most of it, and is worth the consensus-code risk.
-//   chase+search ~= 340   the search is free; the remainder is mix64, which consensus fixes.
-//                         PoM kernel optimisation is then finished for good.
+//                Still no mix64, no modulo, and the SAME addresses in the same order as chase --
+//                so the delta against chase is purely the cost of the lookup. It came out
+//                negative, which is how the bucket-index idea was ruled out.
 //
 // Build (nvcc that knows your arch -- 12.8+ for sm_120):
 //   nvcc -O3 -arch=sm_120 tools/bench_walk_mem.cu -o bench_walk_mem
@@ -123,9 +126,9 @@ __global__ void indep(const ulonglong2* buf, unsigned int K,
 // index off bases[]. No mix64, no modulo -- so the delta against `chase` is the cost of the
 // ~9 dependent prefix[] loads plus the bases[] load, isolated from every other difference.
 //
-// This matters because removing the 64-bit modulo from the real kernel measured EXACTLY zero.
-// If the walk's 8.7% shortfall against `chase` were arithmetic, that should have moved. It did
-// not, which points at load-issue pressure instead: ~11 loads per step versus 2.
+// Result: 367.5 vs 343.6 GB/s, i.e. the lookup is free (see MEASURED above). Kept in the file
+// because that is the evidence retiring the bucket-index idea, and a negative result is only
+// worth anything if the experiment that produced it can be re-run.
 __global__ void chase_search(const ulonglong2* buf, unsigned int K, unsigned long long* out,
                              unsigned long long n, const unsigned long long* prefix,
                              const unsigned long long* bases, unsigned int T) {
