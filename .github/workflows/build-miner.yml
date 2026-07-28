@@ -19,10 +19,15 @@ on:
         type: choice
         options: [native, ptx]
         default: native
+      # Default ON, like the Windows workflow. The miner can apt-install these itself, but that
+      # path needs root and working repos and silently does not fire on some rigs -- the symptom
+      # is libkeryx-llama.so failing to dlopen on libcudart.so.12, which costs OPoI inference and
+      # pushes PoM onto its own weight upload instead of the zero-dup gather. Turn it off for a
+      # smaller package when the target already has the CUDA runtime.
       bundle_cuda_runtime:
         description: "Ship libcudart/libcublas beside the binary, for hosts with a driver but no CUDA toolkit. Adds ~400 MB zipped (libcublasLt alone is 526 MB)."
         type: boolean
-        default: false
+        default: true
 
   # Lets deploy.yaml reuse this build instead of duplicating it. Inputs must mirror the
   # workflow_dispatch set above; note nextgen_kernel is `string` here because workflow_call
@@ -37,7 +42,7 @@ on:
         default: native
       bundle_cuda_runtime:
         type: boolean
-        default: false
+        default: true
 
 # NOTE: POM_SM_LIST is deliberately NOT set. pom_gpu.rs include_str!s all seven
 # PTX files unconditionally, so trimming the list breaks the build.
