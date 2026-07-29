@@ -6,6 +6,7 @@ use crate::proto::rpc_client::RpcClient;
 use crate::proto::{
     GetBlockRequestMessage, GetBlockTemplateRequestMessage, GetInfoRequestMessage, KaspadMessage,
     NotifyBlockAddedRequestMessage, NotifyNewBlockTemplateRequestMessage,
+    NotifyVirtualSelectedParentChainChangedRequestMessage,
 };
 use crate::{miner::MinerManager, Error};
 
@@ -542,6 +543,10 @@ impl KeryxdHandler {
                         self.try_start_inference();
                         // Escrow: check for new escrow UTXOs and mature claims.
                         let claim_tx = self.escrow_watcher.as_mut().and_then(|w| w.handle_block(&block));
+                        if let Some(w) = self.escrow_watcher.as_ref() {
+                            let (outputs, sompi) = w.pending_escrow();
+                            miner.record_escrow_pending(outputs, sompi);
+                        }
                         if let Some(tx) = claim_tx {
                             self.client_send(KaspadMessage::submit_transaction(tx)).await?;
                         }
@@ -653,6 +658,10 @@ impl KeryxdHandler {
                     self.scan_txs_for_ai_requests(&block.transactions);
                     self.try_start_inference();
                     let claim_tx = self.escrow_watcher.as_mut().and_then(|w| w.handle_block(&block));
+                    if let Some(w) = self.escrow_watcher.as_ref() {
+                        let (outputs, sompi) = w.pending_escrow();
+                        miner.record_escrow_pending(outputs, sompi);
+                    }
                     if let Some(tx) = claim_tx {
                         self.client_send(KaspadMessage::submit_transaction(tx)).await?;
                     }
@@ -669,21 +678,40 @@ impl KeryxdHandler {
                 }
             },
             Payload::SubmitTransactionResponse(res) => {
-                if self.escrow_watcher.as_ref().map_or(false, |w| w.pending_claim_txid.is_some()) {
-                    let err = res.error.map(|e| e.message);
-                    self.escrow_watcher.as_mut().unwrap().on_submit_response(err);
-                } else if let Some(e) = res.error {
-                    warn!("OPoI: submit_transaction error: {:?}", e);
+                // Escrow claims and OPoI submissions share this stream. Match responses to
+                // in-flight claims by identity (txid, or the txid embedded in the rejection
+                // text) — attributing by position slashed valid escrow entries before.
+                use crate::escrow::SubmitResponseOutcome;
+                let err = res.error.as_ref().map(|e| e.message.clone());
+                let outcome = self
+                    .escrow_watcher
+                    .as_mut()
+                    .map_or(SubmitResponseOutcome::NotOurs, |w| {
+                        w.on_submit_response(&res.transaction_id, err.as_deref())
+                    });
+                match outcome {
+                    SubmitResponseOutcome::Accepted { outputs, amount_sompi } => {
+                        miner.record_claim_accepted(outputs, amount_sompi);
+                    }
+                    SubmitResponseOutcome::Handled => {}
+                    SubmitResponseOutcome::NotOurs => {
+                        if let Some(e) = err {
+                            log::debug!("OPoI: submit_transaction error: {}", e);
+                        }
+                    }
                 }
             }
             Payload::GetInfoResponse(info) => {
                 info!("Keryxd version: {}", info.server_version);
-                // Register for both notification types:
+                // Register for all notification types:
                 // - NewBlockTemplate drives the mining loop
                 // - BlockAdded lets us scan confirmed blocks for AiRequests
                 //   that were confirmed before the miner saw them in mempool
+                // - VirtualChainChanged drives escrow tracking: only chain-block coinbases
+                //   materialize UTXOs, so escrow outputs are tracked from chain blocks only
                 self.client_send(NotifyNewBlockTemplateRequestMessage {}).await?;
                 self.client_send(NotifyBlockAddedRequestMessage {}).await?;
+                self.client_send(NotifyVirtualSelectedParentChainChangedRequestMessage {}).await?;
                 self.client_get_block_template().await?;
             }
             Payload::NotifyNewBlockTemplateResponse(res) => match res.error {
@@ -694,6 +722,20 @@ impl KeryxdHandler {
                 None => info!("Registered for block added notifications (AI request scanning)"),
                 Some(e) => error!("Failed registering for block added notifications: {:?}", e),
             },
+            Payload::NotifyVirtualSelectedParentChainChangedResponse(res) => match res.error {
+                None => info!("Registered for virtual chain notifications (escrow tracking)"),
+                Some(e) => error!("Failed registering for virtual chain notifications: {:?}", e),
+            },
+            // Virtual chain advanced: fetch every added chain block in full. Their coinbases
+            // are the only ones that materialize UTXOs, so escrow tracking feeds off this
+            // stream (handle_block gates tracking on is_chain_block). Removed chain blocks
+            // are ignored: entries from reorged-out blocks fail their claims as orphans and
+            // are cleaned up by the existing retry/slash machinery.
+            Payload::VirtualSelectedParentChainChangedNotification(notif) => {
+                for hash in notif.added_chain_block_hashes {
+                    self.client_send(GetBlockRequestMessage { hash, include_transactions: true }).await?;
+                }
+            }
             msg => info!("got unknown msg: {:?}", msg),
         }
         Ok(())

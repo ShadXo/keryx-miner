@@ -252,6 +252,14 @@ impl MinerManager {
         self.stats.inc_rejected_blocks();
     }
 
+    pub fn record_claim_accepted(&self, outputs: u64, amount_sompi: u64) {
+        self.stats.add_claimed(outputs, amount_sompi);
+    }
+
+    pub fn record_escrow_pending(&self, outputs: u64, amount_sompi: u64) {
+        self.stats.set_escrow_pending(outputs, amount_sompi);
+    }
+
     pub async fn process_block(&mut self, block: Option<BlockSeed>) -> Result<(), Error> {
         let state = match block {
             Some(b) => {
