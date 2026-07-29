@@ -21,6 +21,10 @@ pub struct MinerStats {
     total_hashrate_hs: AtomicU64,
     accepted_blocks: AtomicU64,
     rejected_blocks: AtomicU64,
+    claimed_outputs: AtomicU64,
+    claimed_sompi: AtomicU64,
+    escrow_pending_outputs: AtomicU64,
+    escrow_pending_sompi: AtomicU64,
     last_update_epoch_s: AtomicU64,
     api_port: AtomicU64,
     mining_address: Mutex<Option<String>>,
@@ -58,6 +62,10 @@ pub struct MinerStatsSnapshot {
     pub total_hashrate_hs: u64,
     pub accepted_blocks: u64,
     pub rejected_blocks: u64,
+    pub claimed_outputs: u64,
+    pub claimed_sompi: u64,
+    pub escrow_pending_outputs: u64,
+    pub escrow_pending_sompi: u64,
     pub last_update_epoch_s: u64,
     pub devices: Vec<DeviceRate>,
 }
@@ -73,6 +81,10 @@ impl MinerStats {
             total_hashrate_hs: AtomicU64::new(0),
             accepted_blocks: AtomicU64::new(0),
             rejected_blocks: AtomicU64::new(0),
+            claimed_outputs: AtomicU64::new(0),
+            claimed_sompi: AtomicU64::new(0),
+            escrow_pending_outputs: AtomicU64::new(0),
+            escrow_pending_sompi: AtomicU64::new(0),
             last_update_epoch_s: AtomicU64::new(now),
             api_port: AtomicU64::new(0),
             mining_address: Mutex::new(None),
@@ -115,6 +127,17 @@ impl MinerStats {
     pub fn inc_rejected_blocks(&self) {
         self.rejected_blocks.fetch_add(1, Ordering::AcqRel);
         self.last_update_epoch_s.store(now_epoch_s(), Ordering::Release);
+    }
+
+    pub fn add_claimed(&self, outputs: u64, amount_sompi: u64) {
+        self.claimed_outputs.fetch_add(outputs, Ordering::AcqRel);
+        self.claimed_sompi.fetch_add(amount_sompi, Ordering::AcqRel);
+        self.last_update_epoch_s.store(now_epoch_s(), Ordering::Release);
+    }
+
+    pub fn set_escrow_pending(&self, outputs: u64, amount_sompi: u64) {
+        self.escrow_pending_outputs.store(outputs, Ordering::Release);
+        self.escrow_pending_sompi.store(amount_sompi, Ordering::Release);
     }
 
     pub fn refresh_gpu_telemetry(&self) {
@@ -218,6 +241,10 @@ impl MinerStats {
             total_hashrate_hs: self.total_hashrate_hs.load(Ordering::Acquire),
             accepted_blocks: self.accepted_blocks.load(Ordering::Acquire),
             rejected_blocks: self.rejected_blocks.load(Ordering::Acquire),
+            claimed_outputs: self.claimed_outputs.load(Ordering::Acquire),
+            claimed_sompi: self.claimed_sompi.load(Ordering::Acquire),
+            escrow_pending_outputs: self.escrow_pending_outputs.load(Ordering::Acquire),
+            escrow_pending_sompi: self.escrow_pending_sompi.load(Ordering::Acquire),
             last_update_epoch_s: self.last_update_epoch_s.load(Ordering::Acquire),
             devices,
         }

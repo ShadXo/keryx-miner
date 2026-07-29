@@ -41,10 +41,15 @@ Toolkit choice is not interchangeable — see the warnings on each build step be
   -o cuda/pom_mine_nextgen.fatbin
 ```
 
-CUDA 12.8 or newer is required: earlier toolkits cannot emit `sm_100`/`sm_120` SASS, and their
-PTX (ISA 8.2 on 12.2) makes Blackwell fall back to driver JIT for roughly half the hashrate.
-This was measured on RTX 5090 (67 vs 132 MH/s) and RTX 5080 (38 vs 76 MH/s). CUDA 13.x should
+CUDA 12.8 or newer is required: earlier toolkits cannot emit `sm_100`/`sm_120` SASS, so
+Blackwell cards would fall back to driver-JIT from the embedded PTX. Accepted-block throughput
+is the same either way (verified on RTX 5090 by counting accepted blocks) — native SASS is
+about not depending on the installed driver's JIT quality, not about speed. CUDA 13.x should
 also work for nextgen but has not been tested here.
+
+When comparing fatbin builds, measure accepted blocks over time, never the displayed MH/s:
+the hashrate display currently over-counts (~2×) on the JIT-from-PTX path, which makes
+identical kernels look wildly different between module paths.
 
 The nextgen fatbin deliberately carries no SASS below `sm_89` — those cards are served by the
 legacy fatbin, and duplicating the architectures only inflates the binary.

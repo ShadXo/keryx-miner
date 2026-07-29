@@ -422,6 +422,16 @@ fn draw_frame(
     let opoi_pause_value = if snapshot.opoi_challenge_active { "Active" } else { "Idle" };
     let blocks_found_value = snapshot.accepted_blocks;
     let rejected_value = snapshot.rejected_blocks;
+    let claims_value = format!(
+        "{} ({:.2} KRX)",
+        snapshot.claimed_outputs,
+        snapshot.claimed_sompi as f64 / 1e8
+    );
+    let escrow_pending_value = format!(
+        "{} ({:.2} KRX)",
+        snapshot.escrow_pending_outputs,
+        snapshot.escrow_pending_sompi as f64 / 1e8
+    );
     let uptime_value = format_duration(snapshot.uptime_s);
     let last_update_age = seconds_since(snapshot.last_update_epoch_s);
     let last_update_value = format!("{}s ago", last_update_age);
@@ -551,6 +561,16 @@ fn draw_frame(
             "Blocks Rejected",
             rejected_value.to_string(),
             if rejected_value > 0 { palette().err } else { palette().ok },
+        ),
+        metric_row(
+            "Escrow Claimed",
+            claims_value.clone(),
+            if snapshot.claimed_outputs > 0 { palette().bright } else { palette().dim },
+        ),
+        metric_row(
+            "Escrow Pending",
+            escrow_pending_value.clone(),
+            if snapshot.escrow_pending_outputs > 0 { palette().text } else { palette().dim },
         ),
         metric_row(
             "Stats Updated",
