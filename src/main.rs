@@ -276,6 +276,20 @@ const POM_TIER_LADDER: &[(keryx_miner::models::Tier, u64)] = &[
     (keryx_miner::models::Tier::VeryLight, 5_700),
 ];
 
+/// Tier to use when there is NO hardware to size against — no CUDA device enumerated, or no GPU
+/// assigned a tier at all.
+///
+/// The ceiling cannot be taken at face value there: under auto it is `VeryHigh`, and assigning
+/// that blindly would announce and prefetch a 29.7 GB model on a host that reported no usable GPU.
+/// Cap at `Default`; an explicitly lower ceiling still wins, and `--force-model` overrides earlier.
+fn capped_blind_tier(ceiling: keryx_miner::models::Tier) -> keryx_miner::models::Tier {
+    if tier_rank(ceiling) > tier_rank(keryx_miner::models::Tier::Default) {
+        keryx_miner::models::Tier::Default
+    } else {
+        ceiling
+    }
+}
+
 /// Ordinal rank of a tier (VeryLight=0 … VeryHigh=4), for the "≤ ceiling" comparison.
 fn tier_rank(t: keryx_miner::models::Tier) -> u8 {
     use keryx_miner::models::Tier::*;
@@ -338,8 +352,16 @@ fn assign_pom_tiers(
             log::warn!("No CUDA device enumerated for PoM tier assignment — assigning the forced tier to device 0 (fallback).");
             return vec![(0u32, t, keryx_miner::models::spec_for_tier(t))];
         }
-        log::warn!("No CUDA device enumerated for PoM tier assignment — assigning the ceiling tier to device 0 (fallback).");
-        return candidates.first().map(|(_, t, s)| vec![(0u32, *t, *s)]).unwrap_or_default();
+        let blind = capped_blind_tier(ceiling);
+        log::warn!(
+            "No CUDA device enumerated for PoM tier assignment — assigning {} to device 0 (conservative fallback).",
+            keryx_miner::models::spec_for_tier(blind).dir_name
+        );
+        return candidates
+            .iter()
+            .find(|(_, t, _)| tier_rank(*t) <= tier_rank(blind))
+            .map(|(_, t, s)| vec![(0u32, *t, *s)])
+            .unwrap_or_default();
     }
     let mut out = Vec::with_capacity(devices.len());
     for (id, vram_mb) in devices {
@@ -381,7 +403,10 @@ fn lineup_from_assignments(
         }
     }
     if union.is_empty() {
-        return Box::leak(vec![keryx_miner::models::spec_for_tier(ceiling)].into_boxed_slice());
+        // Same reasoning as the no-device fallback in assign_pom_tiers: nothing was assigned, so
+        // there is no hardware to size against, and under auto the ceiling is VeryHigh. Announcing
+        // and prefetching a 29.7 GB model on that basis would be wrong. Cap at Default.
+        return Box::leak(vec![keryx_miner::models::spec_for_tier(capped_blind_tier(ceiling))].into_boxed_slice());
     }
     // Leaked once at startup to keep the &'static API of init_supported / prefetch.
     Box::leak(union.into_boxed_slice())
@@ -403,7 +428,10 @@ fn prefetch_lineup_from_assignments(
         }
     }
     if union.is_empty() {
-        for spec in keryx_miner::models::pom_models_all_eras(ceiling) {
+        // Nothing assigned => no hardware to size against. This branch DOWNLOADS, so taking the
+        // raw ceiling under auto (VeryHigh) would pull ~29.7 GB before mining can start on a host
+        // that reported no usable GPU. Cap it, same as the other blind fallbacks.
+        for spec in keryx_miner::models::pom_models_all_eras(capped_blind_tier(ceiling)) {
             if !union.iter().any(|s| s.model_id == spec.model_id) {
                 union.push(spec);
             }
@@ -742,13 +770,6 @@ async fn run() -> Result<(), Error> {
     }
     let forced_max_rank = forced_tiers.iter().flatten().map(|t| tier_rank(*t)).max();
 
-    // Warn if GPU power limit is below safe threshold for the selected model tier.
-    // Low PL causes CUDA FIFO instability (Xid 32) under large GEMM workloads.
-    check_gpu_power_limit(
-        opt.high || opt.very_high || forced_max_rank.is_some_and(|r| r >= 3),
-        opt.very_high || forced_max_rank.is_some_and(|r| r >= 4),
-    );
-
     let tier = if opt.very_high {
         info!("--very-high mode: top tier — mines Kimi-Linear-48B under PoM.");
         keryx_miner::models::Tier::VeryHigh
@@ -762,14 +783,29 @@ async fn run() -> Result<(), Error> {
         info!("--very-light mode: smallest tier — mines Qwen3-8B-abliterated under PoM.");
         keryx_miner::models::Tier::VeryLight
     } else {
-        info!("default mode: mines GLM-4-9B under PoM.");
-        keryx_miner::models::Tier::Default
+        // AUTO: no flag means "use what the hardware holds", not "use tier 2". The per-card VRAM
+        // floors in POM_TIER_LADDER already decide what each GPU can load — they are trusted to
+        // downgrade a small card, so they are trusted to promote a large one. Capping at Default
+        // meant a 24 GB card silently mined a tier below its capability, and said nothing about
+        // it. The flags remain available as an explicit ceiling for anyone who wants to hold a
+        // card below its maximum (smaller download, less VRAM pressure, lower power draw).
+        info!("auto mode: each GPU mines the highest PoM tier its VRAM holds (use --light/--high/etc. to cap).");
+        keryx_miner::models::Tier::VeryHigh
     };
     // Per-GPU PoM assignment: each CUDA device mines the highest tier ≤ the flag ceiling that its
     // VRAM holds (small cards downgrade instead of failing; big cards are not pushed past the
     // ceiling). --force-model entries win per-card over both. VRAM is CUDA-driver-sourced so
     // device_ids match the devices the walk loads onto.
     let pom_assignments = assign_pom_tiers(tier, &forced_tiers);
+
+    // Power-limit warning keyed off what was ACTUALLY assigned, not off the flags. Under auto the
+    // flags no longer imply the tier, so checking them would leave a card that auto-took tier 3/4
+    // unwarned — exactly the card the warning exists for (low PL + large GEMM => Xid 32).
+    {
+        let assigned_max = pom_assignments.iter().map(|(_, t, _)| tier_rank(*t)).max();
+        let rank = assigned_max.max(forced_max_rank);
+        check_gpu_power_limit(rank.is_some_and(|r| r >= 3), rank.is_some_and(|r| r >= 4));
+    }
     // The served/announced lineup (ai:cap) = the current-era models across all GPUs.
     let specs = lineup_from_assignments(&pom_assignments, tier);
     keryx_miner::slm::init_supported(specs);
