@@ -638,7 +638,7 @@ async fn run() -> Result<(), Error> {
         warn!("{}", warning);
     }
 
-    let stats = Arc::new(MinerStats::new());
+    let stats = Arc::new(MinerStats::new(opt.hiveos));
     stats.set_mining_address(opt.mining_address.clone());
     stats.set_api_port(opt.stats_port);
     let _ui_guard = ui_state
@@ -718,6 +718,7 @@ async fn run() -> Result<(), Error> {
                 orphan_retry_after_daa: None,
                 submit_retries: 0,
                 batch_cap: 0,
+                cap_set_daa: 0,
                 is_inference: false,
             })
             .collect();

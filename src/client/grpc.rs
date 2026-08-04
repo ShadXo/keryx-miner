@@ -12,6 +12,10 @@ use crate::{miner::MinerManager, Error};
 
 /// Max AiRequest queue size — drop oldest when full to prevent unbounded memory growth.
 const MAX_AI_QUEUE_SIZE: usize = 64;
+/// Max boot-time escrow-validation GetBlock requests in flight at once — each answer
+/// sends the next queued one, so thousands of state entries never overwhelm the
+/// HTTP/2 flow-control window or delay the mining stream.
+const VALIDATION_WINDOW: usize = 64;
 /// Max unique stable-ids tracked for deduplication — evict when full.
 const MAX_AI_SEEN_IDS: usize = 10_000;
 
@@ -21,7 +25,7 @@ use log::{error, info, warn};
 use rand::{thread_rng, RngCore};
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tokio::sync::{mpsc::{self, error::SendError, Sender}, oneshot};
 use tokio::task::JoinHandle;
 use tokio_stream::wrappers::ReceiverStream;
@@ -50,6 +54,11 @@ pub struct KeryxdHandler {
     /// Fed by both BlockAdded scans and block template scans.
     ai_request_queue: VecDeque<(String, Vec<u8>, [u8; 32], String, usize)>,
 
+    /// Block hashes queued for boot-time escrow-state validation, drained in slices of
+    /// VALIDATION_WINDOW so thousands of GetBlock requests never saturate the HTTP/2
+    /// flow-control window (each consumed answer sends the next queued request).
+    validation_queue: VecDeque<String>,
+
     /// Stable IDs already queued or in-flight — used for deduplication.
     ai_seen_prefixes: std::collections::HashSet<String>,
 
@@ -68,6 +77,10 @@ pub struct KeryxdHandler {
 
     /// Shared flag with MinerManager — suppresses GPU stall warnings during OPoI inference.
     opoi_challenge_active: Option<Arc<AtomicBool>>,
+
+    /// Tracks pending submit-block requests so rejections can be attributed to the worker
+    /// that originated the submission even though the submit response carries no device id.
+    pending_block_submissions: Arc<Mutex<VecDeque<(String, String)>>>,
 
     /// Last DAA score seen in a block template — used to compute challenge_window_end.
     last_known_daa: u64,
@@ -178,7 +191,8 @@ impl KeryxdHandler {
         let (send_channel, recv) = mpsc::channel(1024);
         send_channel.send(GetInfoRequestMessage {}.into()).await?;
         let stream = client.message_stream(ReceiverStream::new(recv)).await?.into_inner();
-        let (block_channel, block_handle) = Self::create_block_channel(send_channel.clone());
+        let pending_block_submissions = Arc::new(Mutex::new(VecDeque::new()));
+        let (block_channel, block_handle) = Self::create_block_channel(send_channel.clone(), Arc::clone(&pending_block_submissions));
         Ok(Box::new(Self {
             client,
             stream,
@@ -192,11 +206,13 @@ impl KeryxdHandler {
             block_channel,
             block_handle,
             ai_request_queue: VecDeque::new(),
+            validation_queue: VecDeque::new(),
             ai_seen_prefixes: std::collections::HashSet::new(),
             ai_request_txids: std::collections::HashMap::new(),
             inference_rx: None,
             challenge_inference_rx: None,
             opoi_challenge_active: None,
+            pending_block_submissions,
             last_known_daa: 0,
             ipfs_url,
             escrow_pubkey,
@@ -204,15 +220,23 @@ impl KeryxdHandler {
         }))
     }
 
-    fn create_block_channel(send_channel: Sender<KaspadMessage>) -> (Sender<BlockSeed>, BlockHandle) {
+    fn create_block_channel(
+        send_channel: Sender<KaspadMessage>,
+        pending_block_submissions: Arc<Mutex<VecDeque<(String, String)>>>,
+    ) -> (Sender<BlockSeed>, BlockHandle) {
         // KaspadMessage::submit_block(block)
         let (send, recv) = mpsc::channel::<BlockSeed>(1);
         (
             send,
             tokio::spawn(async move {
                 ReceiverStream::new(recv)
-                    .map(|block_seed| match block_seed {
-                        FullBlock(block) => KaspadMessage::submit_block(*block),
+                    .map(move |block_seed| match block_seed {
+                        FullBlock { block, device_id } => {
+                            let block_hash = block.block_hash().map(|hash| format!("{:x}", hash)).unwrap_or_default();
+                            let mut pending = pending_block_submissions.lock().unwrap();
+                            pending.push_back((block_hash, device_id));
+                            KaspadMessage::submit_block(*block)
+                        }
                         PartialBlock { .. } => unreachable!("All blocks sent here should have arrived from here"),
                     })
                     .map(Ok)
@@ -638,9 +662,17 @@ impl KeryxdHandler {
                     return Ok(());
                 }
                 match (template.block, template.is_synced, template.error) {
-                    (Some(b), true, None) => miner.process_block(Some(FullBlock(Box::new(b)))).await?,
+                    (Some(b), true, None) => miner.process_block(Some(FullBlock {
+                        block: Box::new(b),
+                        device_id: "CPU".to_string(),
+                    }))
+                    .await?,
                     (Some(b), false, None) if self.mine_when_not_synced => {
-                        miner.process_block(Some(FullBlock(Box::new(b)))).await?
+                        miner.process_block(Some(FullBlock {
+                            block: Box::new(b),
+                            device_id: "CPU".to_string(),
+                        }))
+                        .await?
                     }
                     (_, false, None) => miner.process_block(None).await?,
                     (_, _, Some(e)) => {
@@ -649,34 +681,71 @@ impl KeryxdHandler {
                     (None, true, None) => error!("No block and No Error!"),
                 }
             }
-            // GetBlock response: arrives after we requested a full block from BlockAdded.
-            // Scan its transactions for AiRequests and escrow UTXOs.
+            // GetBlock response: either a boot-time validation answer, or a full block we
+            // requested from BlockAdded (scanned for AiRequests and escrow UTXOs).
             Payload::GetBlockResponse(msg) => {
+                let mut was_validation = false;
                 if let Some(e) = msg.error {
-                    warn!("GetBlockResponse error: {}", e.message);
-                } else if let Some(block) = msg.block {
-                    self.scan_txs_for_ai_requests(&block.transactions);
-                    self.try_start_inference();
-                    let claim_tx = self.escrow_watcher.as_mut().and_then(|w| w.handle_block(&block));
-                    if let Some(w) = self.escrow_watcher.as_ref() {
-                        let (outputs, sompi) = w.pending_escrow();
-                        miner.record_escrow_pending(outputs, sompi);
+                    // Validation answer: "cannot find header <hash>" — the block never
+                    // existed on this chain, its escrow entries are ghosts.
+                    was_validation = self
+                        .escrow_watcher
+                        .as_mut()
+                        .map_or(false, |w| w.on_block_validation_error(&e.message));
+                    if !was_validation {
+                        warn!("GetBlockResponse error: {}", e.message);
                     }
-                    if let Some(tx) = claim_tx {
-                        self.client_send(KaspadMessage::submit_transaction(tx)).await?;
+                } else if let Some(block) = msg.block {
+                    let hash = block.verbose_data.as_ref().map(|v| v.hash.clone()).unwrap_or_default();
+                    // Chain membership from the node's live verdict: a stored-but-reorged
+                    // block must purge its entries just like a missing one.
+                    let is_chain = block.verbose_data.as_ref().map_or(false, |v| v.is_chain_block);
+                    was_validation = self
+                        .escrow_watcher
+                        .as_mut()
+                        .map_or(false, |w| w.consume_validation_ok(&hash, is_chain));
+                    if !was_validation {
+                        self.scan_txs_for_ai_requests(&block.transactions);
+                        self.try_start_inference();
+                        let claim_tx = self.escrow_watcher.as_mut().and_then(|w| w.handle_block(&block));
+                        if let Some(w) = self.escrow_watcher.as_ref() {
+                            let (outputs, sompi) = w.pending_escrow();
+                            miner.record_escrow_pending(outputs, sompi);
+                        }
+                        if let Some(tx) = claim_tx {
+                            self.client_send(KaspadMessage::submit_transaction(tx)).await?;
+                        }
+                    }
+                }
+                // Self-paced validation flow: every consumed answer pulls the next
+                // queued request, keeping at most VALIDATION_WINDOW in flight.
+                if was_validation {
+                    if let Some(hash) = self.validation_queue.pop_front() {
+                        self.client_send(GetBlockRequestMessage { hash, include_transactions: false }).await?;
                     }
                 }
             }
-            Payload::SubmitBlockResponse(res) => match res.error {
-                None => {
-                    miner.record_block_accepted();
-                    info!("Block submitted successfully!");
+            Payload::SubmitBlockResponse(res) => {
+                let attributed_device = self
+                    .pending_block_submissions
+                    .lock()
+                    .unwrap()
+                    .pop_front()
+                    .map(|(_, device_id)| device_id)
+                    .unwrap_or_else(|| "CPU".to_string());
+                match res.error {
+                    None => {
+                        miner.record_block_accepted();
+                        miner.record_block_accepted_for_device(&attributed_device);
+                        info!("Block submitted successfully!");
+                    }
+                    Some(e) => {
+                        miner.record_block_rejected();
+                        miner.record_block_rejected_for_device(&attributed_device);
+                        warn!("Failed submitting block: {:?}", e);
+                    }
                 }
-                Some(e) => {
-                    miner.record_block_rejected();
-                    warn!("Failed submitting block: {:?}", e);
-                }
-            },
+            }
             Payload::SubmitTransactionResponse(res) => {
                 // Escrow claims and OPoI submissions share this stream. Match responses to
                 // in-flight claims by identity (txid, or the txid embedded in the rejection
@@ -712,6 +781,17 @@ impl KeryxdHandler {
                 self.client_send(NotifyNewBlockTemplateRequestMessage {}).await?;
                 self.client_send(NotifyBlockAddedRequestMessage {}).await?;
                 self.client_send(NotifyVirtualSelectedParentChainChangedRequestMessage {}).await?;
+                // Boot-time escrow-state validation: check every referenced block against
+                // the node so ghost entries (orphaned-chain coinbases) are purged before
+                // any claim ships. Send an initial slice; each answer sends the next.
+                if let Some(hashes) = self.escrow_watcher.as_mut().map(|w| w.start_state_validation()) {
+                    self.validation_queue = hashes.into();
+                    for _ in 0..VALIDATION_WINDOW {
+                        if let Some(hash) = self.validation_queue.pop_front() {
+                            self.client_send(GetBlockRequestMessage { hash, include_transactions: false }).await?;
+                        }
+                    }
+                }
                 self.client_get_block_template().await?;
             }
             Payload::NotifyNewBlockTemplateResponse(res) => match res.error {

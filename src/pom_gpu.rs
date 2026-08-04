@@ -1003,6 +1003,22 @@ fn classify_miner_load_error(err: &str) -> MinerLoadFailureKind {
     MinerLoadFailureKind::Other
 }
 
+fn is_transient_gpu_runtime_fault(err: &str) -> bool {
+    let s = err.to_ascii_lowercase();
+    s.contains("illegal address")
+        || s.contains("illegal memory")
+        || s.contains("cuda_error_illegal_address")
+        || s.contains("invalid device pointer")
+        || s.contains("misaligned address")
+}
+
+fn reset_stale_gpu_state(device_id: u32, use_llama: bool) {
+    if use_llama {
+        crate::llama_engine::unload_for_gpu(device_id as usize);
+    }
+    uninstall(device_id);
+}
+
 fn ensure_installed_inner(device_id: u32, daa: u64) -> bool {
     let (model_id, gguf) = match mining_tiers().lock().ok().and_then(|g| g.get(&device_id).cloned()) {
         Some(x) => x,
@@ -1085,6 +1101,15 @@ fn ensure_installed_inner(device_id: u32, daa: u64) -> bool {
         Ok(Ok(gm)) => gm,
         Ok(Err(e)) => {
             let e_msg = e.to_string();
+            if is_transient_gpu_runtime_fault(&e_msg) {
+                log::warn!(
+                    "PoM[gpu{}]: transient GPU runtime fault while loading miner ({}); dropping stale miner state and forcing a rebuild on the next cycle.",
+                    device_id,
+                    e_msg
+                );
+                reset_stale_gpu_state(device_id, use_llama);
+                return false;
+            }
             match classify_miner_load_error(&e_msg) {
                 MinerLoadFailureKind::PtxIncompatible => {
                     log::error!(
@@ -1171,5 +1196,12 @@ mod tests {
 
         assert_eq!(map.len(), 1);
         assert_eq!(map.get(&1), Some(&"gpu1-miner"));
+    }
+
+    #[test]
+    fn detects_transient_illegal_address_faults() {
+        assert!(is_transient_gpu_runtime_fault("CUDA_ERROR_ILLEGAL_ADDRESS"));
+        assert!(is_transient_gpu_runtime_fault("illegal memory access was encountered"));
+        assert!(!is_transient_gpu_runtime_fault("out of memory"));
     }
 }

@@ -420,7 +420,7 @@ fn draw_frame(
 
     let hashrate_value = format_hashrate(snapshot.total_hashrate_hs);
     let opoi_pause_value = if snapshot.opoi_challenge_active { "Active" } else { "Idle" };
-    let blocks_found_value = snapshot.accepted_blocks;
+    let accepted_blocks_value = snapshot.accepted_blocks;
     let rejected_value = snapshot.rejected_blocks;
     let claims_value = format!(
         "{} ({:.2} KRX)",
@@ -556,7 +556,7 @@ fn draw_frame(
             (format!(" {:<16}", "Address"), palette().dim),
             (address_metric, palette().ok),
         ]),
-        metric_row("Blocks Accepted", blocks_found_value.to_string(), palette().bright),
+        metric_row("Blocks Accepted", accepted_blocks_value.to_string(), palette().bright),
         metric_row(
             "Blocks Rejected",
             rejected_value.to_string(),
@@ -758,6 +758,8 @@ fn draw_frame(
                 brand_color,
             ),
         ]));
+        let blocks_accepted_color = if d.blocks_accepted > 0 { palette().bright } else { detail_color };
+        let blocks_rejected_color = if d.blocks_rejected > 0 { palette().err } else { detail_color };
         right_rows.push(PanelRow::Segments(vec![
             ("   ".to_string(), palette().muted),
             ("P: ".to_string(), palette().muted),
@@ -765,6 +767,12 @@ fn draw_frame(
             ("  ".to_string(), palette().muted),
             ("Eff: ".to_string(), palette().muted),
             (efficiency_short, detail_color),
+            ("  ".to_string(), palette().muted),
+            ("Blocks Accepted: ".to_string(), palette().muted),
+            (d.blocks_accepted.to_string(), blocks_accepted_color),
+            ("  ".to_string(), palette().muted),
+            ("Blocks Rejected: ".to_string(), palette().muted),
+            (d.blocks_rejected.to_string(), blocks_rejected_color),
         ]));
     }
 
@@ -969,7 +977,7 @@ fn color_for_log_line(line: &str) -> Color {
         palette().mid
     } else if lower.contains("escrowwatcher") && lower.contains("claim accepted") {
         palette().bright
-    } else if line.contains("Found a block") || line.contains("Block submitted successfully") {
+    } else if lower.contains("found a block") || lower.contains("found a share") || lower.contains("block submitted successfully") {
         palette().bright
     } else {
         palette().text
@@ -1122,15 +1130,15 @@ fn format_hashrate(hs: u64) -> String {
 }
 
 fn format_power_draw(power_w: f32) -> String {
-    if power_w.is_finite() {
-        format!("{:.0}W", power_w.max(0.0).round())
+    if power_w.is_finite() && power_w >= 0.0 {
+        format!("{:.0}W", power_w.round())
     } else {
         "--".to_string()
     }
 }
 
 fn format_efficiency(hashrate_hs: u64, power_w: f32) -> String {
-    if hashrate_hs == 0 || !power_w.is_finite() || power_w.is_sign_negative() {
+    if hashrate_hs == 0 || !power_w.is_finite() || power_w <= 0.0 {
         return "--".to_string();
     }
 
@@ -1139,21 +1147,24 @@ fn format_efficiency(hashrate_hs: u64, power_w: f32) -> String {
         return "--".to_string();
     }
 
-    let (scaled_rate, unit) = if hashrate < 1_000_000.0 {
-        (hashrate / 1_000.0, "kH")
-    } else if hashrate < 1_000_000_000.0 {
-        (hashrate / 1_000_000.0, "MH")
-    } else if hashrate < 1_000_000_000_000.0 {
-        (hashrate / 1_000_000_000.0, "GH")
-    } else {
-        (hashrate / 1_000_000_000_000.0, "TH")
-    };
-
-    if scaled_rate <= 0.0 {
+    let efficiency = hashrate / power_w as f64;
+    if efficiency <= 0.0 {
         return "--".to_string();
     }
 
-    format!("{:.1} J/{}", (power_w as f64) / scaled_rate, unit)
+    let (scaled_value, unit) = if efficiency < 1_000.0 {
+        (efficiency, "H/W")
+    } else if efficiency < 1_000_000.0 {
+        (efficiency / 1_000.0, "kH/W")
+    } else if efficiency < 1_000_000_000.0 {
+        (efficiency / 1_000_000.0, "MH/W")
+    } else if efficiency < 1_000_000_000_000.0 {
+        (efficiency / 1_000_000_000.0, "GH/W")
+    } else {
+        (efficiency / 1_000_000_000_000.0, "TH/W")
+    };
+
+    format!("{:.0} {}", scaled_value, unit)
 }
 
 fn parse_device_id(worker_id: &str) -> Option<u32> {
