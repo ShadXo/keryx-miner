@@ -594,6 +594,13 @@ async fn run() -> Result<(), Error> {
 
     opt.process()?;
 
+    // --resident-tree: opt-in in-RAM Merkle tree + mmap'd chunks, for a lookup-time proof build
+    // instead of recomputing the non-checkpointed levels. Relocated here with the rest of the
+    // post-process env wiring, since logging is initialised before process() in this fork.
+    if opt.resident_tree {
+        std::env::set_var("KERYX_RESIDENT_TREE", "1");
+    }
+
     // Model storage root is configurable: explicit --models-dir wins, otherwise
     // --hiveos defaults to a stable shared HiveOS path.
     if let Some(dir) = opt.models_dir.as_ref() {
@@ -844,12 +851,18 @@ async fn run() -> Result<(), Error> {
 
     // Verify GPU inference works before mining. OPoI challenges are mandatory, so a miner
     // that cannot run inference must fail fast with a clear message rather than spam panics.
-    info!("Probing GPU inference (cuBLAS) before mining…");
+    info!("Probing GPU inference (cuBLAS + llama engine) before mining…");
     match tokio::task::spawn_blocking(keryx_miner::slm::probe_gpu_inference).await {
-        Ok(keryx_miner::slm::GpuProbe::Ok) => info!("GPU inference verified — cuBLAS loaded successfully."),
+        Ok(keryx_miner::slm::GpuProbe::Ok) => info!("GPU inference verified — cuBLAS and the llama engine loaded successfully."),
         Ok(keryx_miner::slm::GpuProbe::NoCuda) => {
             error!("No CUDA device detected — OPoI inference is GPU-only and is mandatory, cannot mine.");
             return Err("No CUDA device — cannot start OPoI mining".into());
+        }
+        Ok(keryx_miner::slm::GpuProbe::EngineMissing(why)) => {
+            error!("Inference engine unavailable: {}", why);
+            error!("OPoI inference is mandatory: mining without it would answer no request at all.");
+            error!("Restore the library shipped with this release next to the miner binary, then restart.");
+            return Err("llama inference engine unavailable — cannot start OPoI mining".into());
         }
         Ok(keryx_miner::slm::GpuProbe::CublasMissing) => {
             warn!("CUDA GPU detected but a CUDA runtime lib is missing — installing them automatically (one-time)…");
@@ -867,6 +880,13 @@ async fn run() -> Result<(), Error> {
                 match tokio::task::spawn_blocking(keryx_miner::slm::probe_gpu_inference).await {
                     Ok(keryx_miner::slm::GpuProbe::Ok) => {
                         info!("CUDA libs installed — GPU inference verified, starting mining.");
+                    }
+                    // Restarting cannot conjure a library that is not on disk; fail here rather
+                    // than hand the supervisor a restart loop.
+                    Ok(keryx_miner::slm::GpuProbe::EngineMissing(why)) => {
+                        error!("CUDA libs installed, but the inference engine is unavailable: {}", why);
+                        error!("Restore the library shipped with this release next to the miner binary, then restart.");
+                        return Err("llama inference engine unavailable — cannot start OPoI mining".into());
                     }
                     _ => {
                         info!("CUDA libs installed successfully — restarting miner to activate them.");

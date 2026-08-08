@@ -349,13 +349,18 @@ pub enum GpuProbe {
     NoCuda,
     /// A CUDA device exists but cuBLAS could not be loaded — GPU inference is impossible.
     CublasMissing,
+    /// CUDA is fine but the llama engine library is missing or unusable — carries the reason.
+    /// Not auto-recoverable: the library ships with the release.
+    EngineMissing(String),
 }
 
 /// Verify that GPU inference can actually work *before* mining starts.
 ///
-/// The in-process llama engine dlopens cuBLAS lazily on the first load; discovering a missing
-/// `libcublas` mid-challenge would silently drop responses. Probe both prerequisites up front:
-/// a usable CUDA device (driver) and a loadable cuBLAS, and report a clean, actionable result.
+/// The in-process llama engine and its cuBLAS dependency are both dlopened lazily on the first
+/// load; discovering either of them missing mid-challenge would silently drop responses while
+/// mining kept running — the possession walk has no dependency on them. Probe all three
+/// prerequisites up front: a usable CUDA device (driver), a loadable cuBLAS, and the engine
+/// library itself, and report a clean, actionable result.
 pub fn probe_gpu_inference() -> GpuProbe {
     if crate::pom_gpu::query_all_gpus_vram().is_empty() {
         return GpuProbe::NoCuda;
@@ -371,10 +376,15 @@ pub fn probe_gpu_inference() -> GpuProbe {
     let ok = loads(&["cublas64_12.dll"]);
     #[cfg(not(windows))]
     let ok = loads(&["libcublas.so.12", "libcublas.so"]) && loads(&["libcudart.so.12", "libcudart.so"]);
-    if ok {
-        return GpuProbe::Ok;
+    if !ok {
+        return GpuProbe::CublasMissing;
     }
-    GpuProbe::CublasMissing
+    // Checked last, and only once the CUDA runtime is known good: the engine library links
+    // cuBLAS/cudart, so probing it earlier would report a missing CUDA runtime as a broken engine.
+    if let Err(why) = crate::llama_engine::probe_library() {
+        return GpuProbe::EngineMissing(why);
+    }
+    GpuProbe::Ok
 }
 
 /// Pre-download all registered model files before mining starts.

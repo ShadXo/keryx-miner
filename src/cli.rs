@@ -73,6 +73,13 @@ pub struct Opt {
     pub hiveos: bool,
 
     #[clap(
+        long = "resident-tree",
+        help = "Hold the full Merkle tree in RAM for faster proof build (needs ~2x model size of system RAM; falls back to disk if unavailable)",
+        help_heading = "OPoI / Inference"
+    )]
+    pub resident_tree: bool,
+
+    #[clap(
         long = "escrow-key-file",
         help = "Path to the OPoI escrow private key file (auto-generated if absent)",
         help_heading = "OPoI / Inference",
