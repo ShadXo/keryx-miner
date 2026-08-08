@@ -98,6 +98,49 @@ unsafe fn sym<T: Copy>(lib: &libloading::Library, name: &str) -> Option<T> {
     lib.get::<T>(name.as_bytes()).ok().map(|s| *s)
 }
 
+/// Startup probe: is the inference engine library actually usable?
+///
+/// The engine is only ever dlopened lazily, on the first inference request. A deleted, renamed or
+/// stale library therefore leaves PoW/PoM fully working — the possession walk uploads the
+/// canonical GGUF itself and never needs this library — while every OPoI response is silently
+/// dropped hours into a session. Resolve the library up front, load it, and check the ABI and
+/// every symbol the engine calls. Returns the resolved path, or a human-readable reason.
+///
+/// Assumes the CUDA runtime probe already passed: this library links cuBLAS/cudart, so a missing
+/// CUDA runtime would surface here as a load failure and be misattributed to the engine.
+///
+/// The probe handle is dropped on return; `ensure_loaded` reloads the library for real later.
+pub fn probe_library() -> Result<std::path::PathBuf, String> {
+    let Some(so) = so_path() else {
+        #[cfg(target_os = "macos")]
+        let name = "libkeryx-llama.dylib";
+        #[cfg(target_os = "windows")]
+        let name = "keryx-llama.dll";
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+        let name = "libkeryx-llama.so";
+        return Err(format!("{} not found next to the miner binary", name));
+    };
+    let lib = unsafe { libloading::Library::new(&so) }
+        .map_err(|e| format!("{} failed to load: {}", so.display(), e))?;
+    unsafe {
+        let (Some(abi), Some(_load), Some(_count), Some(_info), Some(_gen), Some(_free)) = (
+            sym::<AbiFn>(&lib, "keryx_llama_abi"),
+            sym::<LoadFn>(&lib, "keryx_llama_load"),
+            sym::<CountFn>(&lib, "keryx_llama_tensor_count"),
+            sym::<InfoFn>(&lib, "keryx_llama_tensor_info"),
+            sym::<GenFn>(&lib, "keryx_llama_generate"),
+            sym::<FreeFn>(&lib, "keryx_llama_free"),
+        ) else {
+            return Err(format!("{} is missing engine symbols", so.display()));
+        };
+        let got = abi();
+        if got != ABI {
+            return Err(format!("{} has ABI {}, this miner expects {}", so.display(), got, ABI));
+        }
+    }
+    Ok(so)
+}
+
 /// Load the .so + the model once (idempotent, blocking — a model load takes seconds). Returns
 /// whether the engine is active for `gguf` on `gpu`. Safe to call from multiple threads.
 pub fn ensure_loaded(gguf: &str, gpu: usize) -> bool {

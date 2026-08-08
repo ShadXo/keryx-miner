@@ -112,6 +112,14 @@ On a multi-GPU rig the tier is assigned per card from its VRAM, so a mixed rig r
 
 The model is loaded **on demand** when a request arrives and cached between requests. Mining pauses on that GPU during inference, then resumes automatically.
 
+### Faster proof build (optional)
+
+`--resident-tree` holds the full Merkle tree in RAM, so building a block's proof is a lookup instead of an on-the-fly recompute. It needs roughly **2× the model size in system RAM** (not VRAM) — about 10 GB for the smallest tier, ~40 GB for the largest. If the machine doesn't have the RAM, the miner logs a warning and keeps the default disk-backed path, so enabling it is always safe.
+
+```bash
+./keryx-miner --mining-address keryx:YOUR_ADDRESS --resident-tree
+```
+
 ### Getting the models
 
 Nothing to download by hand: on first run the miner fetches the model for your tier over IPFS and caches it. It looks for the weights at:
