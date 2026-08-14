@@ -835,13 +835,13 @@ impl PomGpuMiner {
     /// measurement; `walk_v2 = true` bills the live per-step cost. `f64::MAX` on launch error.
     fn bench_walk_ms(&self, bench: u64) -> f64 {
         let (pph, tgt) = ([0u8; 32], [0u8; 32]);
-        if self.mine(&pph, 0, &tgt, 0, bench, false, true, false, false).is_err() {
+        if self.mine(&pph, 0, &tgt, 0, bench, false, true, false, false, false).is_err() {
             return f64::MAX;
         }
         let mut ms = f64::MAX;
         for _ in 0..3 {
             let t = std::time::Instant::now();
-            if self.mine(&pph, 0, &tgt, 0, bench, false, true, false, false).is_err() {
+            if self.mine(&pph, 0, &tgt, 0, bench, false, true, false, false, false).is_err() {
                 return f64::MAX;
             }
             ms = ms.min(t.elapsed().as_secs_f64() * 1e3);
@@ -1576,6 +1576,8 @@ impl PomGpuMiner {
             prefix_dev,
             t_count: bases.len() as u32,
             n_total_chunks,
+            block_dim: AtomicU32::new(POM_DEFAULT_BLOCK),
+            use_ilp2: AtomicBool::new(false),
             _uploads: uploads,
         })
     }
