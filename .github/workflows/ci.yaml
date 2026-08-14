@@ -40,6 +40,16 @@ jobs:
           method: network
           sub-packages: '["nvcc","cudart"]'
 
+      # The test binary links the CUDA DRIVER (libcuda.so.1) since the v3/H6 work, and a CI
+      # runner has no GPU and no driver. The toolkit ships a stub for exactly this case, but
+      # only as `libcuda.so` — the loader wants the `.1` soname, so symlink it and put the stub
+      # directory on the loader path. Host-side tests never call into it; this only satisfies
+      # load-time resolution.
+      - name: CUDA driver stub for host-side tests
+        run: |
+          sudo ln -sf /usr/local/cuda/lib64/stubs/libcuda.so /usr/local/cuda/lib64/stubs/libcuda.so.1
+          echo "LD_LIBRARY_PATH=/usr/local/cuda/lib64/stubs:$LD_LIBRARY_PATH" >> "$GITHUB_ENV"
+
       - uses: actions/cache@v4
         with:
           path: |
