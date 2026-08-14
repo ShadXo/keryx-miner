@@ -12,7 +12,7 @@ pub struct Opt {
         long = "very-light",
         help = "Model tier: Qwen3-8B-abliterated — 6GB+ GPU, smallest tier",
         help_heading = "OPoI / Inference",
-        conflicts_with_all = &["light", "high", "very_high"]
+        conflicts_with_all = &["light", "high", "very-high"]
     )]
     pub very_light: bool,
 
@@ -20,7 +20,7 @@ pub struct Opt {
         long = "light",
         help = "Model tier: Mistral-7B-v0.3 — 8GB+ VRAM",
         help_heading = "OPoI / Inference",
-        conflicts_with_all = &["very_light", "high", "very_high"]
+        conflicts_with_all = &["very-light", "high", "very-high"]
     )]
     pub light: bool,
 
@@ -28,7 +28,7 @@ pub struct Opt {
         long = "high",
         help = "Model tier: Qwen3.6-27B (Q4_K_M) — 24GB+ VRAM",
         help_heading = "OPoI / Inference",
-        conflicts_with_all = &["very_light", "light", "very_high"]
+        conflicts_with_all = &["very-light", "light", "very-high"]
     )]
     pub high: bool,
 
@@ -36,7 +36,7 @@ pub struct Opt {
         long = "very-high",
         help = "Model tier: Kimi-Linear-48B (Q4_K_M) — 32GB+ VRAM",
         help_heading = "OPoI / Inference",
-        conflicts_with_all = &["very_light", "light", "high"]
+        conflicts_with_all = &["very-light", "light", "high"]
     )]
     pub very_high: bool,
 
@@ -88,6 +88,21 @@ pub struct Opt {
     pub escrow_key_file: String,
 
     #[clap(
+        long = "escrow-cert",
+        help = "Escrow delegation cert as 128 hex chars, for setups that cannot drop a file (HiveOS). Wins over --escrow-cert-file",
+        help_heading = "OPoI / Inference"
+    )]
+    pub escrow_cert: Option<String>,
+
+    #[clap(
+        long = "escrow-cert-file",
+        help = "Path to the escrow delegation cert produced by `keryx-cli delegate-escrow` (required from H6)",
+        help_heading = "OPoI / Inference",
+        default_value = "escrow.cert"
+    )]
+    pub escrow_cert_file: String,
+
+    #[clap(
         long = "escrow-state-file",
         help = "Path to the escrow claim state file",
         help_heading = "OPoI / Inference",
@@ -124,12 +139,12 @@ pub struct Opt {
     #[clap(long = "devfund-percent", help = "The percentage of blocks to send to the devfund (minimum 2%)", default_value = "2", parse(try_from_str = parse_devfund_percent))]
     pub devfund_percent: u16,
 
-    #[clap(short, long, help = "Keryxd port [default: Mainnet = 22110, Testnet = 22211]")]
+    #[clap(short, long, help = "Keryxd port [default: Mainnet = 22110, Testnet = 22210]")]
     port: Option<u16>,
 
     #[clap(
         long,
-        help = "Use testnet instead of mainnet: default port 22211 and testnet DAA activation gates (PoM/H3 from genesis, H4/H5 at 3000) [default: false]"
+        help = "Use testnet instead of mainnet: default port 22210 and testnet DAA activation gates (PoM/H3 from genesis, H4/H5 at 3000) [default: false]"
     )]
     testnet: bool,
 
@@ -250,7 +265,7 @@ impl Opt {
     }
 
     fn port(&mut self) -> u16 {
-        *self.port.get_or_insert(if self.testnet { 22211 } else { 22110 })
+        *self.port.get_or_insert(if self.testnet { 22210 } else { 22110 })
     }
 
     pub fn log_level(&self) -> LevelFilter {
@@ -259,5 +274,17 @@ impl Opt {
         } else {
             LevelFilter::Info
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    #[test]
+    fn model_tier_conflicts_reference_valid_arguments() {
+        Opt::command().debug_assert();
+        assert!(Opt::try_parse_from(["keryx-miner", "--very-light", "--very-high"]).is_err());
     }
 }
