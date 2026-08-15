@@ -1127,17 +1127,24 @@ async fn run() -> Result<(), Error> {
     }
     let forced_max_rank = forced_tiers.iter().flatten().map(|t| tier_rank(*t)).max();
 
+    // Name the model from spec_for_tier() rather than a literal: the lineup is era-dependent, and
+    // hardcoded names go stale silently at a hardfork. H6 alone moves --light from Mistral-7B to
+    // GLM-4-9B and --very-light from Qwen3-8B to Qwen3.5-9B, so a literal here would have told
+    // every operator the wrong model at the crossing.
+    let announce = |flag: &str, what: &str, tier: keryx_miner::models::Tier| {
+        info!("{} mode: {} — mines {} under PoM.", flag, what, keryx_miner::models::spec_for_tier(tier).name);
+    };
     let tier = if opt.very_high {
-        info!("--very-high mode: top tier — mines Kimi-Linear-48B under PoM.");
+        announce("--very-high", "top tier", keryx_miner::models::Tier::VeryHigh);
         keryx_miner::models::Tier::VeryHigh
     } else if opt.high {
-        info!("--high mode: high tier — mines Qwen3.6-27B under PoM.");
+        announce("--high", "high tier", keryx_miner::models::Tier::High);
         keryx_miner::models::Tier::High
     } else if opt.light {
-        info!("--light mode: light tier — mines Mistral-7B-v0.3 under PoM.");
+        announce("--light", "light tier", keryx_miner::models::Tier::Light);
         keryx_miner::models::Tier::Light
     } else if opt.very_light {
-        info!("--very-light mode: smallest tier — mines Qwen3-8B-abliterated under PoM.");
+        announce("--very-light", "smallest tier", keryx_miner::models::Tier::VeryLight);
         keryx_miner::models::Tier::VeryLight
     } else {
         // AUTO: no flag means "use what the hardware holds", not "use tier 2". The per-card VRAM
