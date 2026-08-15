@@ -249,6 +249,22 @@ jobs:
               cp target/release/keryx-miner pkg/
               cp target/release/libkeryxcuda.so pkg/
               cp dist/libkeryx-llama.so pkg/
+              # libkeryx-llama.so is linked -fopenmp and statically absorbs libggml-cpu.a
+              # (itself built with OpenMP), so it carries DT_NEEDED on libgomp.so.1. That
+              # rides in with the gcc runtime on a normal distro and is therefore invisible
+              # here, but minimal container images (vast.ai and similar) omit it and the
+              # engine dlopen fails with "libgomp.so.1: cannot open shared object file".
+              # The probe reports that as EngineMissing, which — unlike a missing CUDA
+              # runtime — has no auto-install path, so since a7bc4e1 the miner refuses to
+              # start at all. Ship it beside the .so; -rpath,$ORIGIN resolves it.
+              # Deliberately NOT gated on bundle_cuda_runtime: this is a dependency of the
+              # engine itself, not of the optionally-bundled CUDA runtime.
+              gomp=$(g++ -print-file-name=libgomp.so.1)
+              if [ ! -e "$gomp" ]; then
+                echo "libgomp.so.1 not found via g++ -print-file-name — refusing to ship a package that cannot start on a minimal host" >&2
+                exit 1
+              fi
+              cp -L "$gomp" pkg/
               # libkeryx-llama.so has DT_NEEDED on libcudart.so.12 and libcublas.so.12 (which
               # itself needs libcublasLt.so.12). Rigs usually carry only the driver, so the
               # dlopen fails, OPoI inference is unavailable, and PoM falls back to uploading a
