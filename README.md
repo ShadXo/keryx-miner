@@ -92,7 +92,11 @@ Inference is not optional. A miner that holds no model cannot prove possession a
 
 ### Model tiers
 
-One tier, one model. The flag you pick decides which model your GPU must hold, and the tier you prove through PoM (Proof of Model) scales your share of the block reward: the higher the tier, the larger the miner cut.
+One tier, one model. The tier you prove through PoM (Proof of Model) scales your share of the block reward: the higher the tier, the larger the miner cut.
+
+With no flag, each GPU mines the **highest tier its VRAM holds**. The flags are a *ceiling*, not a selection — use one to hold a card below its maximum (smaller download, less VRAM pressure, lower power draw).
+
+The lineup changes at the H6 hardfork (mainnet DAA 77,203,262). Until then:
 
 | Flag | Model | Quant | Min VRAM |
 |------|-------|-------|----------|
@@ -100,11 +104,25 @@ One tier, one model. The flag you pick decides which model your GPU must hold, a
 | `--light` | Mistral-7B-v0.3 | Q6_K | 8 GB+ |
 | *(none, default)* | GLM-4-9B-0414 | Q6_K | 12 GB+ |
 | `--high` | Qwen3.6-27B | Q4_K_M | 24 GB+ |
-| `--very-high` | Kimi-Linear-48B | Q4_K_M | 32 GB+ |
+| `--very-high` | Kimi-Linear-48B | Q4_K_M | 30 GB+ |
+
+From H6 onward. Qwen3.5-9B replaces **both** Qwen3-8B and Mistral-7B, GLM-4-9B slides down to `--light`, and Gemma-4-12B is new — it fills the gap between 12 GB and 24 GB cards:
+
+| Flag | Model | Quant | Min VRAM |
+|------|-------|-------|----------|
+| `--very-light` | Qwen3.5-9B-abliterated | Q5_K_M | 8 GB+ |
+| `--light` | GLM-4-9B-0414 | Q6_K | 12 GB+ |
+| *(none, default)* | Gemma-4-12B-abliterated | Q6_K | 16 GB+ |
+| `--high` | Qwen3.6-27B | Q4_K_M | 24 GB+ |
+| `--very-high` | Kimi-Linear-48B | Q4_K_M | 30 GB+ |
+
+Note what this means per card: the same flag can move you to a **larger** model at the crossing. A 12 GB card mining the default tier today holds GLM-4-9B; after H6 that tier wants 16 GB, so the card drops to `--light` — which is the same GLM-4-9B it was already running. A 10 GB card, however, loses the default tier entirely and lands on tier 0.
+
+Both eras' models are downloaded before mining starts, so the crossing is a hot swap rather than a mid-run stall. That means **two models on disk per tier** until the chain passes H6, after which the superseded one stops being fetched and can be deleted.
 
 Tiers are **not cumulative**: each one serves exactly one model, and a card that cannot hold the model you asked for falls back to a tier it can actually serve.
 
-On a multi-GPU rig the tier is assigned per card from its VRAM, so a mixed rig runs several tiers side by side. `--force-model` overrides that per GPU, in CUDA driver order:
+On a multi-GPU rig the tier is assigned per card from its VRAM, so a mixed rig runs several tiers side by side. `--force-model` overrides that per GPU, in CUDA driver order — including past the VRAM floor, which is why forcing a tier your card cannot hold only penalises you (OOM, or a partial-possession slowdown):
 
 ```bash
 ./keryx-miner --mining-address keryx:YOUR_ADDRESS --force-model light,very-high
