@@ -177,10 +177,17 @@ jobs:
         uses: actions/cache@v4
         with:
           path: dist/libkeryx-llama.so
-          # Bump the suffix whenever build.rs changes how the .so is LINKED — a cache hit sets
-          # KERYX_LLAMA_SKIP=1 and reuses the old binary, so a link-flag change (here:
-          # -rpath,$ORIGIN) would otherwise never reach the shipped artifact.
-          key: llama-${{ env.LLAMA_TAG }}-${{ inputs.llama_archs }}-cuda1282-rpath1-nehalem1
+          # A cache hit sets KERYX_LLAMA_SKIP=1 and reuses the stored .so wholesale, so ANY
+          # input that changes the .so must appear in this key. It used to be a hand-bumped
+          # suffix, and that failed exactly as you'd expect: c13cc9b added
+          # keryx_llama_last_error and bumped the engine ABI 2 -> 3, the suffix was not
+          # bumped, and every Linux package built after it shipped the pre-c13cc9b ABI-2 .so
+          # beside a miner that demanded ABI 3 -- "is missing engine symbols", refusing to
+          # start since a7bc4e1 made that fatal. Hash the actual inputs instead: the wrapper
+          # source, and build.rs (which owns the compile and link flags). build.rs also drives
+          # the PoM PTX ladder, so unrelated edits there do cost a full llama rebuild -- worth
+          # it, because the alternative is silently shipping a broken engine again.
+          key: llama-${{ env.LLAMA_TAG }}-${{ inputs.llama_archs }}-cuda1282-nehalem1-${{ hashFiles('tools/keryx-llama/keryx_llama.cpp', 'build.rs') }}
 
       - name: Cache cargo
         uses: actions/cache@v4
@@ -249,6 +256,24 @@ jobs:
               cp target/release/keryx-miner pkg/
               cp target/release/libkeryxcuda.so pkg/
               cp dist/libkeryx-llama.so pkg/
+              # Hard gate on the engine ABI contract. probe_library() resolves exactly these
+              # symbols and refuses the library if any is absent; since a7bc4e1 that refusal
+              # is fatal, so a .so missing one produces a package that cannot start at all.
+              # That already shipped once (see the cache key above), silently, because
+              # nothing here ever looked at what was in the .so. Check statically with nm --
+              # dlopen-ing it would drag in libcuda, which the build container has no driver
+              # for. Keep this list in sync with probe_library() in src/llama_engine.rs.
+              missing=""
+              for s in keryx_llama_abi keryx_llama_load keryx_llama_tensor_count \
+                       keryx_llama_tensor_info keryx_llama_generate keryx_llama_free \
+                       keryx_llama_last_error; do
+                nm -D --defined-only pkg/libkeryx-llama.so | grep -q " $s\$" || missing="$missing $s"
+              done
+              if [ -n "$missing" ]; then
+                echo "libkeryx-llama.so does not export:$missing -- stale or mismatched engine build, refusing to package" >&2
+                exit 1
+              fi
+              echo "engine symbol check passed"
               # libkeryx-llama.so is linked -fopenmp and statically absorbs libggml-cpu.a
               # (itself built with OpenMP), so it carries DT_NEEDED on libgomp.so.1. That
               # rides in with the gcc runtime on a normal distro and is therefore invisible
