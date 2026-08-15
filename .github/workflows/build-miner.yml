@@ -267,7 +267,10 @@ jobs:
               # into `grep -q` per symbol: grep exits at the first match and closes the pipe,
               # nm dies of SIGPIPE (141), and under `set -o pipefail` that marks the pipeline
               # failed even though the symbol was found -- reporting every symbol as missing.
-              syms=$(nm -D --defined-only pkg/libkeryx-llama.so | awk '{ printf " %s ", $NF }')
+              # No single quotes anywhere below: this whole script is passed to bash -c inside
+              # a single-quoted argument, so an awk program in single quotes would close it.
+              # tr also reads its input to completion, which keeps the pipeline SIGPIPE-free.
+              syms=" $(nm -D --defined-only pkg/libkeryx-llama.so | tr "\n" " ") "
               missing=""
               for s in keryx_llama_abi keryx_llama_load keryx_llama_tensor_count \
                        keryx_llama_tensor_info keryx_llama_generate keryx_llama_free \
