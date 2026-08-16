@@ -42,10 +42,11 @@ __device__ __forceinline__ bool pom_le_leq(const unsigned long long a[4],
 // H5.1: the seed fold reads its own word set (s0..s3, host-salted per era) while the pow fold
 // keeps p0..p3 — pre-H5.1 the host passes identical words, keeping behavior bit-identical.
 //
-// ILP1 — one nonce per thread. The host launches `batch` threads for this entry point.
-// This is the DEFAULT, and on every card measured so far it is also what the startup sweep picks
-// — see the note on `pom_mine_ilp2` below. Selection is per device (`autotune_block` in
-// src/pom_gpu.rs), so a part where ILP x2 does win will still get it.
+// One nonce per thread; the host launches `batch` threads for this entry point.
+//
+// Pre-H6 only. Since the H6 hardfork every live chain takes `pom_mine_v3` below, so nothing
+// reaches this kernel any more — it is kept because it is upstream's and removing it would
+// deepen the divergence, not because it runs.
 extern "C" __global__ void pom_mine(const unsigned long long* bases, const unsigned long long* prefix,
                                     unsigned int T, unsigned long long n_total_chunks, unsigned int K,
                                     unsigned long long p0, unsigned long long p1, unsigned long long p2, unsigned long long p3,
@@ -92,107 +93,6 @@ extern "C" __global__ void pom_mine(const unsigned long long* bases, const unsig
     pom_pow_fold(state, p0, p1, p2, p3, pv);
     if (pom_le_leq(pv, t0, t1, t2, t3)) {
         atomicMin(winner, nonce);
-    }
-}
-
-// ILP x2: each thread grinds TWO nonces with their walk steps interleaved. The walk is
-// memory-latency bound (a 3090 sits at ~24% of its bandwidth at 1 nonce/thread), so the
-// second walk's search/mix work overlaps the first walk's DRAM fetch and vice versa.
-// Byte-exact per nonce: each walk's math is untouched, only the instruction scheduling
-// interleaves. The host launches ceil(batch/2) threads (grid calc in src/pom_gpu.rs).
-//
-// Its premise -- that a walk reaching only ~24% of a 3090's bandwidth must be threads idling with
-// spare memory capacity -- turned out not to hold. The observation was right (a 3080 measures 26%
-// of spec, a 5070 Ti 35%), but tools/bench_walk_mem.cu shows independent access with many misses
-// in flight per thread is NO faster than a strict pointer chase: memory-level parallelism is not
-// what limits this walk, so giving each thread a second nonce cannot recover the gap.
-//
-// Measured, ILP1 vs ILP2 (Mnonce/s):
-//     RTX 5070 Ti  GDDR7    38.4 / 38.6      flat
-//     RTX 3080     GDDR6X   24.5 / 24.2      ILP1 ahead -- and GDDR6X is the class this targeted
-//     RTX 3070     GDDR6     ~0 delta        (ocminer/keryx-miner-supr)
-//     RTX 5090     GDDR7    ILP2 -6%         (ocminer/keryx-miner-supr)
-//
-// Note the ~+47% GDDR6X figure often quoted alongside this belongs to the VECTORIZED CHUNK READ
-// (02fe488, ~17 -> ~25 MH/s on a 3090), not to ILP x2 (7464a0b), which shipped without a measurement.
-// The vectorized read is in both kernels and does work.
-//
-// Kept because it is upstream's kernel and dropping it would deepen the divergence for no gain;
-// the sweep simply never selects it. Selected per device, never unconditionally -- shipping it
-// unconditionally is what produced the half-range bug, since the host switched to ceil(batch/2)
-// threads while the nextgen fatbin was left holding a one-nonce-per-thread kernel.
-extern "C" __global__ void pom_mine_ilp2(const unsigned long long* bases, const unsigned long long* prefix,
-                                    unsigned int T, unsigned long long n_total_chunks, unsigned int K,
-                                    unsigned long long p0, unsigned long long p1, unsigned long long p2, unsigned long long p3,
-                                    unsigned long long s0, unsigned long long s1, unsigned long long s2, unsigned long long s3,
-                                    unsigned long long time_,
-                                    unsigned long long t0, unsigned long long t1, unsigned long long t2, unsigned long long t3,
-                                    unsigned long long nonce_base, unsigned long long n_nonces,
-                                    unsigned long long* winner, unsigned int walk_v2) {
-    unsigned long long tid = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
-    unsigned long long i0 = tid * 2ULL;
-    if (i0 >= n_nonces) return;
-    unsigned long long i1 = i0 + 1ULL;
-    bool has1 = i1 < n_nonces;
-    unsigned long long nonce0 = nonce_base + i0;
-    // Boundary thread of an odd batch: walk nonce0 twice (result discarded below) rather than
-    // branching the whole thread body on has1.
-    unsigned long long nonce1 = nonce_base + (has1 ? i1 : i0);
-
-    unsigned long long state0 = pom_seed_fold(nonce0, time_, s0, s1, s2, s3);
-    unsigned long long state1 = pom_seed_fold(nonce1, time_, s0, s1, s2, s3);
-    unsigned long long off0 = state0 % n_total_chunks;
-    unsigned long long off1 = state1 % n_total_chunks;
-    for (unsigned int i = 0; i < K; i++) {
-        unsigned int lo0 = 0, hi0 = T;
-        while (lo0 + 1 < hi0) {
-            unsigned int mid = (lo0 + hi0) >> 1;
-            if (prefix[mid] <= off0) lo0 = mid; else hi0 = mid;
-        }
-        unsigned int lo1 = 0, hi1 = T;
-        while (lo1 + 1 < hi1) {
-            unsigned int mid = (lo1 + hi1) >> 1;
-            if (prefix[mid] <= off1) lo1 = mid; else hi1 = mid;
-        }
-        // 128-bit vector loads: read each 32-byte chunk as 2x ulonglong2 (a.x,a.y,c.x,c.y =
-        // w0..w3), BYTE-EXACT vs the 4x u64 form. Both chunks' fetches issue back-to-back so
-        // their DRAM latencies overlap (the whole point of the x2 interleave).
-        const ulonglong2* q0 = (const ulonglong2*)bases[lo0];
-        const ulonglong2* q1 = (const ulonglong2*)bases[lo1];
-        unsigned long long b0 = (off0 - prefix[lo0]) * 2ULL;
-        unsigned long long b1 = (off1 - prefix[lo1]) * 2ULL;
-        ulonglong2 a0 = q0[b0], c0 = q0[b0 + 1];
-        ulonglong2 a1 = q1[b1], c1 = q1[b1 + 1];
-        unsigned long long h0 = state0, h1 = state1;
-        if (walk_v2) {
-            // H5 non-foldable walk: chain mix64 through each chunk word so all 32 bytes are
-            // load-bearing (closes the pre-H5 XOR-fold that let a miner hold a 4x-smaller table).
-            // walk_v2 is uniform across all threads -> no warp divergence. The two chains are
-            // independent and interleave in the pipeline.
-            h0 = mix64(h0 ^ a0.x); h1 = mix64(h1 ^ a1.x);
-            h0 = mix64(h0 ^ a0.y); h1 = mix64(h1 ^ a1.y);
-            h0 = mix64(h0 ^ c0.x); h1 = mix64(h1 ^ c1.x);
-            h0 = mix64(h0 ^ c0.y); h1 = mix64(h1 ^ c1.y);
-            state0 = h0; state1 = h1;
-        } else {
-            // Pre-H5 fold (frozen — validates all blocks below H5_ACTIVATION_DAA).
-            h0 ^= a0.x; h0 ^= a0.y; h0 ^= c0.x; h0 ^= c0.y;
-            h1 ^= a1.x; h1 ^= a1.y; h1 ^= c1.x; h1 ^= c1.y;
-            state0 = mix64(h0); state1 = mix64(h1);
-        }
-        off0 = state0 % n_total_chunks;
-        off1 = state1 % n_total_chunks;
-    }
-    unsigned long long pv[4];
-    pom_pow_fold(state0, p0, p1, p2, p3, pv);
-    if (pom_le_leq(pv, t0, t1, t2, t3)) {
-        atomicMin(winner, nonce0);
-    }
-    if (has1) {
-        pom_pow_fold(state1, p0, p1, p2, p3, pv);
-        if (pom_le_leq(pv, t0, t1, t2, t3)) {
-            atomicMin(winner, nonce1);
-        }
     }
 }
 

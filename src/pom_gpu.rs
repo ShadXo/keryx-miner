@@ -12,7 +12,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::ffi::{c_void, CString};
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Once, OnceLock};
 
 use anyhow::{anyhow, Result};
@@ -31,11 +31,8 @@ const FATBIN_LEGACY: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/pom_mine_
 const FATBIN_NEXTGEN: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/pom_mine_nextgen.fatbin"));
 const CHUNK_BYTES: usize = 32;
 const POM_KERNEL_NAME: &str = "pom_mine";
-/// Opt-in ILP-x2 entry point. Absent from images built before the two-kernel split (notably the
-/// stale committed `pom_mine_nextgen.fatbin`), so its lookup is allowed to fail — see
-/// `LoadedPomKernel::ilp2`. Pre-H6 walk only; the H6 matrix walk uses the v3 entries below.
-const POM_KERNEL_ILP2_NAME: &str = "pom_mine_ilp2";
-/// Block size used until `autotune_block` picks one, and the fallback whenever the sweep errors.
+/// Block size for the pre-H6 walk. Fixed, not tuned: since H6 every live chain takes the v3
+/// entries below, so the legacy kernel is unreachable and there is nothing to tune for.
 const POM_DEFAULT_BLOCK: u32 = 256;
 const POM_V3_KERNEL_NAME: &str = "pom_mine_v3";
 const POM_V3_DUMP_KERNEL_NAME: &str = "pom_mine_v3_dump";
@@ -98,10 +95,6 @@ struct LoadedPomKernel {
     module: sys::CUmodule,
     /// One nonce per thread. Always present — every image exports `pom_mine`.
     function: sys::CUfunction,
-    /// Two nonces per thread. `None` for images predating the two-kernel split, in which case
-    /// the miner stays on ILP1 regardless of tuning (the autotune sweep skips the ILP probe).
-    /// Pre-H6 walk only.
-    ilp2: Option<sys::CUfunction>,
     /// v3 (H6) entries — `None` when the loaded image predates the v3 kernel (stale fatbin)
     /// or the card cannot take the 64 KB opt-in shared attribute. Legacy mining is unaffected.
     function_v3: Option<sys::CUfunction>,
@@ -129,7 +122,7 @@ impl LoadedPomKernel {
             return Err(anyhow!("PoM GPU: {} fatbin is empty", label));
         }
         let module = unsafe { result::module::load_data(fatbin.as_ptr() as *const c_void) }?;
-        // from_module resolves every entry point (legacy, ilp2, v3) in one place.
+        // from_module resolves every entry point (legacy, v3) in one place.
         Self::from_module(module)
     }
 
@@ -139,14 +132,12 @@ impl LoadedPomKernel {
         Self::from_module(module)
     }
 
-    /// Resolves both entry points out of an already-loaded module. `pom_mine` is required;
-    /// `pom_mine_ilp2` is optional so an image built before the split still loads and mines.
+    /// Resolves the entry points out of an already-loaded module. `pom_mine` is required; the v3
+    /// entries are optional so a stale image still loads (and then fails the v3 launch loudly).
     fn from_module(module: sys::CUmodule) -> Result<Self> {
         let function = unsafe { result::module::get_function(module, CString::new(POM_KERNEL_NAME).unwrap()) }?;
-        let ilp2 =
-            unsafe { result::module::get_function(module, CString::new(POM_KERNEL_ILP2_NAME).unwrap()) }.ok();
         let (function_v3, function_v3_dump) = load_v3_functions(module);
-        Ok(Self { module, function, ilp2, function_v3, function_v3_dump })
+        Ok(Self { module, function, function_v3, function_v3_dump })
     }
 
     fn launch(
@@ -163,22 +154,13 @@ impl LoadedPomKernel {
         start: u64,
         batch: u64,
         walk_v2: u32,
-        block: u32,
-        want_ilp2: bool,
     ) -> Result<Option<u64>> {
         let t = words4(target_le);
         let k = crate::pom::POM_WALK_STEPS;
         let winner = stream.clone_htod(&[u64::MAX])?;
-        // Thread count MUST track the entry point: ILP1 walks one nonce per thread, ILP x2 walks
-        // two (see cuda/pom_mine.cu). Getting this pair out of step silently searches half the
-        // range while still crediting a full batch, so derive both from the same decision.
-        let (function, ilp2) = match (want_ilp2, self.ilp2) {
-            (true, Some(f)) => (f, true),
-            _ => (self.function, false),
-        };
-        let threads = if ilp2 { (batch + 1) / 2 } else { batch };
-        let block = block.clamp(1, 1024);
-        let grid = threads.div_ceil(block as u64).max(1) as u32;
+        let function = self.function;
+        let block = POM_DEFAULT_BLOCK;
+        let grid = batch.div_ceil(block as u64).max(1) as u32;
         let cfg = LaunchConfig { grid_dim: (grid, 1, 1), block_dim: (block, 1, 1), shared_mem_bytes: 0 };
 
         let (bases_ptr, _bases_guard) = bases_dev.device_ptr(stream);
@@ -533,13 +515,6 @@ pub struct PomGpuMiner {
     prefix_dev: CudaSlice<u64>,
     t_count: u32,
     n_total_chunks: u64,
-    /// Walk block size, chosen once per device by `autotune_block`. Byte-exact: block size only
-    /// moves occupancy and scheduling, never results. Forced by `KERYX_POM_BLOCK`.
-    block_dim: AtomicU32,
-    /// Whether to use the ILP-x2 entry point. Off unless the sweep measures a real win, because
-    /// ILP x2 regresses parts that already saturate their outstanding-miss slots. Forced by
-    /// `KERYX_POM_ILP2`.
-    use_ilp2: AtomicBool,
     _uploads: Vec<CudaSlice<u8>>, // tensors we uploaded ourselves, kept alive for the gather
 }
 
@@ -593,8 +568,6 @@ impl PomGpuMiner {
             prefix_dev,
             t_count: bases.len() as u32,
             n_total_chunks,
-            block_dim: AtomicU32::new(POM_DEFAULT_BLOCK),
-            use_ilp2: AtomicBool::new(false),
             _uploads: uploads,
         })
     }
@@ -715,8 +688,6 @@ impl PomGpuMiner {
             prefix_dev,
             t_count: bases.len() as u32,
             n_total_chunks,
-            block_dim: AtomicU32::new(POM_DEFAULT_BLOCK),
-            use_ilp2: AtomicBool::new(false),
             _uploads: uploads,
         })
     }
@@ -767,122 +738,7 @@ impl PomGpuMiner {
             start,
             batch,
             walk_v2 as u32,
-            self.block_dim.load(Ordering::Relaxed),
-            self.use_ilp2.load(Ordering::Relaxed),
         )
-    }
-
-    /// Startup micro-benchmark: sweep candidate block sizes over the resident blob, pin the
-    /// fastest, then decide ILP1 vs ILP x2 at that block. Runs ONCE per device (the caller
-    /// guards). Byte-exact — neither knob changes results, only occupancy and scheduling — so
-    /// no re-validation of the walk is needed afterwards.
-    ///
-    /// The BLOCK sweep earns its place; the ILP probe has not yet. Measured:
-    ///
-    ///   RTX 3080  (sm_86, GDDR6X)  block 1024, stably across restarts -- 4x the 256 default.
-    ///                              Matches ocminer/keryx-miner-supr's note (sm_86 3070: 64/1024).
-    ///   RTX 5070 Ti (sm_120)       flat. Three restarts picked 64, 128 and 256 at the same
-    ///                              throughput, i.e. the sweep is choosing noise there -- harmless,
-    ///                              since every candidate is equivalent on that part.
-    ///
-    /// So a hardcoded block size would cost real throughput on Ampere while gaining nothing on
-    /// Blackwell, which is exactly the case for measuring per device rather than guessing.
-    ///
-    /// ILP x2, by contrast, has never been selected on any card measured -- see the note in
-    /// cuda/pom_mine.cu. The probe is kept because the kernel is upstream's and costs ~0.4s once.
-    ///
-    /// `KERYX_POM_BLOCK=<n>` forces a block size and skips the sweep; `KERYX_POM_ILP2=0|1` forces
-    /// the ILP choice; `KERYX_POM_NO_AUTOTUNE=1` keeps the defaults.
-    fn autotune_block(&self, device_id: u32) {
-        if let Ok(s) = std::env::var("KERYX_POM_BLOCK") {
-            if let Some(n) = s.trim().parse::<u32>().ok().filter(|n| (1..=1024).contains(n)) {
-                self.block_dim.store(n, Ordering::Relaxed);
-                info!("PoM[gpu{}]: block size forced to {} (KERYX_POM_BLOCK)", device_id, n);
-                return;
-            }
-            warn!("PoM[gpu{}]: ignoring unparseable KERYX_POM_BLOCK={:?} (want 1..=1024)", device_id, s);
-        }
-        if std::env::var("KERYX_POM_NO_AUTOTUNE").is_ok() {
-            info!("PoM[gpu{}]: block autotune disabled (KERYX_POM_NO_AUTOTUNE) — block=256, ILP1", device_id);
-            return;
-        }
-
-        let bench: u64 = 1 << 20;
-        // Sweep with ILP1 so the block comparison is not confounded by the ILP choice.
-        self.use_ilp2.store(false, Ordering::Relaxed);
-        let mut best_block = POM_DEFAULT_BLOCK;
-        let mut best_ms = f64::MAX;
-        for &bs in &[64u32, 128, 256, 512, 1024] {
-            self.block_dim.store(bs, Ordering::Relaxed);
-            let ms = self.bench_walk_ms(bench);
-            if ms == f64::MAX {
-                self.block_dim.store(POM_DEFAULT_BLOCK, Ordering::Relaxed);
-                warn!("PoM[gpu{}]: block autotune hit a launch error — falling back to block=256, ILP1", device_id);
-                return;
-            }
-            if ms < best_ms {
-                best_ms = ms;
-                best_block = bs;
-            }
-        }
-        self.block_dim.store(best_block, Ordering::Relaxed);
-
-        let mn = |ms: f64| (bench as f64) / (ms / 1e3) / 1e6;
-        let ilp2_available = self.kernel.ilp2.is_some();
-        let ilp2_on = if let Some(f) =
-            std::env::var("KERYX_POM_ILP2").ok().and_then(|s| s.trim().parse::<u32>().ok())
-        {
-            let on = f != 0 && ilp2_available;
-            if f != 0 && !ilp2_available {
-                warn!("PoM[gpu{}]: KERYX_POM_ILP2=1 but this image has no pom_mine_ilp2 — staying on ILP1", device_id);
-            } else {
-                info!("PoM[gpu{}]: ILP2 forced {} (KERYX_POM_ILP2)", device_id, if on { "ON" } else { "OFF" });
-            }
-            self.use_ilp2.store(on, Ordering::Relaxed);
-            on
-        } else if !ilp2_available {
-            // Pre-split image (e.g. the stale committed nextgen fatbin): ILP1 is the only entry
-            // point it exports, and launch() already pins the thread count to match.
-            info!("PoM[gpu{}]: image exports no pom_mine_ilp2 — ILP1", device_id);
-            self.use_ilp2.store(false, Ordering::Relaxed);
-            false
-        } else {
-            self.use_ilp2.store(false, Ordering::Relaxed);
-            let t1 = self.bench_walk_ms(bench);
-            self.use_ilp2.store(true, Ordering::Relaxed);
-            let t2 = self.bench_walk_ms(bench);
-            // Demand a >2% win before switching so run-to-run noise never flips the choice.
-            let on = t1 != f64::MAX && t2 != f64::MAX && t2 < t1 * 0.98;
-            self.use_ilp2.store(on, Ordering::Relaxed);
-            info!("PoM[gpu{}]: ILP1 {:.1} vs ILP2 {:.1} Mnonce/s", device_id, mn(t1), mn(t2));
-            on
-        };
-        info!(
-            "PoM[gpu{}]: autotuned config = block {}, ILP{} (~{:.1} Mnonce/s walk bench)",
-            device_id,
-            best_block,
-            if ilp2_on { "2" } else { "1" },
-            mn(best_ms)
-        );
-    }
-
-    /// Times the walk at the CURRENT `(block_dim, use_ilp2)`: one warmup then best-of-3.
-    /// Zero target means no winner ever matches, so the `atomicMin` path stays out of the
-    /// measurement; `walk_v2 = true` bills the live per-step cost. `f64::MAX` on launch error.
-    fn bench_walk_ms(&self, bench: u64) -> f64 {
-        let (pph, tgt) = ([0u8; 32], [0u8; 32]);
-        if self.mine(&pph, 0, &tgt, 0, bench, false, true, false, false, false).is_err() {
-            return f64::MAX;
-        }
-        let mut ms = f64::MAX;
-        for _ in 0..3 {
-            let t = std::time::Instant::now();
-            if self.mine(&pph, 0, &tgt, 0, bench, false, true, false, false, false).is_err() {
-                return f64::MAX;
-            }
-            ms = ms.min(t.elapsed().as_secs_f64() * 1e3);
-        }
-        ms
     }
 
     /// v3 dump for the winning nonce: (states S_0..=S_K, snippets, fold64(root_K)).
@@ -915,40 +771,6 @@ fn index_build_lock() -> &'static Mutex<()> {
 pub fn install(device_id: u32, m: PomGpuMiner) {
     if let Ok(mut g) = miners().lock() {
         g.insert(device_id, Arc::new(m));
-    }
-}
-
-/// Tuned walk config per device: `device_id -> (block_dim, use_ilp2)`.
-///
-/// The RESULT is cached, not merely a "has been tuned" flag: `uninstall` drops the miner on every
-/// inference model swap, so each rebuild constructs a fresh `PomGpuMiner` at the defaults. Keying
-/// the outcome by device lets a rebuild re-apply it for free. The optimum is a property of the
-/// silicon, not of the resident model, so it stays valid across swaps and era crossings.
-fn tuned_configs() -> &'static Mutex<HashMap<u32, (u32, bool)>> {
-    static TUNED: OnceLock<Mutex<HashMap<u32, (u32, bool)>>> = OnceLock::new();
-    TUNED.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-/// Applies the cached config if this device was tuned before, otherwise runs the sweep once and
-/// caches what it picked.
-fn tune_or_restore(device_id: u32, gm: &PomGpuMiner) {
-    if let Some((block, ilp2)) = tuned_configs().lock().ok().and_then(|g| g.get(&device_id).copied()) {
-        gm.block_dim.store(block, Ordering::Relaxed);
-        gm.use_ilp2.store(ilp2, Ordering::Relaxed);
-        info!(
-            "PoM[gpu{}]: reusing tuned walk config = block {}, ILP{}",
-            device_id,
-            block,
-            if ilp2 { "2" } else { "1" }
-        );
-        return;
-    }
-    gm.autotune_block(device_id);
-    if let Ok(mut g) = tuned_configs().lock() {
-        g.insert(
-            device_id,
-            (gm.block_dim.load(Ordering::Relaxed), gm.use_ilp2.load(Ordering::Relaxed)),
-        );
     }
 }
 
@@ -1628,9 +1450,6 @@ fn ensure_installed_inner(device_id: u32, daa: u64) -> bool {
             return false;
         }
     }
-    // Tune (or re-apply) the walk config before the miner goes live, so the first mined batch
-    // already runs at the chosen block size and ILP mode.
-    tune_or_restore(device_id, &gm);
     install(device_id, gm);
     info!("PoM[gpu{}]: GPU miner ready — N={} chunks resident (matches shared index)", device_id, n);
     true
@@ -1862,8 +1681,6 @@ impl PomGpuMiner {
             prefix_dev,
             t_count: bases.len() as u32,
             n_total_chunks,
-            block_dim: AtomicU32::new(POM_DEFAULT_BLOCK),
-            use_ilp2: AtomicBool::new(false),
             _uploads: uploads,
         })
     }
