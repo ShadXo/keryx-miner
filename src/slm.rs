@@ -323,7 +323,6 @@ fn ensure_gguf(spec: &ModelSpec) -> Result<(std::path::PathBuf, std::path::PathB
 /// e.g. Qwen3). Each template was validated against the GGUF's embedded chat template.
 fn format_prompt_by_name(name: &str, prompt: &str) -> String {
     match name {
-        "mistral-7b-v0.3" => format!("[INST] {}\n\n{}[/INST]", SYSTEM_PROMPT_NEXT, prompt),
         // GLM-4-0414 ignores the <|system|> role identity (keeps claiming a foreign vendor) —
         // fold the system prompt into the user turn instead.
         "glm-4-9b-0414" => format!(
@@ -333,7 +332,7 @@ fn format_prompt_by_name(name: &str, prompt: &str) -> String {
         // Qwen3 family — ChatML + a pre-filled empty think block so the visible answer starts
         // immediately (an open think block would eat the whole max_tokens budget). This is the
         // `enable_thinking = false` branch of their embedded template, verbatim.
-        "qwen3.6-27b" | "qwen3-8b-abliterated" | "qwen3.5-9b-abliterated" => format!(
+        "qwen3.6-27b" | "qwen3.5-9b-abliterated" => format!(
             "<|im_start|>system\n{}<|im_end|>\n\
              <|im_start|>user\n{}<|im_end|>\n\
              <|im_start|>assistant\n<think>\n\n</think>\n\n",
@@ -688,8 +687,7 @@ pub fn load_and_run_inference(model_id: &[u8; 32], prompt: &str, max_tokens: usi
         // The hosted model may live on ANOTHER device whose walk reads its tensors zero-dup:
         // evict drains that device (installed walk AND in-flight build) before freeing anything.
         // Draining only `dev_id` here poisoned the hosting GPU on every two-model rig.
-        crate::pom_gpu::evict_llama_host_for_swap(dev_id);
-        if let Err(e) = crate::llama_engine::ensure_loaded(&gguf, dev_id as usize) {
+        if let Err(e) = crate::pom_gpu::load_llama_for_inference(&gguf, dev_id) {
             log::error!("SlmEngine: cannot load '{}' — {}; response dropped", spec.name, e);
             mark_model_unavailable(model_id, if e.is_oom() { "llama_load_oom" } else { "llama_load_failed" });
             return None;

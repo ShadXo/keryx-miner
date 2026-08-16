@@ -96,17 +96,7 @@ One tier, one model. The tier you prove through PoM (Proof of Model) scales your
 
 With no flag, each GPU mines the **highest tier its VRAM holds**. The flags are a *ceiling*, not a selection — use one to hold a card below its maximum (smaller download, less VRAM pressure, lower power draw).
 
-The lineup changes at the H6 hardfork (mainnet DAA 77,203,262). Until then:
-
-| Flag | Model | Quant | Min VRAM |
-|------|-------|-------|----------|
-| `--very-light` | Qwen3-8B-abliterated | Q4_K_S | 6 GB+ |
-| `--light` | Mistral-7B-v0.3 | Q6_K | 8 GB+ |
-| *(none, default)* | GLM-4-9B-0414 | Q6_K | 12 GB+ |
-| `--high` | Qwen3.6-27B | Q4_K_M | 24 GB+ |
-| `--very-high` | Kimi-Linear-48B | Q4_K_M | 32 GB+ |
-
-From H6 onward. Qwen3.5-9B replaces **both** Qwen3-8B and Mistral-7B, GLM-4-9B slides down to `--light`, and Gemma-4-12B is new — it fills the gap between 12 GB and 24 GB cards:
+This is the H6 lineup, live from mainnet DAA 76,316,623. The pre-H6 models are retired: below that gate no tier has a consensus-valid model, so a miner started early idles until the gate rather than mining something the node would reject.
 
 | Flag | Model | Quant | Min VRAM |
 |------|-------|-------|----------|
@@ -116,9 +106,7 @@ From H6 onward. Qwen3.5-9B replaces **both** Qwen3-8B and Mistral-7B, GLM-4-9B s
 | `--high` | Qwen3.6-27B | Q4_K_M | 24 GB+ |
 | `--very-high` | Kimi-Linear-48B | Q4_K_M | 32 GB+ |
 
-Note what this means per card: the same flag can move you to a **larger** model at the crossing. A 12 GB card mining the default tier today holds GLM-4-9B; after H6 that tier wants 16 GB, so the card drops to `--light` — which is the same GLM-4-9B it was already running. A 10 GB card, however, loses the default tier entirely and lands on tier 0.
-
-Both eras' models are downloaded before mining starts, so the crossing is a hot swap rather than a mid-run stall. That means **two models on disk per tier** until the chain passes H6, after which the superseded one stops being fetched and can be deleted.
+Only the models for eras the chain can still reach are downloaded, so with H6 as the only live era that is **one model per tier**. A card mining more than one tier (across a multi-GPU rig) still needs each of those tiers' models on disk.
 
 Tiers are **not cumulative**: each one serves exactly one model, and a card that cannot hold the model you asked for falls back to a tier it can actually serve.
 
@@ -132,7 +120,7 @@ The model is loaded **on demand** when a request arrives and cached between requ
 
 ### Faster proof build (optional)
 
-`--resident-tree` holds the full Merkle tree in RAM, so building a block's proof is a lookup instead of an on-the-fly recompute. It needs roughly **2× the model size in system RAM** (not VRAM) — about 10 GB for the smallest tier, ~40 GB for the largest. If the machine doesn't have the RAM, the miner logs a warning and keeps the default disk-backed path, so enabling it is always safe.
+`--resident-tree` holds the full Merkle tree in RAM, so building a block's proof is a lookup instead of an on-the-fly recompute. It needs roughly **2× the model size in system RAM** (not VRAM) — about 13 GB for the smallest tier, ~40 GB for the largest. If the machine doesn't have the RAM, the miner logs a warning and keeps the default disk-backed path, so enabling it is always safe.
 
 ```bash
 ./keryx-miner --mining-address keryx:YOUR_ADDRESS --resident-tree
@@ -152,9 +140,9 @@ If IPFS is slow or blocked on your network, download the archive and unzip it in
 
 | Model | Hugging Face | Direct | Torrent |
 |-------|--------------|--------|---------|
-| Qwen3-8B-abliterated | [zip](https://huggingface.co/datasets/Keryx-Labs/models/resolve/main/Qwen3-8B-abliterated.zip) | [zip](https://keryx-labs.com/Qwen3-8B-abliterated.zip) | [torrent](https://keryx-labs.com/Qwen3-8B-abliterated.zip.torrent) |
-| Mistral-7B-v0.3 | [zip](https://huggingface.co/datasets/Keryx-Labs/models/resolve/main/Mistral-7B-v0.3.zip) | [zip](https://keryx-labs.com/Mistral-7B-v0.3.zip) | [torrent](https://keryx-labs.com/Mistral-7B-v0.3.zip.torrent) |
+| Qwen3.5-9B-abliterated | [zip](https://huggingface.co/datasets/Keryx-Labs/models/resolve/main/Qwen3.5-9B-abliterated.zip) | [zip](https://keryx-labs.com/Qwen3.5-9B-abliterated.zip) | [torrent](https://keryx-labs.com/Qwen3.5-9B-abliterated.zip.torrent) |
 | GLM-4-9B-0414 | [zip](https://huggingface.co/datasets/Keryx-Labs/models/resolve/main/GLM-4-9B-0414.zip) | [zip](https://keryx-labs.com/GLM-4-9B-0414.zip) | [torrent](https://keryx-labs.com/GLM-4-9B-0414.zip.torrent) |
+| Gemma-4-12B-abliterated | [zip](https://huggingface.co/datasets/Keryx-Labs/models/resolve/main/Gemma-4-12B-abliterated.zip) | [zip](https://keryx-labs.com/Gemma-4-12B-abliterated.zip) | [torrent](https://keryx-labs.com/Gemma-4-12B-abliterated.zip.torrent) |
 | Qwen3.6-27B | [zip](https://huggingface.co/datasets/Keryx-Labs/models/resolve/main/Qwen3.6-27B.zip) | [zip](https://keryx-labs.com/Qwen3.6-27B.zip) | [torrent](https://keryx-labs.com/Qwen3.6-27B.zip.torrent) |
 | Kimi-Linear-48B | [zip](https://huggingface.co/datasets/Keryx-Labs/models/resolve/main/Kimi-Linear-48B.zip) | [zip](https://keryx-labs.com/Kimi-Linear-48B.zip) | [torrent](https://keryx-labs.com/Kimi-Linear-48B.zip.torrent) |
 

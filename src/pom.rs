@@ -1398,9 +1398,9 @@ pub fn h5_2_activation_daa() -> u64 {
 
 /// H6 matrix-walk gate. At/after this score (the TEMPLATE's daa_score, never wall clock or tip)
 /// the miner grinds the v3 walk and builds `PomProofV3`. MUST equal the node's
-/// `pom_v3_activation`: mainnet 77_203_262, testnet 1000.
+/// `pom_v3_activation`: mainnet 76_316_623, testnet 1000.
 pub fn pom_v3_activation_daa() -> u64 {
-    gate(77_203_262, 1000)
+    gate(76_316_623, 1000)
 }
 
 /// Resident possession indices, built lazily when PoM activates, keyed by MODEL (era-stable).
@@ -1650,12 +1650,14 @@ mod tests {
     #[test]
     #[ignore]
     fn gguf_real_model_read_chunk_byte_identical() {
-        let path = "/home/slash/KERYX-KRX/claude/keryx-miner/target/release/models/Qwen3-8B-abliterated/model.gguf";
-        if !std::path::Path::new(path).exists() {
+        // Override with KERYX_TEST_GGUF to point at any locally downloaded model.
+        let path = std::env::var("KERYX_TEST_GGUF")
+            .unwrap_or_else(|_| "target/release/models/Qwen3.5-9B-abliterated/model.gguf".to_string());
+        if !std::path::Path::new(&path).exists() {
             eprintln!("skip: GGUF not found at {path}");
             return;
         }
-        let idx = WeightIndex::build_from_gguf(path, [0u8; 32]).expect("build index from real GGUF");
+        let idx = WeightIndex::build_from_gguf(&path, [0u8; 32]).expect("build index from real GGUF");
         eprintln!("real model index: N={} chunks", idx.n_chunks);
         let (k, t) = (POM_WALK_STEPS, POM_OPENINGS);
         let pph = [3u8; 32];
