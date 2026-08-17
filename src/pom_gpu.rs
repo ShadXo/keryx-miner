@@ -400,20 +400,33 @@ fn select_pom_kernel(device_id: usize) -> Result<LoadedPomKernel> {
 
     let is_nextgen_cc = is_nextgen_device(device_id);
 
-    let fatbin_candidates: [(&str, &str, &[u8]); 2] = if is_nextgen_cc {
-        [
-            ("pom_mine_mod_nextgen", "nextgen fatbin", FATBIN_NEXTGEN),
-            ("pom_mine_mod_legacy", "legacy fatbin", FATBIN_LEGACY),
-        ]
+    // A cc >= 8.9 card gets the nextgen image or the PTX ladder — never the legacy fatbin. The
+    // legacy image is built for sm_86, so a Blackwell part loading it JITs its compute_86 PTX and
+    // runs measurably slower than the arch-matched sm_120 PTX further down the ladder, silently.
+    // Offering legacy here also pre-empts `nextgen_kernel: ptx`, which exists to exercise that
+    // ladder. Same reasoning as the PoW image ladder in plugins/cuda/src/worker.rs.
+    let fatbin_candidates: &[(&str, &str, &[u8])] = if is_nextgen_cc {
+        &[("pom_mine_mod_nextgen", "nextgen fatbin", FATBIN_NEXTGEN)]
     } else {
-        [
-            ("pom_mine_mod_legacy", "legacy fatbin", FATBIN_LEGACY),
-            ("pom_mine_mod_nextgen", "nextgen fatbin", FATBIN_NEXTGEN),
-        ]
+        &[("pom_mine_mod_legacy", "legacy fatbin", FATBIN_LEGACY)]
     };
 
-    for (module_name, label, fatbin) in fatbin_candidates {
+    // An image that resolves `pom_mine` but not `pom_mine_v3` still loads — the v3 lookups are
+    // optional so a pre-v3 image is not fatal outright. But accepting one here ends the search,
+    // and since H6 every launch takes the v3 path, so that GPU would then fail every batch with
+    // "no v3 entry" while a candidate further down the ladder exports it. Hold a v3-less success
+    // aside and keep looking; fall back to it only if nothing else can do better.
+    let mut v3_less: Option<(LoadedPomKernel, &str, &str)> = None;
+
+    for &(module_name, label, fatbin) in fatbin_candidates {
         match LoadedPomKernel::from_fatbin(label, fatbin) {
+            Ok(kernel) if kernel.function_v3.is_none() => {
+                warn!(
+                    "PoM[gpu{}]: {} loaded but exports no pom_mine_v3 — trying the PTX ladder for a v3-capable image",
+                    device_id, label
+                );
+                v3_less.get_or_insert((kernel, label, module_name));
+            }
             Ok(kernel) => {
                 let cc = gpu_compute_capability(device_id);
                 if let Some((major, minor)) = cc {
@@ -439,6 +452,11 @@ fn select_pom_kernel(device_id: usize) -> Result<LoadedPomKernel> {
 
     for (module_name, label, ptx) in POM_PTX_CANDIDATES {
         match LoadedPomKernel::from_ptx(label, ptx) {
+            Ok(kernel) if kernel.function_v3.is_none() => {
+                // Same rule as the fatbins: keep it only as a last resort. A PTX image lacking the
+                // v3 entry cannot mine post-H6, so prefer any later candidate that has it.
+                v3_less.get_or_insert((kernel, label, module_name));
+            }
             Ok(kernel) => {
                 let cc = gpu_compute_capability(device_id);
                 if let Some((major, minor)) = cc {
@@ -465,6 +483,19 @@ fn select_pom_kernel(device_id: usize) -> Result<LoadedPomKernel> {
                 warn!("PoM[gpu{}]: {} PTX load failed: {}", device_id, label, e);
             }
         }
+    }
+
+    // Nothing on the ladder exported v3. Take the pre-v3 image we set aside rather than refusing to
+    // load at all: it still mines every era before the H6 gate, and failing here would take PoW
+    // down with it on a chain that has not crossed yet.
+    if let Some((kernel, label, module_name)) = v3_less {
+        let cc = gpu_compute_capability(device_id);
+        warn!(
+            "PoM[gpu{}]: no image on the ladder exports pom_mine_v3 — falling back to {} ({}), which cannot mine past the H6 gate",
+            device_id, label, module_name
+        );
+        set_gpu_kernel_info(device_id, cc, &format!("{} (no v3)", label), module_name);
+        return Ok(kernel);
     }
 
     Err(anyhow!("PoM GPU: no compatible PTX image for this device/driver"))

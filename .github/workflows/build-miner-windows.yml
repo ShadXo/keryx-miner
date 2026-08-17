@@ -93,10 +93,8 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "nvcc -fatbin failed" }
           Get-Item pom_mine_nextgen.fatbin | Select-Object Name,Length
 
-      # Legacy image, for the same reason — see the note in build-miner.yml. Every cc < 8.9
-      # card loads it, and the committed copy is upstream's, where `pom_mine` is the ILP x2
-      # kernel rather than this fork's ILP1. Shipping it would leave Ampere unable to select
-      # ILP2 at all and launching twice the threads it uses.
+      # Legacy image, for the same reason — see the note in build-miner.yml. Every cc < 8.9 card
+      # loads it and it must export `pom_mine_v3`, or that card cannot mine past the H6 gate.
       - name: Compile legacy fatbin
         if: inputs.nextgen_kernel == 'native'
         shell: pwsh

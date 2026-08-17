@@ -308,6 +308,12 @@ fn load(gguf: &str, gpu: usize, allow_gpu_change: bool) -> Result<u64, LoadError
             }
         }
         *g = Some(Engine { model, count, info, generate: gen, free, tensor_device, gpu, gguf: gguf.to_string(), attempt });
+        // The library demonstrably works, so clear the sticky flag. It is set for conditions that
+        // are permanent in practice (absent .so, missing symbols, wrong ABI) but not permanent by
+        // nature — an operator can drop the right library in place and restart a worker without
+        // restarting the miner. Latching it forever would leave inference refused for the life of
+        // the process against evidence to the contrary.
+        LIB_UNUSABLE.store(false, Ordering::Relaxed);
         log::info!("llama engine: ✓ active — llama.cpp hosts the model + serves OPoI inference.");
         Ok(attempt)
     }

@@ -87,14 +87,13 @@ jobs:
           sudo chown "$(id -u):$(id -g)" pom_mine_nextgen.fatbin
           ls -la pom_mine_nextgen.fatbin
 
-      # The LEGACY image needs rebuilding for the same reason as nextgen, and it is easy to
-      # miss because the bug is silent. Every cc < 8.9 card loads this one, and the committed
-      # copy is upstream's — where `pom_mine` IS the ILP x2 kernel. In this fork `pom_mine` is
-      # ILP1 and the two-nonce variant is `pom_mine_ilp2`, so shipping upstream's image leaves
-      # our host launching `batch` threads at a kernel that grinds two nonces each: coverage
-      # stays correct (the kernel's own i0 >= n_nonces guard stops the overshoot) but half the
-      # threads exit immediately and the autotune cannot offer ILP2 at all. Building it here
-      # gives Ampere both entry points and a real measurement, exactly like Blackwell.
+      # The LEGACY image needs rebuilding for the same reason as nextgen: every cc < 8.9 card
+      # loads this one, and it must export `pom_mine_v3` or that card cannot mine past the H6
+      # gate. select_pom_kernel now refuses a v3-less image and walks on to the PTX ladder
+      # rather than silently accepting it, so a stale copy degrades instead of wedging — but
+      # the PTX path is slower than native SASS, so build it here regardless.
+      # (This note used to be about `pom_mine_ilp2`, which no longer exists: H6 routes every
+      # live chain through pom_mine_v3, so the ILP kernel and its autotune were removed.)
       # -Wno-deprecated-gpu-targets: sm_61/70 are deprecated in 12.x (removed in 13.x) and
       # warn loudly; still fully supported by this toolkit.
       - name: Compile legacy fatbin
@@ -173,6 +172,12 @@ jobs:
           cp keryx-cuda-sm120.ptx  plugins/cuda/resources/keryx-cuda-sm120.ptx
           ls -la plugins/cuda/resources/keryx-nextgen.fatbin plugins/cuda/resources/keryx-cuda-sm120.ptx
 
+      # Sanitised BUILD_IMAGE for use inside a cache key: the raw value has ':' and '/' in it.
+      - name: Derive cache key component from BUILD_IMAGE
+        id: cachekey
+        run: |
+          printf 'image=%s\n' "$(printf '%s' "$BUILD_IMAGE" | tr -c '[:alnum:].-' '_')" >> "$GITHUB_OUTPUT"
+
       - name: Cache llama engine
         uses: actions/cache@v4
         with:
@@ -187,7 +192,11 @@ jobs:
           # source, and build.rs (which owns the compile and link flags). build.rs also drives
           # the PoM PTX ladder, so unrelated edits there do cost a full llama rebuild -- worth
           # it, because the alternative is silently shipping a broken engine again.
-          key: llama-${{ env.LLAMA_TAG }}-${{ inputs.llama_archs }}-cuda1282-nehalem1-${{ hashFiles('tools/keryx-llama/keryx_llama.cpp', 'build.rs') }}
+          #
+          # The toolkit is part of the key too, taken from BUILD_IMAGE via the step above rather
+          # than written out as a literal: a hardcoded `cuda1282` does not change when someone
+          # bumps BUILD_IMAGE, which is the same silent-stale-reuse bug one paragraph up.
+          key: llama-${{ env.LLAMA_TAG }}-${{ inputs.llama_archs }}-${{ steps.cachekey.outputs.image }}-nehalem1-${{ hashFiles('tools/keryx-llama/keryx_llama.cpp', 'build.rs') }}
 
       - name: Cache cargo
         uses: actions/cache@v4

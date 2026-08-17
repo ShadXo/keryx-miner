@@ -4,7 +4,7 @@ use log::LevelFilter;
 use crate::Error;
 
 #[derive(Parser, Debug)]
-#[clap(name = "keryx-miner", version, about = "A Keryx high performance GPU miner with OPoI inference\n\nUncensored model tiers — one model per tier (default: Gemma-4-12B):\n  --very-light Qwen3.5-9B-abliterated (Q5_K_M) — 8GB+ VRAM, smallest tier\n  --light      GLM-4-9B (Q6_K) — 12GB+ VRAM\n  (default)    Gemma-4-12B-abliterated (Q6_K) — 16GB+ VRAM\n  --high       Qwen3.6-27B (Q4_K_M) — 24GB+ VRAM\n  --very-high  Kimi-Linear-48B (Q4_K_M) — 32GB+ VRAM", term_width = 0)]
+#[clap(name = "keryx-miner", version, about = "A Keryx high performance GPU miner with OPoI inference\n\nUncensored model tiers — one model per tier. With NO flag each GPU mines the highest\ntier its VRAM holds; the flags below are a CEILING, for holding a card lower (smaller\ndownload, less VRAM pressure, lower power draw). Note the top tier is a 29.7 GB model.\n  --very-light Qwen3.5-9B-abliterated (Q5_K_M) — 8GB+ VRAM, smallest tier\n  --light      GLM-4-9B (Q6_K) — 12GB+ VRAM\n  (no flag)    highest tier that fits, per GPU — Gemma-4-12B (Q6_K) needs 16GB+\n  --high       Qwen3.6-27B (Q4_K_M) — 24GB+ VRAM\n  --very-high  Kimi-Linear-48B (Q4_K_M) — 32GB+ VRAM", term_width = 0)]
 pub struct Opt {
     // ── OPoI / Inference ─────────────────────────────────────────────────────
 

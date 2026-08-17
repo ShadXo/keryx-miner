@@ -64,6 +64,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let legacy_dst = format!("{out_dir}/pom_mine_legacy.fatbin");
         let nextgen_dst = format!("{out_dir}/pom_mine_nextgen.fatbin");
 
+        // Track the RESOLVED sources, not just the committed paths above. When POM_FATBIN_* points
+        // somewhere else (CI compiles fresh images to the repo root), only the env VALUE was
+        // tracked, not the file's contents — so a rebuilt fatbin at an unchanged path could not
+        // invalidate this script. Combined with a restored `target/` cache that means the stale
+        // OUT_DIR copy gets embedded and the freshly built image is silently discarded.
+        println!("cargo:rerun-if-changed={legacy_src}");
+        println!("cargo:rerun-if-changed={nextgen_src}");
+
         if std::path::Path::new(&legacy_src).exists() {
             fs::copy(&legacy_src, &legacy_dst).unwrap_or_else(|e| {
                 panic!("failed copying POM_FATBIN_LEGACY from {legacy_src} to {legacy_dst}: {e}")

@@ -339,66 +339,52 @@ extern "C" fn plugin_log_sink(level: u8, msg_ptr: *const u8, msg_len: usize) {
     log::log!(lvl, "{}", msg);
 }
 
-/// Query GPU stats via nvidia-smi and warn on power/VRAM issues for the selected model tier.
-///
-/// VRAM requirements (GGUF weights only, not counting CUDA workspace):
-///   Qwen3.5-9B-abliterated  →  ~6.5 GB  (requires ≥8 GB card)
-///   GLM-4-9B                →  ~8.3 GB  (requires ≥12 GB card)
-///   Gemma-4-12B-abliterated →  ~9.8 GB  (requires ≥16 GB card)
-///   Qwen3.6-27B             → ~16.5 GB  (requires ≥24 GB card)
-///   Kimi-Linear-48B         → ~29.7 GB  (requires ≥32 GB card)
+/// Warn when a card is power-limited far enough to risk Xid 32 under a large GEMM.
 ///
 /// Power thresholds empirically derived: Xid 32 observed at ≤300W on RTX 3090 with 32B GGUF.
+///
+/// Deliberately power ONLY. This used to warn about VRAM too, and got it wrong twice over on a
+/// mixed rig: it read a single nvidia-smi line while the caller passes the highest tier assigned
+/// to ANY GPU, and nvidia-smi orders by PCI position while CUDA orders `FASTEST_FIRST` (see
+/// `pom_gpu::query_all_gpus_vram`), so the line it read was not reliably the card that took that
+/// tier. `assign_pom_tiers` already sizes every device against `pom_tier_ladder()` using
+/// CUDA-ordered VRAM and downgrades per card, which is the same check done correctly — so the
+/// duplicate here only ever produced spurious "will OOM" warnings.
 fn check_gpu_power_limit(needs_high: bool, needs_very_high: bool) {
     let output = std::process::Command::new("nvidia-smi")
-        .args(["--query-gpu=power.limit,power.max_limit,memory.total", "--format=csv,noheader,nounits"])
+        .args(["--query-gpu=power.limit,power.max_limit", "--format=csv,noheader,nounits"])
         .output();
 
-    // nvidia-smi prints one line per GPU; the power + VRAM check applies to GPU 0
-    // (the device the miner mines/serves on).
-    let (current_w, vram_mb) = match output {
+    // One line per GPU. Warn on the LOWEST limit present: the risk is a specific card browning
+    // out under a large GEMM, so a healthy sibling must not mask it.
+    let min_w = match output {
         Ok(o) if o.status.success() => {
             let s = String::from_utf8_lossy(&o.stdout);
-            let mut cur = 0u32;
-            let mut vram = 0u64;
-            for (i, line) in s.trim().lines().take(1).enumerate() {
-                let mut parts = line.split(',');
-                let line_cur: f32 = parts.next().unwrap_or("0").trim().parse().unwrap_or(0.0);
-                let _max: f32 = parts.next().unwrap_or("0").trim().parse().unwrap_or(0.0);
-                let line_vram: u64 = parts.next().unwrap_or("0").trim().parse().unwrap_or(0);
-                if i == 0 {
-                    cur = line_cur as u32;
-                }
-                vram += line_vram;
-            }
-            (cur, vram)
+            s.trim()
+                .lines()
+                .filter_map(|line| line.split(',').next()?.trim().parse::<f32>().ok())
+                .map(|w| w as u32)
+                .min()
         }
         _ => return,
     };
+    let Some(min_w) = min_w else { return };
 
-    // VRAM sufficiency for the selected tier (Q4_K_M weights + KV cache + CUDA workspace).
-    // Insufficient VRAM means GPU inference for this tier will OOM. This is non-fatal — a
-    // host/CPU path can still serve it — so warn rather than error, and do NOT then claim the
-    // model is "ready" on the same GPU (the contradictory ERROR-then-ready pair).
-    let (model_label, min_vram_mb): (&str, u64) = if needs_very_high {
-        ("Kimi-Linear-48B (--very-high)", 30_000)
+    let tier_label = if needs_very_high {
+        "4 (Kimi-Linear-48B)"
     } else if needs_high {
-        ("Qwen3.6-27B (--high)", 20_000)
+        "3 (Qwen3.6-27B)"
     } else {
-        ("Gemma-4-12B-abliterated (default)", 15_000)
+        "≤2"
     };
-
-    if vram_mb < min_vram_mb {
+    let threshold_w: u32 = if needs_very_high || needs_high { 300 } else { 250 };
+    if min_w < threshold_w {
         log::warn!(
-            "⚠  {} needs ≥{} GB VRAM but only {} GB on this GPU — GPU inference for this tier \
-             will OOM. Use a smaller tier (--high Qwen3.6-27B / --light GLM-4-9B / --very-light \
-             Qwen3.5-9B) or let the per-GPU assignment downgrade it.",
-            model_label,
-            min_vram_mb / 1024,
-            vram_mb / 1024,
+            "⚠  lowest GPU power limit is {}W — tier {} drives large GEMMs, and Xid 32 has been \
+             observed at ≤300W on a 3090 under this load. Raise the limit if inference wedges.",
+            min_w,
+            tier_label,
         );
-    } else {
-        log::info!("GPU: {}W PL, {} MB VRAM — ready for {}", current_w, vram_mb, model_label);
     }
 }
 
@@ -1097,9 +1083,11 @@ async fn run() -> Result<(), Error> {
     // property, not a per-GPU one.
     //   --very-light → Qwen3.5-9B-abliterated
     //   --light      → GLM-4-9B
-    //   (no flag)    → Gemma-4-12B-abliterated   [default]
+    //   (no flag)    → the highest tier this GPU's VRAM holds, per card (NOT a fixed tier 2)
     //   --high       → Qwen3.6-27B
     //   --very-high  → Kimi-Linear-48B
+    // The flags are a ceiling, not a selection: `assign_pom_tiers` picks the largest tier ≤ the
+    // flag that fits each card, so a 24 GB card under no flag takes tier 3, not tier 2.
 
     // Per-card tier overrides (--force-model, CUDA-driver order). Parsed once here — the power
     // warning below and the per-GPU assignment both need them.

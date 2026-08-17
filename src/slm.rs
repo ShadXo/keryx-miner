@@ -678,6 +678,10 @@ pub fn load_and_run_inference(model_id: &[u8; 32], prompt: &str, max_tokens: usi
                 "SlmEngine: llama engine unusable (see the earlier load warning) — not evicting the gpu{} miner; response dropped",
                 dev_id
             );
+            // Withdraw it from ai:cap too. Returning early skips the load path that would
+            // normally do this, so without it the miner keeps advertising a model it cannot
+            // serve — soliciting requests it will drop, which is worse than not offering it.
+            mark_model_unavailable(&spec.model_id, "llama_library_unusable");
             return None;
         }
         // The engine hosts another model (or nothing). Inference has priority: release the
