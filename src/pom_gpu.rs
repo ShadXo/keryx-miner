@@ -36,6 +36,8 @@ const POM_KERNEL_NAME: &str = "pom_mine";
 const POM_DEFAULT_BLOCK: u32 = 256;
 const POM_V3_KERNEL_NAME: &str = "pom_mine_v3";
 const POM_V3_DUMP_KERNEL_NAME: &str = "pom_mine_v3_dump";
+const POM_V4_KERNEL_NAME: &str = "pom_mine_v4";
+const POM_V4_SHARED_BYTES: u32 = 2048;
 /// v3 dynamic shared bytes (the 64 KB tile) — needs the opt-in attribute; cc >= 7.0 only.
 const POM_V3_SHARED_BYTES: u32 = crate::pom_v3::POM_V3_TILE_BYTES as u32;
 
@@ -99,6 +101,7 @@ struct LoadedPomKernel {
     /// or the card cannot take the 64 KB opt-in shared attribute. Legacy mining is unaffected.
     function_v3: Option<sys::CUfunction>,
     function_v3_dump: Option<sys::CUfunction>,
+    function_v4: Option<sys::CUfunction>,
 }
 
 impl Drop for LoadedPomKernel {
@@ -134,10 +137,32 @@ impl LoadedPomKernel {
 
     /// Resolves the entry points out of an already-loaded module. `pom_mine` is required; the v3
     /// entries are optional so a stale image still loads (and then fails the v3 launch loudly).
+    /// Does this image export every entry the newest scheduled era needs?
+    ///
+    /// The v3/v4 lookups are optional so a stale image still loads rather than failing outright —
+    /// but an image missing one cannot mine past that era's gate, and accepting it ends the
+    /// candidate search. Checked so the ladder can keep looking for a complete image instead.
+    fn mines_current_era(&self) -> bool {
+        self.function_v3.is_some() && self.function_v4.is_some()
+    }
+
+    /// Which entries this image lacks, for the operator-facing warning. Empty when complete.
+    fn missing_entries(&self) -> String {
+        let mut m: Vec<&str> = Vec::new();
+        if self.function_v3.is_none() {
+            m.push("pom_mine_v3");
+        }
+        if self.function_v4.is_none() {
+            m.push("pom_mine_v4");
+        }
+        if m.is_empty() { String::new() } else { format!(" {}", m.join(", ")) }
+    }
+
     fn from_module(module: sys::CUmodule) -> Result<Self> {
         let function = unsafe { result::module::get_function(module, CString::new(POM_KERNEL_NAME).unwrap()) }?;
         let (function_v3, function_v3_dump) = load_v3_functions(module);
-        Ok(Self { module, function, function_v3, function_v3_dump })
+        let function_v4 = unsafe { result::module::get_function(module, CString::new(POM_V4_KERNEL_NAME).unwrap()) }.ok();
+        Ok(Self { module, function, function_v3, function_v3_dump, function_v4 })
     }
 
     fn launch(
@@ -256,6 +281,32 @@ impl LoadedPomKernel {
         unsafe { result::launch_kernel(function, cfg.grid_dim, cfg.block_dim, cfg.shared_mem_bytes, stream.cu_stream(), &mut params) }?;
         stream.synchronize()?;
 
+        let w = stream.clone_dtoh(&winner)?[0];
+        Ok(if w == u64::MAX { None } else { Some(w) })
+    }
+
+    /// v4 (re-walk) grind: one block of 32 threads per nonce over `[start, start + batch)`.
+    #[allow(clippy::too_many_arguments)]
+    fn launch_v4(&self, stream: &Arc<CudaStream>, bases_dev: &CudaSlice<u64>, prefix_dev: &CudaSlice<u64>, t_count: u32, n_tiles: u64, p_words: &[u64; 4], s_words: &[u64; 4], timestamp: u64, target_le: &[u8; 32], start: u64, batch: u64) -> Result<Option<u64>> {
+        let function = self.function_v4.ok_or_else(|| anyhow!("PoM GPU: loaded kernel image has no pom_mine_v4 entry"))?;
+        let t = words4(target_le);
+        let k = crate::pom_v4::POM_V4_K as u32;
+        let winner = stream.clone_htod(&[u64::MAX])?;
+        let cfg = LaunchConfig { grid_dim: (batch as u32, 1, 1), block_dim: (crate::pom_v4::POM_V4_D as u32, 1, 1), shared_mem_bytes: POM_V4_SHARED_BYTES };
+        let (bases_ptr, _bg) = bases_dev.device_ptr(stream);
+        let (prefix_ptr, _pg) = prefix_dev.device_ptr(stream);
+        let (winner_ptr, _wg) = winner.device_ptr(stream);
+        let mut params: [*mut c_void; 21] = [
+            (&bases_ptr as *const _ as *mut c_void), (&prefix_ptr as *const _ as *mut c_void),
+            (&t_count as *const _ as *mut c_void), (&n_tiles as *const _ as *mut c_void), (&k as *const _ as *mut c_void),
+            (&p_words[0] as *const _ as *mut c_void), (&p_words[1] as *const _ as *mut c_void), (&p_words[2] as *const _ as *mut c_void), (&p_words[3] as *const _ as *mut c_void),
+            (&s_words[0] as *const _ as *mut c_void), (&s_words[1] as *const _ as *mut c_void), (&s_words[2] as *const _ as *mut c_void), (&s_words[3] as *const _ as *mut c_void),
+            (&timestamp as *const _ as *mut c_void),
+            (&t[0] as *const _ as *mut c_void), (&t[1] as *const _ as *mut c_void), (&t[2] as *const _ as *mut c_void), (&t[3] as *const _ as *mut c_void),
+            (&start as *const _ as *mut c_void), (&batch as *const _ as *mut c_void), (&winner_ptr as *const _ as *mut c_void),
+        ];
+        unsafe { result::launch_kernel(function, cfg.grid_dim, cfg.block_dim, cfg.shared_mem_bytes, stream.cu_stream(), &mut params) }?;
+        stream.synchronize()?;
         let w = stream.clone_dtoh(&winner)?[0];
         Ok(if w == u64::MAX { None } else { Some(w) })
     }
@@ -416,16 +467,16 @@ fn select_pom_kernel(device_id: usize) -> Result<LoadedPomKernel> {
     // and since H6 every launch takes the v3 path, so that GPU would then fail every batch with
     // "no v3 entry" while a candidate further down the ladder exports it. Hold a v3-less success
     // aside and keep looking; fall back to it only if nothing else can do better.
-    let mut v3_less: Option<(LoadedPomKernel, &str, &str)> = None;
+    let mut incomplete: Option<(LoadedPomKernel, &str, &str)> = None;
 
     for &(module_name, label, fatbin) in fatbin_candidates {
         match LoadedPomKernel::from_fatbin(label, fatbin) {
-            Ok(kernel) if kernel.function_v3.is_none() => {
+            Ok(kernel) if !kernel.mines_current_era() => {
                 warn!(
-                    "PoM[gpu{}]: {} loaded but exports no pom_mine_v3 — trying the PTX ladder for a v3-capable image",
-                    device_id, label
+                    "PoM[gpu{}]: {} loaded but is missing{} — trying the PTX ladder for a complete image",
+                    device_id, label, kernel.missing_entries()
                 );
-                v3_less.get_or_insert((kernel, label, module_name));
+                incomplete.get_or_insert((kernel, label, module_name));
             }
             Ok(kernel) => {
                 let cc = gpu_compute_capability(device_id);
@@ -452,10 +503,9 @@ fn select_pom_kernel(device_id: usize) -> Result<LoadedPomKernel> {
 
     for (module_name, label, ptx) in POM_PTX_CANDIDATES {
         match LoadedPomKernel::from_ptx(label, ptx) {
-            Ok(kernel) if kernel.function_v3.is_none() => {
-                // Same rule as the fatbins: keep it only as a last resort. A PTX image lacking the
-                // v3 entry cannot mine post-H6, so prefer any later candidate that has it.
-                v3_less.get_or_insert((kernel, label, module_name));
+            Ok(kernel) if !kernel.mines_current_era() => {
+                // Same rule as the fatbins: keep it only as a last resort.
+                incomplete.get_or_insert((kernel, label, module_name));
             }
             Ok(kernel) => {
                 let cc = gpu_compute_capability(device_id);
@@ -485,16 +535,17 @@ fn select_pom_kernel(device_id: usize) -> Result<LoadedPomKernel> {
         }
     }
 
-    // Nothing on the ladder exported v3. Take the pre-v3 image we set aside rather than refusing to
-    // load at all: it still mines every era before the H6 gate, and failing here would take PoW
-    // down with it on a chain that has not crossed yet.
-    if let Some((kernel, label, module_name)) = v3_less {
+    // Nothing on the ladder carries a full entry set. Take the incomplete image we set aside
+    // rather than refusing to load at all: it still mines every era whose entry it does have, and
+    // failing here would take PoW down with it on a chain that has not reached the missing gate.
+    if let Some((kernel, label, module_name)) = incomplete {
         let cc = gpu_compute_capability(device_id);
+        let missing = kernel.missing_entries();
         warn!(
-            "PoM[gpu{}]: no image on the ladder exports pom_mine_v3 — falling back to {} ({}), which cannot mine past the H6 gate",
-            device_id, label, module_name
+            "PoM[gpu{}]: no image on the ladder is complete — falling back to {} ({}), which is missing{} and cannot mine past that gate",
+            device_id, label, module_name, missing
         );
-        set_gpu_kernel_info(device_id, cc, &format!("{} (no v3)", label), module_name);
+        set_gpu_kernel_info(device_id, cc, &format!("{} (incomplete)", label), module_name);
         return Ok(kernel);
     }
 
@@ -732,9 +783,18 @@ impl PomGpuMiner {
     /// `h3` salts the pph words host-side (POM_H3_PPH_SALT); `h5_1` swaps the SEED words to the
     /// v2 salt (POM_H5_1_PPH_SALT) while the pow words stay H3 — the kernel is era-agnostic,
     /// it folds whatever word sets it receives.
-    pub fn mine(&self, pre_pow_hash: &[u8; 32], timestamp: u64, target_le: &[u8; 32], start: u64, batch: u64, h3: bool, walk_v2: bool, h5_1: bool, h5_2: bool, v3: bool) -> Result<Option<u64>> {
+    pub fn mine(&self, pre_pow_hash: &[u8; 32], timestamp: u64, target_le: &[u8; 32], start: u64, batch: u64, h3: bool, walk_v2: bool, h5_1: bool, h5_2: bool, v3: bool, v4: bool) -> Result<Option<u64>> {
         // Worker threads rotate; make sure this device's context is current before raw launches.
         self.ctx.bind_to_thread()?;
+        if v4 {
+            let s_words = crate::pom::pph_words_v4(pre_pow_hash);
+            let p_words = crate::pom::pph_words_for_era(pre_pow_hash, true);
+            let n_tiles = self.n_total_chunks / crate::pom_v4::POM_V4_TILE_CHUNKS;
+            if n_tiles == 0 {
+                return Err(anyhow!("PoM GPU: blob too small for the v4 walk"));
+            }
+            return self.kernel.launch_v4(&self.stream, &self.bases_dev, &self.prefix_dev, self.t_count, n_tiles, &p_words, &s_words, timestamp, target_le, start, batch);
+        }
         let p_words = crate::pom::pph_words_for_era(pre_pow_hash, h3);
         let s_words = crate::pom::seed_pph_words_for_era(pre_pow_hash, h3, h5_1, h5_2);
         if v3 {
@@ -782,6 +842,7 @@ impl PomGpuMiner {
         }
         self.kernel.launch_v3_dump(&self.stream, &self.bases_dev, &self.prefix_dev, self.t_count, n_tiles, &s_words, timestamp, nonce)
     }
+
 }
 
 // Per-GPU PoM miners. Host-side WeightIndex remains shared; only the CUDA-resident worker state
@@ -885,7 +946,7 @@ pub fn is_loading() -> bool {
 
 /// Convenience: search a nonce batch via the installed miner for a specific device.
 #[allow(clippy::too_many_arguments)]
-pub fn mine(device_id: u32, pre_pow_hash: &[u8; 32], timestamp: u64, target_le: &[u8; 32], start: u64, batch: u64, h3: bool, walk_v2: bool, h5_1: bool, h5_2: bool, v3: bool) -> Option<u64> {
+pub fn mine(device_id: u32, pre_pow_hash: &[u8; 32], timestamp: u64, target_le: &[u8; 32], start: u64, batch: u64, h3: bool, walk_v2: bool, h5_1: bool, h5_2: bool, v3: bool, v4: bool) -> Option<u64> {
     if inference_paused() {
         return None;
     }
@@ -893,7 +954,7 @@ pub fn mine(device_id: u32, pre_pow_hash: &[u8; 32], timestamp: u64, target_le: 
         let g = miners().lock().ok()?;
         g.get(&device_id)?.clone()
     };
-    miner.mine(pre_pow_hash, timestamp, target_le, start, batch, h3, walk_v2, h5_1, h5_2, v3).ok().flatten()
+    miner.mine(pre_pow_hash, timestamp, target_le, start, batch, h3, walk_v2, h5_1, h5_2, v3, v4).ok().flatten()
 }
 
 /// Convenience: v3 dump for the winning nonce via the installed miner for a specific device.
@@ -1764,7 +1825,7 @@ mod v3_kernel_tests {
         let miner = PomGpuMiner::load_test_segments(0, split_blob(&blob)).unwrap();
         // Trivial target: every nonce wins, atomicMin returns the batch base.
         let target = [0xFFu8; 32];
-        let found = miner.mine(&PPH, TIMESTAMP, &target, 1000, 8, true, true, true, true, true).unwrap().unwrap();
+        let found = miner.mine(&PPH, TIMESTAMP, &target, 1000, 8, true, true, true, true, true, false).unwrap().unwrap();
         assert_eq!(found, 1000);
 
         let (states, snippets, final_state) = miner.dump_v3(&PPH, TIMESTAMP, found, true, true, true).unwrap();
