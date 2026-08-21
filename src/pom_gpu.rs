@@ -1969,15 +1969,18 @@ mod v3_kernel_tests {
         // which both kernels must agree on across the whole range.
         let target = [0xFFu8; 32];
         for base in [0u64, 1_000, 1u64 << 20] {
-            let tc = miner.mine(&PPH, TIMESTAMP, &target, base, 2048, true, true, true, true, false, true).unwrap();
-            std::env::set_var("KERYX_POM_V4_TC", "0");
-            // v4_tc_enabled() caches, so compare against launch_v4 directly instead.
+            // Call both launches directly rather than through mine(): v4_tc_enabled() caches its
+            // first read, so an env toggle between the two halves would not take effect.
             let s_words = crate::pom::pph_words_v4(&PPH);
             let p_words = crate::pom::pph_words_for_era(&PPH, true);
             let n_tiles = miner.n_total_chunks / pom_v4::POM_V4_TILE_CHUNKS;
             let classic = miner
                 .kernel
                 .launch_v4(&miner.stream, &miner.bases_dev, &miner.prefix_dev, miner.t_count, n_tiles, &p_words, &s_words, TIMESTAMP, &target, base, 2048)
+                .unwrap();
+            let tc = miner
+                .kernel
+                .launch_v4_tc(&miner.stream, &miner.bases_dev, &miner.prefix_dev, miner.t_count, n_tiles, &p_words, &s_words, TIMESTAMP, &target, base, 2048)
                 .unwrap();
             assert_eq!(tc, classic, "tensor-core and classic disagree at base {base}");
         }
@@ -2044,9 +2047,21 @@ mod v3_kernel_tests {
     }
 }
 
-/// Whether the tensor-core v4 solver is enabled. `KERYX_POM_V4_TC=0` forces the classic kernel —
-/// the escape hatch for comparing the two, and for backing out on a card where it misbehaves.
+/// Whether the tensor-core v4 solver is enabled. OPT-IN: `KERYX_POM_V4_TC=1` turns it on.
+///
+/// Deliberately off by default. The MMA fragment mapping is hand-written from the PTX ISA layout
+/// and has never executed on a GPU — only `ptxas` has seen it. A wrong lane mapping does not
+/// crash; it silently computes a different walk, which means mining proofs the node rejects. Until
+/// `v4_kernel_matches_host_reference` and `v4_tensor_core_matches_classic` both pass on real
+/// hardware, a package built from this tree must mine with the classic kernel unless someone
+/// deliberately asks otherwise. Flip the default once those gates are green.
 fn v4_tc_enabled() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| !matches!(std::env::var("KERYX_POM_V4_TC").as_deref(), Ok("0")))
+    *ON.get_or_init(|| {
+        let on = matches!(std::env::var("KERYX_POM_V4_TC").as_deref(), Ok("1"));
+        if on {
+            warn!("PoM v4: tensor-core solver ENABLED (KERYX_POM_V4_TC=1) — unvalidated on this hardware; verify with the --ignored v4 gates before trusting shares");
+        }
+        on
+    })
 }
