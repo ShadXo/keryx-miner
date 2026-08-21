@@ -37,6 +37,7 @@ const POM_DEFAULT_BLOCK: u32 = 256;
 const POM_V3_KERNEL_NAME: &str = "pom_mine_v3";
 const POM_V3_DUMP_KERNEL_NAME: &str = "pom_mine_v3_dump";
 const POM_V4_KERNEL_NAME: &str = "pom_mine_v4";
+const POM_V4_DUMP_KERNEL_NAME: &str = "pom_mine_v4_dump";
 const POM_V4_SHARED_BYTES: u32 = 2048;
 /// v3 dynamic shared bytes (the 64 KB tile) — needs the opt-in attribute; cc >= 7.0 only.
 const POM_V3_SHARED_BYTES: u32 = crate::pom_v3::POM_V3_TILE_BYTES as u32;
@@ -102,6 +103,8 @@ struct LoadedPomKernel {
     function_v3: Option<sys::CUfunction>,
     function_v3_dump: Option<sys::CUfunction>,
     function_v4: Option<sys::CUfunction>,
+    /// v4 dump entry — test-only, so its absence never gates mining (see `mines_current_era`).
+    function_v4_dump: Option<sys::CUfunction>,
 }
 
 impl Drop for LoadedPomKernel {
@@ -162,7 +165,9 @@ impl LoadedPomKernel {
         let function = unsafe { result::module::get_function(module, CString::new(POM_KERNEL_NAME).unwrap()) }?;
         let (function_v3, function_v3_dump) = load_v3_functions(module);
         let function_v4 = unsafe { result::module::get_function(module, CString::new(POM_V4_KERNEL_NAME).unwrap()) }.ok();
-        Ok(Self { module, function, function_v3, function_v3_dump, function_v4 })
+        let function_v4_dump =
+            unsafe { result::module::get_function(module, CString::new(POM_V4_DUMP_KERNEL_NAME).unwrap()) }.ok();
+        Ok(Self { module, function, function_v3, function_v3_dump, function_v4, function_v4_dump })
     }
 
     fn launch(
@@ -314,6 +319,62 @@ impl LoadedPomKernel {
     /// v3 (H6) dump: re-walk ONE (winning) nonce and return (states S_0..=S_K concatenated,
     /// snippets, fold64(root_K)) for the host proof-build.
     #[allow(clippy::too_many_arguments)]
+    /// Dump variant of `launch_v4`: one nonce, one block, emitting every state and snippet so the
+    /// GPU walk can be checked against the Rust mirror in `pom_v4`. Test-only.
+    #[allow(clippy::too_many_arguments)]
+    fn launch_v4_dump(
+        &self,
+        stream: &Arc<CudaStream>,
+        bases_dev: &CudaSlice<u64>,
+        prefix_dev: &CudaSlice<u64>,
+        t_count: u32,
+        n_tiles: u64,
+        s_words: &[u64; 4],
+        timestamp: u64,
+        nonce: u64,
+    ) -> Result<(Vec<u8>, Vec<u8>, u64)> {
+        let function =
+            self.function_v4_dump.ok_or_else(|| anyhow!("PoM GPU: loaded kernel image has no v4 dump entry"))?;
+        let k = crate::pom_v4::POM_V4_K;
+        let d = crate::pom_v4::POM_V4_D;
+        let states = stream.clone_htod(vec![0u8; (k + 1) * d * d].as_slice())?;
+        let snippets = stream.clone_htod(vec![0u8; k * crate::pom_v4::POM_V4_SNIPPET_BYTES].as_slice())?;
+        let final_state = stream.clone_htod(&[0u64])?;
+        let k32 = k as u32;
+        let cfg = LaunchConfig {
+            grid_dim: (1, 1, 1),
+            block_dim: (d as u32, 1, 1),
+            shared_mem_bytes: POM_V4_SHARED_BYTES,
+        };
+
+        let (bases_ptr, _bases_guard) = bases_dev.device_ptr(stream);
+        let (prefix_ptr, _prefix_guard) = prefix_dev.device_ptr(stream);
+        let (states_ptr, _states_guard) = states.device_ptr(stream);
+        let (snippets_ptr, _snippets_guard) = snippets.device_ptr(stream);
+        let (final_ptr, _final_guard) = final_state.device_ptr(stream);
+
+        let mut params: [*mut c_void; 14] = [
+            (&bases_ptr as *const _ as *mut c_void),
+            (&prefix_ptr as *const _ as *mut c_void),
+            (&t_count as *const _ as *mut c_void),
+            (&n_tiles as *const _ as *mut c_void),
+            (&k32 as *const _ as *mut c_void),
+            (&s_words[0] as *const _ as *mut c_void),
+            (&s_words[1] as *const _ as *mut c_void),
+            (&s_words[2] as *const _ as *mut c_void),
+            (&s_words[3] as *const _ as *mut c_void),
+            (&timestamp as *const _ as *mut c_void),
+            (&nonce as *const _ as *mut c_void),
+            (&states_ptr as *const _ as *mut c_void),
+            (&snippets_ptr as *const _ as *mut c_void),
+            (&final_ptr as *const _ as *mut c_void),
+        ];
+
+        unsafe { result::launch_kernel(function, cfg.grid_dim, cfg.block_dim, cfg.shared_mem_bytes, stream.cu_stream(), &mut params) }?;
+        stream.synchronize()?;
+
+        Ok((stream.clone_dtoh(&states)?, stream.clone_dtoh(&snippets)?, stream.clone_dtoh(&final_state)?[0]))
+    }
     fn launch_v3_dump(
         &self,
         stream: &Arc<CudaStream>,
@@ -832,6 +893,18 @@ impl PomGpuMiner {
         )
     }
 
+    /// v4 dump for one nonce: (states S_0..=S_K, snippets, fold64(root_K)). Test-only — this is
+    /// what lets the GPU walk be proven byte-exact against the `pom_v4` mirror.
+    pub fn dump_v4(&self, pre_pow_hash: &[u8; 32], timestamp: u64, nonce: u64, h3: bool, h5_1: bool, h5_2: bool) -> Result<(Vec<u8>, Vec<u8>, u64)> {
+        self.ctx.bind_to_thread()?;
+        let s_words = crate::pom::seed_pph_words_for_era(pre_pow_hash, h3, h5_1, h5_2);
+        let n_tiles = self.n_total_chunks / crate::pom_v4::POM_V4_TILE_CHUNKS;
+        if n_tiles == 0 {
+            return Err(anyhow!("PoM GPU: blob too small for the v4 walk"));
+        }
+        self.kernel.launch_v4_dump(&self.stream, &self.bases_dev, &self.prefix_dev, self.t_count, n_tiles, &s_words, timestamp, nonce)
+    }
+
     /// v3 dump for the winning nonce: (states S_0..=S_K, snippets, fold64(root_K)).
     pub fn dump_v3(&self, pre_pow_hash: &[u8; 32], timestamp: u64, nonce: u64, h3: bool, h5_1: bool, h5_2: bool) -> Result<(Vec<u8>, Vec<u8>, u64)> {
         self.ctx.bind_to_thread()?;
@@ -955,6 +1028,18 @@ pub fn mine(device_id: u32, pre_pow_hash: &[u8; 32], timestamp: u64, target_le: 
         g.get(&device_id)?.clone()
     };
     miner.mine(pre_pow_hash, timestamp, target_le, start, batch, h3, walk_v2, h5_1, h5_2, v3, v4).ok().flatten()
+}
+
+/// Convenience: v4 dump for one nonce via the installed miner for a specific device.
+pub fn dump_v4(device_id: u32, pre_pow_hash: &[u8; 32], timestamp: u64, nonce: u64, h3: bool, h5_1: bool, h5_2: bool) -> Option<(Vec<u8>, Vec<u8>, u64)> {
+    if inference_paused() {
+        return None;
+    }
+    let miner = {
+        let g = miners().lock().ok()?;
+        g.get(&device_id)?.clone()
+    };
+    miner.dump_v4(pre_pow_hash, timestamp, nonce, h3, h5_1, h5_2).ok()
 }
 
 /// Convenience: v3 dump for the winning nonce via the installed miner for a specific device.
@@ -1783,6 +1868,7 @@ impl PomGpuMiner {
 mod v3_kernel_tests {
     use super::*;
     use crate::pom_v3;
+    use crate::pom_v4;
 
     const PPH: [u8; 32] = [7u8; 32];
     const TIMESTAMP: u64 = 0x11_2233_4455;
@@ -1798,6 +1884,30 @@ mod v3_kernel_tests {
             start = c;
         }
         segs
+    }
+
+    /// The v4 counterpart of `v3_kernel_matches_host_reference`. Requires a GPU, so it is
+    /// #[ignore]d like the rest — run with `cargo test -- --ignored` on a CUDA host.
+    ///
+    /// This is the gate any v4 kernel optimisation has to pass: warp-per-nonce, cp.async
+    /// pipelining and tensor-core MMA all change HOW the walk is computed and none of them may
+    /// change WHAT it computes. Without this, a wrong kernel shows up as rejected blocks.
+    #[test]
+    #[ignore]
+    fn v4_kernel_matches_host_reference() {
+        let blob = pom_v4::lockstep_blob();
+        let miner = PomGpuMiner::load_test_segments(0, split_blob(&blob)).unwrap();
+        let nonce = 42u64;
+        let (states, snippets, final_state) = miner.dump_v4(&PPH, TIMESTAMP, nonce, true, true, true).unwrap();
+
+        let seed = crate::pom::pom_block_seed(&PPH, TIMESTAMP, nonce, true, true, true);
+        let (ref_states, ref_snippets, _) = pom_v4::ref_walk(seed, &blob);
+        assert_eq!(snippets, ref_snippets, "GPU snippets differ from the host reference");
+        assert_eq!(states, ref_states, "GPU states differ from the host reference");
+
+        let d2 = pom_v4::POM_V4_D * pom_v4::POM_V4_D;
+        let root = pom_v4::v4_state_root(&ref_states[pom_v4::POM_V4_K * d2..]);
+        assert_eq!(final_state, crate::pom_v3::fold64(&root), "GPU blake3 tree differs from the host");
     }
 
     #[test]

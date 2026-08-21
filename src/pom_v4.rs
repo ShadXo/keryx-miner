@@ -137,3 +137,47 @@ pub fn verify_proof_v4(seed: u64, proof: &PomProofV4, r_t: &[u8; 32], n_chunks: 
     }
     Ok(fold64(&v4_state_root(&state)))
 }
+
+/// Test-only reference walk (host): S_0..=S_K + snippets + offsets over an in-RAM blob.
+///
+/// Exists to give the v4 GPU kernel the byte-exactness harness v3 has had since H6 and v4
+/// shipped without. Without it a subtly wrong kernel is indistinguishable from a correct one
+/// until the node rejects blocks — and any optimisation of the walk is unverifiable.
+#[cfg(test)]
+pub(crate) fn ref_walk(seed: u64, blob: &[u8]) -> (Vec<u8>, Vec<u8>, Vec<u64>) {
+    let d2 = POM_V4_D * POM_V4_D;
+    let n_tiles = (blob.len() / POM_V4_CHUNK_BYTES) as u64 / POM_V4_TILE_CHUNKS;
+    assert!(n_tiles > 0, "blob too small for one v4 tile");
+    let mut states = Vec::with_capacity((POM_V4_K + 1) * d2);
+    states.extend_from_slice(&v4_initial_state(seed));
+    let mut snippets = Vec::with_capacity(POM_V4_K * POM_V4_SNIPPET_BYTES);
+    let mut offsets = Vec::with_capacity(POM_V4_K);
+    let mut off = v4_first_offset(seed, n_tiles);
+    for step in 1..=POM_V4_K as u32 {
+        let tile = &blob[(off as usize) * POM_V4_TILE_BYTES..(off as usize + 1) * POM_V4_TILE_BYTES];
+        let snippet: [u8; POM_V4_SNIPPET_BYTES] = tile[..POM_V4_SNIPPET_BYTES].try_into().unwrap();
+        offsets.push(off);
+        snippets.extend_from_slice(&snippet);
+        let prev = states[(step as usize - 1) * d2..(step as usize) * d2].to_vec();
+        let next = v4_transition(&prev, tile, step);
+        states.extend_from_slice(&next);
+        if (step as usize) < POM_V4_K {
+            off = v4_next_offset(seed, step as u64, &snippet, n_tiles);
+        }
+    }
+    (states, snippets, offsets)
+}
+
+/// Test-only blob sized for the v4 walk. Same generator as the v3 lockstep blob so the two
+/// harnesses stay comparable; only the tile geometry differs.
+#[cfg(test)]
+pub(crate) fn lockstep_blob() -> Vec<u8> {
+    let n_bytes = 64 * POM_V4_TILE_BYTES + 5 * POM_V4_CHUNK_BYTES;
+    let mut blob = vec![0u8; n_bytes];
+    let mut h = 0xDEADBEEFu64;
+    for b in blob.iter_mut() {
+        h = mix64(h);
+        *b = h as u8;
+    }
+    blob
+}

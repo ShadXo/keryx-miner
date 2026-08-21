@@ -365,6 +365,7 @@ extern "C" __global__ void pom_mine_v3_dump(
 #define V4_D4 (V4_D / 4)          // 8 uints per row/column
 #define V4_TILE_BYTES 1024
 #define V4_TILE_CHUNKS 32
+#define V4_SNIPPET_BYTES 32
 static_assert(V4_D == 32, "PoM v4 requires D=32");
 
 #define V4_S0_ROW_SALT       0x03421325594C3C51ULL
@@ -403,7 +404,8 @@ __device__ __forceinline__ void b3_hash_row32(const unsigned int row[8], unsigne
 // fold64(v4_state_root(S_K)); valid on thread 0 only.
 __device__ __forceinline__ unsigned long long v4_walk_block(
     const unsigned long long* bases, const unsigned long long* prefix, unsigned int T,
-    unsigned long long n_tiles, unsigned int K, unsigned long long seed, unsigned int* s_tile) {
+    unsigned long long n_tiles, unsigned int K, unsigned long long seed, unsigned int* s_tile,
+    unsigned char* states_out, unsigned char* snippets_out) {
     const unsigned int x = threadIdx.x;   // state row, 0..31
 
     // S_0: mix64 keystream per row.
@@ -413,12 +415,25 @@ __device__ __forceinline__ unsigned long long v4_walk_block(
         #pragma unroll
         for (int k4 = 0; k4 < V4_D4; k4++) { h = mix64(h); row4[k4] = (unsigned int)h; }
     }
+    // Dump hooks mirror pom_mine_v3_dump: null for the mining kernel, so the walk itself is
+    // unchanged. S_0 is state index 0; step s writes state index s.
+    if (states_out) {
+        unsigned int* dst = (unsigned int*)(states_out + (unsigned long long)x * V4_D);
+        #pragma unroll
+        for (int k4 = 0; k4 < V4_D4; k4++) dst[k4] = row4[k4];
+    }
 
     unsigned long long off = mix64(seed ^ V4_OFFSET_FIRST_SALT) % n_tiles;
 
     for (unsigned int step = 1; step <= K; step++) {
         v4_load_tile(bases, prefix, T, off, s_tile, x);
         __syncthreads();
+
+        if (x == 0 && snippets_out) {
+            unsigned int* sn = (unsigned int*)(snippets_out + (unsigned long long)(step - 1) * V4_SNIPPET_BYTES);
+            #pragma unroll
+            for (int w = 0; w < 8; w++) sn[w] = s_tile[w];
+        }
 
         // Next offset from the CURRENT tile's snippet (first 32 bytes = 8 words).
         {
@@ -447,6 +462,12 @@ __device__ __forceinline__ unsigned long long v4_walk_block(
         }
         #pragma unroll
         for (int k4 = 0; k4 < V4_D4; k4++) row4[k4] = new4[k4];
+        if (states_out) {
+            unsigned int* dst = (unsigned int*)(states_out + (unsigned long long)step * V4_TILE_BYTES
+                                                + (unsigned long long)x * V4_D);
+            #pragma unroll
+            for (int k4 = 0; k4 < V4_D4; k4++) dst[k4] = row4[k4];
+        }
         __syncthreads();
     }
 
@@ -477,10 +498,31 @@ extern "C" __global__ void pom_mine_v4(
     if ((unsigned long long)blockIdx.x >= n_nonces) return;
     const unsigned long long nonce = nonce_base + blockIdx.x;
     const unsigned long long seed = pom_seed_fold(nonce, time_, s0, s1, s2, s3);
-    const unsigned long long fin = v4_walk_block(bases, prefix, T, n_tiles, K, seed, s_shared);
+    const unsigned long long fin = v4_walk_block(bases, prefix, T, n_tiles, K, seed, s_shared, nullptr, nullptr);
     if (threadIdx.x == 0) {
         unsigned long long pv[4];
         pom_pow_fold(fin, p0, p1, p2, p3, pv);
         if (pom_le_leq(pv, t0, t1, t2, t3)) atomicMin(winner, nonce);
     }
+}
+
+// Dump variant of the v4 walk: one nonce, one block, emitting every state S_0..S_K and each
+// step's snippet. Exists so the GPU walk can be proven byte-exact against the Rust mirror in
+// src/pom_v4.rs (v4_initial_state / v4_transition / v4_state_root) — v3 has had `pom_mine_v3_dump`
+// for this since H6 and v4 shipped without one, which left no way to tell a correct kernel from a
+// subtly wrong one short of watching for rejected blocks.
+//
+// Layout, mirroring the v3 dump: state S_t row x at states_out + t*V4_TILE_BYTES + x*V4_D, and
+// step s's snippet at snippets_out + (s-1)*V4_SNIPPET_BYTES.
+extern "C" __global__ void pom_mine_v4_dump(
+    const unsigned long long* bases, const unsigned long long* prefix, unsigned int T,
+    unsigned long long n_tiles, unsigned int K,
+    unsigned long long s0, unsigned long long s1, unsigned long long s2, unsigned long long s3,
+    unsigned long long time_, unsigned long long nonce,
+    unsigned char* states_out, unsigned char* snippets_out, unsigned long long* final_state_out) {
+    extern __shared__ unsigned int s_tile_dump[];
+    const unsigned long long seed = pom_seed_fold(nonce, time_, s0, s1, s2, s3);
+    const unsigned long long fin =
+        v4_walk_block(bases, prefix, T, n_tiles, K, seed, s_tile_dump, states_out, snippets_out);
+    if (threadIdx.x == 0) *final_state_out = fin;
 }
