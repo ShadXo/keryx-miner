@@ -38,6 +38,13 @@ const POM_V3_KERNEL_NAME: &str = "pom_mine_v3";
 const POM_V3_DUMP_KERNEL_NAME: &str = "pom_mine_v3_dump";
 const POM_V4_KERNEL_NAME: &str = "pom_mine_v4";
 const POM_V4_DUMP_KERNEL_NAME: &str = "pom_mine_v4_dump";
+/// Tensor-core v4 solver (sm_80+): warp-per-nonce, pre-resolved offset chain, depth-3 cp.async
+/// tile pipeline, 8x mma.sync.m16n8k32.s8 per step. Optional so an older image still loads.
+const POM_V4_TC_KERNEL_NAME: &str = "pom_mine_v4_tc";
+/// Warps (= nonces) per block in the TC kernel; must equal V4_TC_WARPS in cuda/pom_mine.cu.
+const POM_V4_TC_WARPS: u32 = 4;
+/// Per-warp shared: 3 tile buffers + 2 state buffers + the K-entry offset chain.
+const POM_V4_TC_SMEM_PER_WARP: u32 = (3 + 2) * 1024 + 32 * 4 * 8;
 const POM_V4_SHARED_BYTES: u32 = 2048;
 /// v3 dynamic shared bytes (the 64 KB tile) — needs the opt-in attribute; cc >= 7.0 only.
 const POM_V3_SHARED_BYTES: u32 = crate::pom_v3::POM_V3_TILE_BYTES as u32;
@@ -105,6 +112,8 @@ struct LoadedPomKernel {
     function_v4: Option<sys::CUfunction>,
     /// v4 dump entry — test-only, so its absence never gates mining (see `mines_current_era`).
     function_v4_dump: Option<sys::CUfunction>,
+    /// Tensor-core v4 entry. Optional: absent on a pre-TC image, and skipped on sm_75 and below.
+    function_v4_tc: Option<sys::CUfunction>,
 }
 
 impl Drop for LoadedPomKernel {
@@ -167,7 +176,9 @@ impl LoadedPomKernel {
         let function_v4 = unsafe { result::module::get_function(module, CString::new(POM_V4_KERNEL_NAME).unwrap()) }.ok();
         let function_v4_dump =
             unsafe { result::module::get_function(module, CString::new(POM_V4_DUMP_KERNEL_NAME).unwrap()) }.ok();
-        Ok(Self { module, function, function_v3, function_v3_dump, function_v4, function_v4_dump })
+        let function_v4_tc =
+            unsafe { result::module::get_function(module, CString::new(POM_V4_TC_KERNEL_NAME).unwrap()) }.ok();
+        Ok(Self { module, function, function_v3, function_v3_dump, function_v4, function_v4_dump, function_v4_tc })
     }
 
     fn launch(
@@ -322,6 +333,57 @@ impl LoadedPomKernel {
     /// Dump variant of `launch_v4`: one nonce, one block, emitting every state and snippet so the
     /// GPU walk can be checked against the Rust mirror in `pom_v4`. Test-only.
     #[allow(clippy::too_many_arguments)]
+    /// Tensor-core v4 launch: one WARP per nonce, so a block covers `POM_V4_TC_WARPS` nonces.
+    /// Byte-identical output to `launch_v4` — see the kernel comment for why the int8 MMA
+    /// accumulation order cannot change the result.
+    #[allow(clippy::too_many_arguments)]
+    fn launch_v4_tc(&self, stream: &Arc<CudaStream>, bases_dev: &CudaSlice<u64>, prefix_dev: &CudaSlice<u64>, t_count: u32, n_tiles: u64, p_words: &[u64; 4], s_words: &[u64; 4], timestamp: u64, target_le: &[u8; 32], start: u64, batch: u64) -> Result<Option<u64>> {
+        let function = self.function_v4_tc.ok_or_else(|| anyhow!("PoM GPU: loaded kernel image has no pom_mine_v4_tc entry"))?;
+        let t = words4(target_le);
+        let k = crate::pom_v4::POM_V4_K as u32;
+        let winner = stream.clone_htod(&[u64::MAX])?;
+        let grid = (batch as u32).div_ceil(POM_V4_TC_WARPS).max(1);
+        let cfg = LaunchConfig {
+            grid_dim: (grid, 1, 1),
+            block_dim: (32 * POM_V4_TC_WARPS, 1, 1),
+            shared_mem_bytes: POM_V4_TC_WARPS * POM_V4_TC_SMEM_PER_WARP,
+        };
+
+        let (bases_ptr, _bases_guard) = bases_dev.device_ptr(stream);
+        let (prefix_ptr, _prefix_guard) = prefix_dev.device_ptr(stream);
+        let (winner_ptr, _winner_guard) = winner.device_ptr(stream);
+
+        let mut params: [*mut c_void; 21] = [
+            (&bases_ptr as *const _ as *mut c_void),
+            (&prefix_ptr as *const _ as *mut c_void),
+            (&t_count as *const _ as *mut c_void),
+            (&n_tiles as *const _ as *mut c_void),
+            (&k as *const _ as *mut c_void),
+            (&p_words[0] as *const _ as *mut c_void),
+            (&p_words[1] as *const _ as *mut c_void),
+            (&p_words[2] as *const _ as *mut c_void),
+            (&p_words[3] as *const _ as *mut c_void),
+            (&s_words[0] as *const _ as *mut c_void),
+            (&s_words[1] as *const _ as *mut c_void),
+            (&s_words[2] as *const _ as *mut c_void),
+            (&s_words[3] as *const _ as *mut c_void),
+            (&timestamp as *const _ as *mut c_void),
+            (&t[0] as *const _ as *mut c_void),
+            (&t[1] as *const _ as *mut c_void),
+            (&t[2] as *const _ as *mut c_void),
+            (&t[3] as *const _ as *mut c_void),
+            (&start as *const _ as *mut c_void),
+            (&batch as *const _ as *mut c_void),
+            (&winner_ptr as *const _ as *mut c_void),
+        ];
+
+        unsafe { result::launch_kernel(function, cfg.grid_dim, cfg.block_dim, cfg.shared_mem_bytes, stream.cu_stream(), &mut params) }?;
+        stream.synchronize()?;
+
+        let w = stream.clone_dtoh(&winner)?[0];
+        Ok(if w == u64::MAX { None } else { Some(w) })
+    }
+
     fn launch_v4_dump(
         &self,
         stream: &Arc<CudaStream>,
@@ -853,6 +915,12 @@ impl PomGpuMiner {
             let n_tiles = self.n_total_chunks / crate::pom_v4::POM_V4_TILE_CHUNKS;
             if n_tiles == 0 {
                 return Err(anyhow!("PoM GPU: blob too small for the v4 walk"));
+            }
+            // Tensor-core path when the image has it and the operator has not opted out. The
+            // kernel itself falls back to the classic walk on sm_75 and below, so no capability
+            // gate is needed here -- an older card simply gets the same result more slowly.
+            if self.kernel.function_v4_tc.is_some() && v4_tc_enabled() {
+                return self.kernel.launch_v4_tc(&self.stream, &self.bases_dev, &self.prefix_dev, self.t_count, n_tiles, &p_words, &s_words, timestamp, target_le, start, batch);
             }
             return self.kernel.launch_v4(&self.stream, &self.bases_dev, &self.prefix_dev, self.t_count, n_tiles, &p_words, &s_words, timestamp, target_le, start, batch);
         }
@@ -1886,6 +1954,35 @@ mod v3_kernel_tests {
         segs
     }
 
+    /// The 2048-nonce gate: the tensor-core solver and the classic kernel must agree on every
+    /// nonce in a range, not just on the one the single-nonce mirror test covers. This is the
+    /// breadth check to the mirror test's depth — a data-dependent MMA layout bug would pass the
+    /// latter and fail here. Mirrors how keryx-miner-supr validated the same optimisation.
+    #[test]
+    #[ignore]
+    fn v4_tensor_core_matches_classic() {
+        let blob = pom_v4::lockstep_blob();
+        let miner = PomGpuMiner::load_test_segments(0, split_blob(&blob)).unwrap();
+        assert!(miner.kernel.function_v4_tc.is_some(), "image has no pom_mine_v4_tc entry");
+
+        // Trivial target so every nonce "wins": atomicMin then returns the lowest nonce searched,
+        // which both kernels must agree on across the whole range.
+        let target = [0xFFu8; 32];
+        for base in [0u64, 1_000, 1u64 << 20] {
+            let tc = miner.mine(&PPH, TIMESTAMP, &target, base, 2048, true, true, true, true, false, true).unwrap();
+            std::env::set_var("KERYX_POM_V4_TC", "0");
+            // v4_tc_enabled() caches, so compare against launch_v4 directly instead.
+            let s_words = crate::pom::pph_words_v4(&PPH);
+            let p_words = crate::pom::pph_words_for_era(&PPH, true);
+            let n_tiles = miner.n_total_chunks / pom_v4::POM_V4_TILE_CHUNKS;
+            let classic = miner
+                .kernel
+                .launch_v4(&miner.stream, &miner.bases_dev, &miner.prefix_dev, miner.t_count, n_tiles, &p_words, &s_words, TIMESTAMP, &target, base, 2048)
+                .unwrap();
+            assert_eq!(tc, classic, "tensor-core and classic disagree at base {base}");
+        }
+    }
+
     /// The v4 counterpart of `v3_kernel_matches_host_reference`. Requires a GPU, so it is
     /// #[ignore]d like the rest — run with `cargo test -- --ignored` on a CUDA host.
     ///
@@ -1945,4 +2042,11 @@ mod v3_kernel_tests {
         assert_eq!(pom_v3::fold64(&proof.roots[pom_v3::POM_V3_K]), final_state);
         assert!(pom_v3::verify_proof_v3(&PPH, found, seed, &proof, &index.r_t, index.n_chunks));
     }
+}
+
+/// Whether the tensor-core v4 solver is enabled. `KERYX_POM_V4_TC=0` forces the classic kernel —
+/// the escape hatch for comparing the two, and for backing out on a card where it misbehaves.
+fn v4_tc_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| !matches!(std::env::var("KERYX_POM_V4_TC").as_deref(), Ok("0")))
 }
