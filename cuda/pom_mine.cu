@@ -392,6 +392,17 @@ __device__ __forceinline__ void v4_load_tile(
     dst[1] = q[b + 1];
 }
 
+// Pointer to 32-byte chunk `idx` in the gathered blob, as two ulonglong2. Same binary search
+// v4_load_tile does, exposed separately so the chase and the cp.async pipeline can address a
+// chunk without also copying it.
+__device__ __forceinline__ const ulonglong2* v4_chunk_ptr(
+    const unsigned long long* bases, const unsigned long long* prefix, unsigned int T,
+    unsigned long long idx) {
+    unsigned int lo = 0, hi = T;
+    while (lo + 1 < hi) { unsigned int mid = (lo + hi) >> 1; if (prefix[mid] <= idx) lo = mid; else hi = mid; }
+    return (const ulonglong2*)bases[lo] + (idx - prefix[lo]) * 2ULL;
+}
+
 // blake3 of a 32-byte state row (single partial block).
 __device__ __forceinline__ void b3_hash_row32(const unsigned int row[8], unsigned int out[8]) {
     unsigned int cv[8];
@@ -533,128 +544,117 @@ extern "C" __global__ void pom_mine_v4_dump(
     if (threadIdx.x == 0) *final_state_out = fin;
 }
 
-// ===================== PoM v4 tensor-core solver (sm_80+) =====================
-// Same walk, same bytes, different instructions. The transition next[x][j] =
-// rho8(dot_i8(row_x, col_j)) is a 32x32x32 signed int8 matmul, which is exactly what
-// mma.sync.m16n8k32.s8 computes: M=32 -> 2 m16 tiles, N=32 -> 4 n8 tiles, K=32 -> 1, so 8 MMA
-// ops per step per warp, replacing 256 __dp4a per thread.
-//
-// Bit-exactness: products are int8xint8 accumulated in int32, |sum| <= 127*127*32 ~ 516k, so no
-// overflow, and integer addition is associative -- the tensor core's accumulation order cannot
-// change the result. This is why the swap is safe here and would NOT be for a float kernel.
-//
-// The awkward part is that the MMA accumulator lands in a different lane layout than the A
-// fragment wants next step, so a redistribution is needed every step. Doing it on int32 would
-// cost 4 KB of shared per warp; applying rho8 first and redistributing BYTES costs 1 KB. With
-// ping-pong state buffers that is 3 KB/warp (tile + 2 state), leaving occupancy warp-limited
-// rather than shared-limited.
-//
-// Layout of mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32, per PTX ISA:
-//   g = lane >> 2 (0..7), t = lane & 3
-//   A (16x32 s8, row-major): a0=A[g][4t..4t+3] a1=A[g+8][4t..] a2=A[g][4t+16..] a3=A[g+8][4t+16..]
-//   B (32x8 s8, col-major):  b0=B[n=g][k=4t..4t+3]  b1=B[n=g][k=4t+16..]
-//   C (16x8 s32):            c0=C[g][2t] c1=C[g][2t+1] c2=C[g+8][2t] c3=C[g+8][2t+1]
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
-#define V4_TC_SUPPORTED 1
 
-__device__ __forceinline__ unsigned int v4_ld4(const unsigned char* p) {
-    return *(const unsigned int*)p;   // 4-byte aligned by construction (offsets are multiples of 4)
+// ===================== PoM v4 tensor-core solver (sm_80+) =====================
+// Same walk, same bytes, different instructions and a different dispatch shape.
+//
+// Structure follows keryx-miner-supr's v0.11.5/v0.11.6 solver (MIT/Apache, same licences as this
+// tree), after a first attempt that kept the offset chase inside the walk kernel measured ~12%
+// SLOWER than the classic dp4a kernel on a 3080 Ti. The chase is inherently serial per nonce --
+// 256 dependent loads -- so running it one-warp-per-nonce leaves 31 lanes idle and hides nothing.
+// Split out as its own kernel at one THREAD per nonce, thousands of chains run concurrently and
+// the latency hides itself.
+//
+// Bit-exactness: the transition is a 32x32x32 signed int8 matmul. Products are int8xint8
+// accumulated in int32, |sum| <= 127*127*32 ~ 516k so nothing overflows, and integer addition is
+// associative -- the tensor core's accumulation order cannot change the result.
+
+// Chase: resolve one nonce's whole tile-offset chain, reading only each tile's first 32 bytes.
+// Depends solely on seed, step and the snippet -- never on the walk state -- which is what lets
+// the walk prefetch tiles it has not reached yet.
+extern "C" __global__ void pom_mine_v4_chase(
+    const unsigned long long* bases, const unsigned long long* prefix, unsigned int T,
+    unsigned long long n_tiles, unsigned int K,
+    unsigned long long s0, unsigned long long s1, unsigned long long s2, unsigned long long s3,
+    unsigned long long time_, unsigned long long nonce_base, unsigned long long n_nonces,
+    unsigned int* offsets /* [n_nonces][K] */) {
+    const unsigned long long i = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n_nonces) return;
+    const unsigned long long nonce = nonce_base + i;
+    const unsigned long long seed = pom_seed_fold(nonce, time_, s0, s1, s2, s3);
+    unsigned long long off = mix64(seed ^ V4_OFFSET_FIRST_SALT) % n_tiles;
+    unsigned int* my = offsets + i * (unsigned long long)K;
+    for (unsigned int step = 1; step <= K; step++) {
+        my[step - 1] = (unsigned int)off;
+        const ulonglong2* q = v4_chunk_ptr(bases, prefix, T, off * V4_TILE_CHUNKS);
+        const ulonglong2 a = q[0], b = q[1];
+        unsigned long long sf = 0;
+        sf = mix64(sf ^ (unsigned int)(a.x)); sf = mix64(sf ^ (unsigned int)(a.x >> 32));
+        sf = mix64(sf ^ (unsigned int)(a.y)); sf = mix64(sf ^ (unsigned int)(a.y >> 32));
+        sf = mix64(sf ^ (unsigned int)(b.x)); sf = mix64(sf ^ (unsigned int)(b.x >> 32));
+        sf = mix64(sf ^ (unsigned int)(b.y)); sf = mix64(sf ^ (unsigned int)(b.y >> 32));
+        off = mix64(seed ^ (unsigned long long)(step + 1) * V4_OFFSET_STEP_SALT ^ sf) % n_tiles;
+    }
 }
 
-// One walk step on tensor cores. s_state: 32x32 s8 row-major (row x = state row x).
-// s_tile: 32x32 s8, column j contiguous at s_tile + j*32 -- i.e. exactly B in .col layout.
-// Writes the post-rho8 next state to s_next.
-__device__ __forceinline__ void v4_step_tc(
-    const unsigned char* s_state, const unsigned char* s_tile, unsigned char* s_next,
-    unsigned int step, unsigned int lane) {
-    const unsigned int g = lane >> 2;
-    const unsigned int t = lane & 3;
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
 
+#define V4_TC_WARPS 4    // nonces (warps) per block
+#define V4_TC_PIPE  3    // cp.async tile buffers per warp
+
+__device__ __forceinline__ void v4_cp_async16(void* smem_dst, const void* gmem_src) {
+    unsigned long long sdst = __cvta_generic_to_shared(smem_dst);
+    // .cg: streaming, bypass L1 -- these tiles are read once and never revisited.
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" :: "l"(sdst), "l"(gmem_src));
+}
+
+__device__ __forceinline__ void v4_tile_cp_async(
+    const unsigned long long* bases, const unsigned long long* prefix, unsigned int T,
+    unsigned long long tile_index, unsigned int* s_tile, unsigned int lane) {
+    const ulonglong2* q = v4_chunk_ptr(bases, prefix, T, tile_index * V4_TILE_CHUNKS + lane);
+    ulonglong2* dst = (ulonglong2*)(s_tile + lane * 8);
+    v4_cp_async16(dst, q);
+    v4_cp_async16(dst + 1, q + 1);
+}
+
+// One step on tensor cores. s_state is updated IN PLACE (single 1 KB buffer, no ping-pong): every
+// lane reads its A fragment first, then a __syncwarp separates reads from writes. Results are
+// written as packed 16-bit pairs, halving the shared stores versus one byte at a time.
+__device__ __forceinline__ void v4_imma_step(
+    unsigned int* s_state, const unsigned int* s_tile, unsigned int step, unsigned int x) {
+    const unsigned int gid = x >> 2, tig = x & 3u;
+    unsigned int a[2][4];
     #pragma unroll
-    for (int m = 0; m < 2; m++) {            // rows 0..15 and 16..31
-        const unsigned int r0 = (unsigned int)m * 16 + g;        // this lane's low  row
-        const unsigned int r1 = r0 + 8;                          // this lane's high row
-        const unsigned int a0 = v4_ld4(s_state + r0 * 32 + t * 4);
-        const unsigned int a1 = v4_ld4(s_state + r1 * 32 + t * 4);
-        const unsigned int a2 = v4_ld4(s_state + r0 * 32 + t * 4 + 16);
-        const unsigned int a3 = v4_ld4(s_state + r1 * 32 + t * 4 + 16);
-
+    for (unsigned int g = 0; g < 2; g++) {
+        const unsigned int r0 = g * 16u + gid, r1 = r0 + 8u;
+        a[g][0] = s_state[r0 * 8u + tig];
+        a[g][1] = s_state[r1 * 8u + tig];
+        a[g][2] = s_state[r0 * 8u + tig + 4u];
+        a[g][3] = s_state[r1 * 8u + tig + 4u];
+    }
+    __syncwarp();   // all lanes have read the old state before anyone overwrites it
+    unsigned short* s_state16 = (unsigned short*)s_state;
+    const unsigned int step_base = step * 0x9E3779B9u;
+    #pragma unroll
+    for (unsigned int cg = 0; cg < 4; cg++) {
+        const unsigned int cb = (cg * 8u + gid) * 8u;
+        const unsigned int b0 = s_tile[cb + tig];
+        const unsigned int b1 = s_tile[cb + tig + 4u];
         #pragma unroll
-        for (int n = 0; n < 4; n++) {        // columns 0..7, 8..15, 16..23, 24..31
-            const unsigned int col = (unsigned int)n * 8 + g;    // this lane's B column
-            const unsigned int b0 = v4_ld4(s_tile + col * 32 + t * 4);
-            const unsigned int b1 = v4_ld4(s_tile + col * 32 + t * 4 + 16);
-
-            unsigned int d0 = 0, d1 = 0, d2 = 0, d3 = 0;
+        for (unsigned int g = 0; g < 2; g++) {
+            int c0 = 0, c1 = 0, c2 = 0, c3 = 0;
             asm volatile(
                 "mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 "
-                "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%11,%12,%13};\n"
-                : "=r"(d0), "=r"(d1), "=r"(d2), "=r"(d3)
-                : "r"(a0), "r"(a1), "r"(a2), "r"(a3),
-                  "r"(b0), "r"(b1),
-                  "r"(d0), "r"(d1), "r"(d2), "r"(d3));
-
-            // C maps to (row, col) as: d0=[r0][c0] d1=[r0][c0+1] d2=[r1][c0] d3=[r1][c0+1]
-            const unsigned int c0 = (unsigned int)n * 8 + t * 2;
-            const unsigned int rowlo = (unsigned int)m * 16 + g;
-            const unsigned int rowhi = rowlo + 8;
-            s_next[rowlo * 32 + c0]     = (unsigned char)v3_rho8((int)d0, v4_tweak(step, rowlo, c0));
-            s_next[rowlo * 32 + c0 + 1] = (unsigned char)v3_rho8((int)d1, v4_tweak(step, rowlo, c0 + 1));
-            s_next[rowhi * 32 + c0]     = (unsigned char)v3_rho8((int)d2, v4_tweak(step, rowhi, c0));
-            s_next[rowhi * 32 + c0 + 1] = (unsigned char)v3_rho8((int)d3, v4_tweak(step, rowhi, c0 + 1));
+                "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+                : "+r"(c0), "+r"(c1), "+r"(c2), "+r"(c3)
+                : "r"(a[g][0]), "r"(a[g][1]), "r"(a[g][2]), "r"(a[g][3]), "r"(b0), "r"(b1));
+            const unsigned int r0 = g * 16u + gid, r1 = r0 + 8u;
+            const unsigned int j0 = cg * 8u + tig * 2u;
+            const unsigned int tw0 = step_base + r0 * 0xC2B2AE35u + j0 * 0x85EBCA6Bu;
+            const unsigned int tw1 = step_base + r1 * 0xC2B2AE35u + j0 * 0x85EBCA6Bu;
+            s_state16[r0 * 16u + (j0 >> 1)] =
+                (unsigned short)(v3_rho8(c0, tw0) | (v3_rho8(c1, tw0 + 0x85EBCA6Bu) << 8));
+            s_state16[r1 * 16u + (j0 >> 1)] =
+                (unsigned short)(v3_rho8(c2, tw1) | (v3_rho8(c3, tw1 + 0x85EBCA6Bu) << 8));
         }
     }
+    __syncwarp();
 }
 #endif  // __CUDA_ARCH__ >= 800
 
-// --- tunables: shared/warp = PIPE*1024 (tiles) + 2048 (state ping-pong) + 1024 (offsets) ---
-#define V4_TC_WARPS 4
-#define V4_TC_PIPE  3
-#define V4_TC_SMEM_PER_WARP ((V4_TC_PIPE + 2) * 1024 + V4_D * 4 * 8)
-
-__device__ __forceinline__ unsigned int v4_smem_u32(const void* p) {
-    return (unsigned int)__cvta_generic_to_shared(p);
-}
-
-// Address of the 32-byte chunk `idx` in the gathered blob (same binary search v4_load_tile does).
-__device__ __forceinline__ const unsigned char* v4_chunk_addr(
-    const unsigned long long* bases, const unsigned long long* prefix, unsigned int T,
-    unsigned long long idx) {
-    unsigned int lo = 0, hi = T;
-    while (lo + 1 < hi) { unsigned int mid = (lo + hi) >> 1; if (prefix[mid] <= idx) lo = mid; else hi = mid; }
-    return (const unsigned char*)bases[lo] + (idx - prefix[lo]) * V4_CHUNK_BYTES_C;
-}
-
-// Stage one 1 KB tile into shared with cp.async: each lane copies its own 32-byte chunk as two
-// 16-byte async loads, so the transfer for a later step overlaps the MMA work of the current one.
-// Addresses come from the pre-resolved offset chain -- without that this could not be issued
-// ahead, since the next offset would not be known until the current tile had already landed.
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
-__device__ __forceinline__ void v4_async_tile(
-    const unsigned long long* bases, const unsigned long long* prefix, unsigned int T,
-    unsigned int tile_index, unsigned char* dst, unsigned int lane) {
-    const unsigned char* src =
-        v4_chunk_addr(bases, prefix, T, (unsigned long long)tile_index * V4_TILE_CHUNKS + lane);
-    const unsigned int d = v4_smem_u32(dst + lane * 32);
-    asm volatile("cp.async.ca.shared.global [%0], [%1], 16;" :: "r"(d), "l"(src) : "memory");
-    asm volatile("cp.async.ca.shared.global [%0], [%1], 16;" :: "r"(d + 16), "l"(src + 16) : "memory");
-}
-#endif
-
-// PoM v4, tensor-core path. One WARP per nonce (not one block), so a block covers V4_TC_WARPS
-// nonces and the 32-thread-block occupancy ceiling of the classic kernel goes away.
-//
-// Three changes over pom_mine_v4, all of which must leave the walk bit-identical:
-//   1. The tile-offset chain is resolved up front. It depends only on seed, step and the current
-//      tile's first 32 bytes -- never on the walk state (see v4_next_offset) -- so all K
-//      addresses are known before any matrix work, which is what makes prefetch possible at all.
-//   2. Tiles are staged with a depth-3 cp.async pipeline against those known addresses, so the
-//      1 KB load for step n+2 is in flight while step n computes.
-//   3. The 32x32x32 int8 transition runs on tensor cores (8x mma.sync.m16n8k32.s8) instead of
-//      256 __dp4a per thread.
-//
-// On sm_75 and below there is no m16n8k32, so the body falls back to the classic per-thread walk
-// and this entry behaves exactly like pom_mine_v4.
+// Walk, tensor-core path. One WARP per nonce; offsets come pre-resolved from pom_mine_v4_chase,
+// so every tile address is known up front and the depth-3 cp.async pipeline can stay ahead.
+// Shared per warp: 1 KB state + V4_TC_PIPE KB of tile buffers.
 extern "C" __global__ void pom_mine_v4_tc(
     const unsigned long long* bases, const unsigned long long* prefix, unsigned int T,
     unsigned long long n_tiles, unsigned int K,
@@ -663,8 +663,9 @@ extern "C" __global__ void pom_mine_v4_tc(
     unsigned long long time_,
     unsigned long long t0, unsigned long long t1, unsigned long long t2, unsigned long long t3,
     unsigned long long nonce_base, unsigned long long n_nonces,
-    unsigned long long* winner) {
-    extern __shared__ unsigned char v4tc_smem[];
+    const unsigned int* offsets, unsigned long long* winner) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
+    extern __shared__ unsigned int v4tc_smem[];
     const unsigned int lane = threadIdx.x & 31u;
     const unsigned int warp = threadIdx.x >> 5;
     const unsigned long long slot = (unsigned long long)blockIdx.x * V4_TC_WARPS + warp;
@@ -672,70 +673,41 @@ extern "C" __global__ void pom_mine_v4_tc(
     const unsigned long long nonce = nonce_base + slot;
     const unsigned long long seed = pom_seed_fold(nonce, time_, s0, s1, s2, s3);
 
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
-    unsigned char* base = v4tc_smem + warp * V4_TC_SMEM_PER_WARP;
-    unsigned char* s_tiles = base;                                   // V4_TC_PIPE x 1 KB
-    unsigned char* s_state = base + V4_TC_PIPE * 1024;               // 2 x 1 KB ping-pong
-    unsigned int*  s_offs  = (unsigned int*)(base + (V4_TC_PIPE + 2) * 1024);
+    unsigned int* base = v4tc_smem + warp * ((1 + V4_TC_PIPE) * 256);
+    unsigned int* s_state = base;
+    unsigned int* s_tiles = base + 256;
+    const unsigned int* my_off = offsets + slot * (unsigned long long)K;
 
-    // ---- 1. resolve the offset chain (snippet-only, 32 B per step) ----
-    {
-        unsigned long long off = mix64(seed ^ V4_OFFSET_FIRST_SALT) % n_tiles;
-        for (unsigned int step = 1; step <= K; step++) {
-            if (lane == 0) s_offs[step - 1] = (unsigned int)off;
-            const unsigned char* sn = v4_chunk_addr(bases, prefix, T, off * V4_TILE_CHUNKS);
-            unsigned long long sf = 0;
-            if (lane == 0) {
-                const unsigned int* w = (const unsigned int*)sn;
-                #pragma unroll
-                for (int i = 0; i < 8; i++) sf = mix64(sf ^ (unsigned long long)w[i]);
-                off = mix64(seed ^ (unsigned long long)(step + 1) * V4_OFFSET_STEP_SALT ^ sf) % n_tiles;
-            }
-            off = __shfl_sync(0xffffffffu, off, 0);
-        }
-        __syncwarp();
-    }
-
-    // ---- S_0 keystream, written as bytes for the MMA A-fragment loads ----
-    unsigned char* cur = s_state;
-    unsigned char* nxt = s_state + 1024;
+    // S_0 keystream, packed exactly as the host writes it.
     {
         unsigned long long h = mix64(seed ^ (V4_S0_ROW_SALT + (unsigned long long)lane));
-        unsigned int* dst = (unsigned int*)(cur + lane * V4_D);
         #pragma unroll
-        for (int k4 = 0; k4 < V4_D4; k4++) { h = mix64(h); dst[k4] = (unsigned int)h; }
+        for (int k4 = 0; k4 < V4_D4; k4++) { h = mix64(h); s_state[lane * 8 + k4] = (unsigned int)h; }
     }
     __syncwarp();
 
-    // ---- 2+3. pipelined tile staging + tensor-core steps ----
     #pragma unroll 1
-    for (unsigned int pre = 0; pre < V4_TC_PIPE - 1 && pre < K; pre++) {
-        v4_async_tile(bases, prefix, T, s_offs[pre], s_tiles + (pre % V4_TC_PIPE) * 1024, lane);
-        asm volatile("cp.async.commit_group;\n" ::: "memory");
+    for (unsigned int pre = 0; pre + 1 < V4_TC_PIPE && pre < K; pre++) {
+        v4_tile_cp_async(bases, prefix, T, my_off[pre], s_tiles + (pre % V4_TC_PIPE) * 256, lane);
+        asm volatile("cp.async.commit_group;");
     }
     for (unsigned int step = 1; step <= K; step++) {
-        const unsigned int slot_in = (step - 1) % V4_TC_PIPE;
-        if (step + V4_TC_PIPE - 2 < K) {
-            v4_async_tile(bases, prefix, T, s_offs[step + V4_TC_PIPE - 2],
-                          s_tiles + ((step + V4_TC_PIPE - 2) % V4_TC_PIPE) * 1024, lane);
-            asm volatile("cp.async.commit_group;\n" ::: "memory");
+        const unsigned int ahead = step + V4_TC_PIPE - 2;
+        if (ahead < K) {
+            v4_tile_cp_async(bases, prefix, T, my_off[ahead], s_tiles + (ahead % V4_TC_PIPE) * 256, lane);
+            asm volatile("cp.async.commit_group;");
         }
-        asm volatile("cp.async.wait_group %0;\n" :: "n"(V4_TC_PIPE - 1) : "memory");
+        asm volatile("cp.async.wait_group %0;" :: "n"(V4_TC_PIPE - 1));
         __syncwarp();
-        v4_step_tc(cur, s_tiles + slot_in * 1024, nxt, step, lane);
-        __syncwarp();
-        unsigned char* tmp = cur; cur = nxt; nxt = tmp;
+        v4_imma_step(s_state, s_tiles + ((step - 1) % V4_TC_PIPE) * 256, step, lane);
     }
-    asm volatile("cp.async.wait_all;\n" ::: "memory");
+    asm volatile("cp.async.wait_all;");
 
-    // ---- root_K over the final state (scratch reuses the tile buffers) ----
+    // root_K over the final state; the tile buffers double as blake3 scratch.
     unsigned int row4[V4_D4];
-    {
-        const unsigned int* src = (const unsigned int*)(cur + lane * V4_D);
-        #pragma unroll
-        for (int k4 = 0; k4 < V4_D4; k4++) row4[k4] = src[k4];
-    }
-    unsigned int* s_tree = (unsigned int*)s_tiles;
+    #pragma unroll
+    for (int k4 = 0; k4 < V4_D4; k4++) row4[k4] = s_state[lane * 8 + k4];
+    unsigned int* s_tree = s_tiles;
     b3_hash_row32(row4, s_tree + lane * 8);
     __syncwarp();
     unsigned int* src = s_tree;
@@ -746,16 +718,18 @@ extern "C" __global__ void pom_mine_v4_tc(
         unsigned int* tmp = src; src = dst; dst = tmp;
     }
     const unsigned long long fin = (unsigned long long)src[0] | ((unsigned long long)src[1] << 32);
-#else
-    // sm_75 and below: no m16n8k32. Fall back to the classic per-warp walk so this entry point
-    // still produces correct results everywhere the fatbin is loadable.
-    unsigned int* s_tile = (unsigned int*)(v4tc_smem + warp * 2048);
-    const unsigned long long fin = v4_walk_block(bases, prefix, T, n_tiles, K, seed, s_tile, nullptr, nullptr);
-#endif
 
     if (lane == 0) {
         unsigned long long pv[4];
         pom_pow_fold(fin, p0, p1, p2, p3, pv);
         if (pom_le_leq(pv, t0, t1, t2, t3)) atomicMin(winner, nonce);
     }
+#else
+    // sm_75 and below have no m16n8k32. The host checks the capability and never dispatches here
+    // on those parts, but the entry must exist for the fatbin to resolve.
+    (void)bases; (void)prefix; (void)T; (void)n_tiles; (void)K;
+    (void)p0; (void)p1; (void)p2; (void)p3; (void)s0; (void)s1; (void)s2; (void)s3;
+    (void)time_; (void)t0; (void)t1; (void)t2; (void)t3;
+    (void)nonce_base; (void)n_nonces; (void)offsets; (void)winner;
+#endif
 }

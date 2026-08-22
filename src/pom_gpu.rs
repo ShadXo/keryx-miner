@@ -41,10 +41,12 @@ const POM_V4_DUMP_KERNEL_NAME: &str = "pom_mine_v4_dump";
 /// Tensor-core v4 solver (sm_80+): warp-per-nonce, pre-resolved offset chain, depth-3 cp.async
 /// tile pipeline, 8x mma.sync.m16n8k32.s8 per step. Optional so an older image still loads.
 const POM_V4_TC_KERNEL_NAME: &str = "pom_mine_v4_tc";
+/// Offset-chase kernel: resolves each nonce's tile-offset chain into a device buffer.
+const POM_V4_CHASE_KERNEL_NAME: &str = "pom_mine_v4_chase";
 /// Warps (= nonces) per block in the TC kernel; must equal V4_TC_WARPS in cuda/pom_mine.cu.
 const POM_V4_TC_WARPS: u32 = 4;
 /// Per-warp shared: 3 tile buffers + 2 state buffers + the K-entry offset chain.
-const POM_V4_TC_SMEM_PER_WARP: u32 = (3 + 2) * 1024 + 32 * 4 * 8;
+const POM_V4_TC_SMEM_PER_WARP: u32 = (1 + 3) * 1024;
 const POM_V4_SHARED_BYTES: u32 = 2048;
 /// v3 dynamic shared bytes (the 64 KB tile) — needs the opt-in attribute; cc >= 7.0 only.
 const POM_V3_SHARED_BYTES: u32 = crate::pom_v3::POM_V3_TILE_BYTES as u32;
@@ -114,6 +116,8 @@ struct LoadedPomKernel {
     function_v4_dump: Option<sys::CUfunction>,
     /// Tensor-core v4 entry. Optional: absent on a pre-TC image, and skipped on sm_75 and below.
     function_v4_tc: Option<sys::CUfunction>,
+    /// Offset-chase entry, paired with `function_v4_tc`.
+    function_v4_chase: Option<sys::CUfunction>,
 }
 
 impl Drop for LoadedPomKernel {
@@ -178,7 +182,9 @@ impl LoadedPomKernel {
             unsafe { result::module::get_function(module, CString::new(POM_V4_DUMP_KERNEL_NAME).unwrap()) }.ok();
         let function_v4_tc =
             unsafe { result::module::get_function(module, CString::new(POM_V4_TC_KERNEL_NAME).unwrap()) }.ok();
-        Ok(Self { module, function, function_v3, function_v3_dump, function_v4, function_v4_dump, function_v4_tc })
+        let function_v4_chase =
+            unsafe { result::module::get_function(module, CString::new(POM_V4_CHASE_KERNEL_NAME).unwrap()) }.ok();
+        Ok(Self { module, function, function_v3, function_v3_dump, function_v4, function_v4_dump, function_v4_tc, function_v4_chase })
     }
 
     fn launch(
@@ -333,53 +339,111 @@ impl LoadedPomKernel {
     /// Dump variant of `launch_v4`: one nonce, one block, emitting every state and snippet so the
     /// GPU walk can be checked against the Rust mirror in `pom_v4`. Test-only.
     #[allow(clippy::too_many_arguments)]
-    /// Tensor-core v4 launch: one WARP per nonce, so a block covers `POM_V4_TC_WARPS` nonces.
-    /// Byte-identical output to `launch_v4` — see the kernel comment for why the int8 MMA
-    /// accumulation order cannot change the result.
+    /// Tensor-core v4 launch: chase then walk.
+    ///
+    /// Two kernels, not one. The offset chase is serial per nonce (256 dependent loads), so it
+    /// runs at one THREAD per nonce where thousands of chains hide each other's latency; folding
+    /// it into the walk as a per-warp prologue left 31 lanes idle and measured ~12% SLOWER than
+    /// the classic kernel on a 3080 Ti.
+    ///
+    /// `offsets_dev` is the caller's cached per-device buffer — sizing it here would mean a
+    /// cudaMalloc + memset + free every batch, which at these sizes is a large slice of the
+    /// batch's own runtime.
     #[allow(clippy::too_many_arguments)]
-    fn launch_v4_tc(&self, stream: &Arc<CudaStream>, bases_dev: &CudaSlice<u64>, prefix_dev: &CudaSlice<u64>, t_count: u32, n_tiles: u64, p_words: &[u64; 4], s_words: &[u64; 4], timestamp: u64, target_le: &[u8; 32], start: u64, batch: u64) -> Result<Option<u64>> {
-        let function = self.function_v4_tc.ok_or_else(|| anyhow!("PoM GPU: loaded kernel image has no pom_mine_v4_tc entry"))?;
+    fn launch_v4_tc(
+        &self,
+        stream: &Arc<CudaStream>,
+        bases_dev: &CudaSlice<u64>,
+        prefix_dev: &CudaSlice<u64>,
+        offsets_dev: &CudaSlice<u32>,
+        t_count: u32,
+        n_tiles: u64,
+        p_words: &[u64; 4],
+        s_words: &[u64; 4],
+        timestamp: u64,
+        target_le: &[u8; 32],
+        start: u64,
+        batch: u64,
+    ) -> Result<Option<u64>> {
+        let chase = self
+            .function_v4_chase
+            .ok_or_else(|| anyhow!("PoM GPU: loaded kernel image has no pom_mine_v4_chase entry"))?;
+        let walk = self
+            .function_v4_tc
+            .ok_or_else(|| anyhow!("PoM GPU: loaded kernel image has no pom_mine_v4_tc entry"))?;
         let t = words4(target_le);
         let k = crate::pom_v4::POM_V4_K as u32;
         let winner = stream.clone_htod(&[u64::MAX])?;
-        let grid = (batch as u32).div_ceil(POM_V4_TC_WARPS).max(1);
-        let cfg = LaunchConfig {
-            grid_dim: (grid, 1, 1),
-            block_dim: (32 * POM_V4_TC_WARPS, 1, 1),
-            shared_mem_bytes: POM_V4_TC_WARPS * POM_V4_TC_SMEM_PER_WARP,
-        };
 
         let (bases_ptr, _bases_guard) = bases_dev.device_ptr(stream);
         let (prefix_ptr, _prefix_guard) = prefix_dev.device_ptr(stream);
+        let (offsets_ptr, _offsets_guard) = offsets_dev.device_ptr(stream);
         let (winner_ptr, _winner_guard) = winner.device_ptr(stream);
 
-        let mut params: [*mut c_void; 21] = [
-            (&bases_ptr as *const _ as *mut c_void),
-            (&prefix_ptr as *const _ as *mut c_void),
-            (&t_count as *const _ as *mut c_void),
-            (&n_tiles as *const _ as *mut c_void),
-            (&k as *const _ as *mut c_void),
-            (&p_words[0] as *const _ as *mut c_void),
-            (&p_words[1] as *const _ as *mut c_void),
-            (&p_words[2] as *const _ as *mut c_void),
-            (&p_words[3] as *const _ as *mut c_void),
-            (&s_words[0] as *const _ as *mut c_void),
-            (&s_words[1] as *const _ as *mut c_void),
-            (&s_words[2] as *const _ as *mut c_void),
-            (&s_words[3] as *const _ as *mut c_void),
-            (&timestamp as *const _ as *mut c_void),
-            (&t[0] as *const _ as *mut c_void),
-            (&t[1] as *const _ as *mut c_void),
-            (&t[2] as *const _ as *mut c_void),
-            (&t[3] as *const _ as *mut c_void),
-            (&start as *const _ as *mut c_void),
-            (&batch as *const _ as *mut c_void),
-            (&winner_ptr as *const _ as *mut c_void),
-        ];
+        // --- chase: one thread per nonce, resolving that nonce's whole offset chain ---
+        {
+            const CHASE_BLOCK: u32 = 128;
+            let grid = (batch as u32).div_ceil(CHASE_BLOCK).max(1);
+            let mut params: [*mut c_void; 13] = [
+                (&bases_ptr as *const _ as *mut c_void),
+                (&prefix_ptr as *const _ as *mut c_void),
+                (&t_count as *const _ as *mut c_void),
+                (&n_tiles as *const _ as *mut c_void),
+                (&k as *const _ as *mut c_void),
+                (&s_words[0] as *const _ as *mut c_void),
+                (&s_words[1] as *const _ as *mut c_void),
+                (&s_words[2] as *const _ as *mut c_void),
+                (&s_words[3] as *const _ as *mut c_void),
+                (&timestamp as *const _ as *mut c_void),
+                (&start as *const _ as *mut c_void),
+                (&batch as *const _ as *mut c_void),
+                (&offsets_ptr as *const _ as *mut c_void),
+            ];
+            unsafe {
+                result::launch_kernel(chase, (grid, 1, 1), (CHASE_BLOCK, 1, 1), 0, stream.cu_stream(), &mut params)
+            }?;
+        }
 
-        unsafe { result::launch_kernel(function, cfg.grid_dim, cfg.block_dim, cfg.shared_mem_bytes, stream.cu_stream(), &mut params) }?;
+        // --- walk: one warp per nonce, reading the resolved offsets ---
+        {
+            let grid = (batch as u32).div_ceil(POM_V4_TC_WARPS).max(1);
+            let mut params: [*mut c_void; 22] = [
+                (&bases_ptr as *const _ as *mut c_void),
+                (&prefix_ptr as *const _ as *mut c_void),
+                (&t_count as *const _ as *mut c_void),
+                (&n_tiles as *const _ as *mut c_void),
+                (&k as *const _ as *mut c_void),
+                (&p_words[0] as *const _ as *mut c_void),
+                (&p_words[1] as *const _ as *mut c_void),
+                (&p_words[2] as *const _ as *mut c_void),
+                (&p_words[3] as *const _ as *mut c_void),
+                (&s_words[0] as *const _ as *mut c_void),
+                (&s_words[1] as *const _ as *mut c_void),
+                (&s_words[2] as *const _ as *mut c_void),
+                (&s_words[3] as *const _ as *mut c_void),
+                (&timestamp as *const _ as *mut c_void),
+                (&t[0] as *const _ as *mut c_void),
+                (&t[1] as *const _ as *mut c_void),
+                (&t[2] as *const _ as *mut c_void),
+                (&t[3] as *const _ as *mut c_void),
+                (&start as *const _ as *mut c_void),
+                (&batch as *const _ as *mut c_void),
+                (&offsets_ptr as *const _ as *mut c_void),
+                (&winner_ptr as *const _ as *mut c_void),
+            ];
+            unsafe {
+                result::launch_kernel(
+                    walk,
+                    (grid, 1, 1),
+                    (32 * POM_V4_TC_WARPS, 1, 1),
+                    POM_V4_TC_WARPS * POM_V4_TC_SMEM_PER_WARP,
+                    stream.cu_stream(),
+                    &mut params,
+                )
+            }?;
+        }
+
         stream.synchronize()?;
-
         let w = stream.clone_dtoh(&winner)?[0];
         Ok(if w == u64::MAX { None } else { Some(w) })
     }
@@ -720,6 +784,9 @@ pub struct PomGpuMiner {
     prefix_dev: CudaSlice<u64>,
     t_count: u32,
     n_total_chunks: u64,
+    /// Cached offsets buffer for the tensor-core path, grown on demand and reused across
+    /// batches. `Mutex` because `mine` takes `&self` from several worker threads.
+    offsets_dev: Mutex<Option<CudaSlice<u32>>>,
     _uploads: Vec<CudaSlice<u8>>, // tensors we uploaded ourselves, kept alive for the gather
 }
 
@@ -773,6 +840,7 @@ impl PomGpuMiner {
             prefix_dev,
             t_count: bases.len() as u32,
             n_total_chunks,
+            offsets_dev: Mutex::new(None),
             _uploads: uploads,
         })
     }
@@ -893,6 +961,7 @@ impl PomGpuMiner {
             prefix_dev,
             t_count: bases.len() as u32,
             n_total_chunks,
+            offsets_dev: Mutex::new(None),
             _uploads: uploads,
         })
     }
@@ -919,8 +988,17 @@ impl PomGpuMiner {
             // Tensor-core path when the image has it and the operator has not opted out. The
             // kernel itself falls back to the classic walk on sm_75 and below, so no capability
             // gate is needed here -- an older card simply gets the same result more slowly.
-            if self.kernel.function_v4_tc.is_some() && v4_tc_enabled() {
-                return self.kernel.launch_v4_tc(&self.stream, &self.bases_dev, &self.prefix_dev, self.t_count, n_tiles, &p_words, &s_words, timestamp, target_le, start, batch);
+            if self.kernel.function_v4_tc.is_some() && self.kernel.function_v4_chase.is_some() && v4_tc_enabled() {
+                // The offsets buffer is K u32 per nonce. Allocated once per device and reused:
+                // at a 16K batch that is 16 MB, and re-allocating + zeroing it every batch would
+                // cost more than the walk it feeds.
+                let need = batch as usize * crate::pom_v4::POM_V4_K;
+                let mut cache = self.offsets_dev.lock().unwrap();
+                if cache.as_ref().map_or(true, |b: &CudaSlice<u32>| b.len() < need) {
+                    *cache = Some(self.stream.alloc_zeros::<u32>(need)?);
+                }
+                let offsets = cache.as_ref().unwrap();
+                return self.kernel.launch_v4_tc(&self.stream, &self.bases_dev, &self.prefix_dev, offsets, self.t_count, n_tiles, &p_words, &s_words, timestamp, target_le, start, batch);
             }
             return self.kernel.launch_v4(&self.stream, &self.bases_dev, &self.prefix_dev, self.t_count, n_tiles, &p_words, &s_words, timestamp, target_le, start, batch);
         }
@@ -1926,6 +2004,7 @@ impl PomGpuMiner {
             prefix_dev,
             t_count: bases.len() as u32,
             n_total_chunks,
+            offsets_dev: Mutex::new(None),
             _uploads: uploads,
         })
     }
@@ -1974,13 +2053,14 @@ mod v3_kernel_tests {
             let s_words = crate::pom::pph_words_v4(&PPH);
             let p_words = crate::pom::pph_words_for_era(&PPH, true);
             let n_tiles = miner.n_total_chunks / pom_v4::POM_V4_TILE_CHUNKS;
+            let offsets = miner.stream.alloc_zeros::<u32>(2048 * pom_v4::POM_V4_K).unwrap();
             let classic = miner
                 .kernel
                 .launch_v4(&miner.stream, &miner.bases_dev, &miner.prefix_dev, miner.t_count, n_tiles, &p_words, &s_words, TIMESTAMP, &target, base, 2048)
                 .unwrap();
             let tc = miner
                 .kernel
-                .launch_v4_tc(&miner.stream, &miner.bases_dev, &miner.prefix_dev, miner.t_count, n_tiles, &p_words, &s_words, TIMESTAMP, &target, base, 2048)
+                .launch_v4_tc(&miner.stream, &miner.bases_dev, &miner.prefix_dev, &offsets, miner.t_count, n_tiles, &p_words, &s_words, TIMESTAMP, &target, base, 2048)
                 .unwrap();
             assert_eq!(tc, classic, "tensor-core and classic disagree at base {base}");
         }
