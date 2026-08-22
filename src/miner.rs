@@ -338,6 +338,17 @@ impl MinerManager {
                 let mut pom_nonce: u64 = thread_rng().next_u64();
                 const POM_BATCH: u64 = 1 << 20;
                 const POM_V3_BATCH: u64 = 512;
+                // v4 is ONE BLOCK OF 32 THREADS per nonce, where v3 is one block of 256, so the
+                // same nonce count feeds the device 8x less work. At the v3 batch of 512 a v4
+                // launch is 512 warps against ~3800 warps of capacity on a 3080 Ti -- the GPU
+                // sits mostly idle and pays a full stream sync every ~1 ms. Sized instead so a
+                // launch is tens of ms: above launch overhead, under the ~100 ms block time, so
+                // template latency is unaffected. KERYX_POM_V4_BATCH overrides.
+                let pom_v4_batch: u64 = std::env::var("KERYX_POM_V4_BATCH")
+                    .ok()
+                    .and_then(|s| s.trim().parse::<u64>().ok())
+                    .filter(|b| *b > 0)
+                    .unwrap_or(1 << 14);
 
                 loop {
                     nonces[0] = 0;
@@ -407,7 +418,7 @@ impl MinerManager {
                         let v4 = daa >= keryx_miner::pom::pom_v4_activation_daa();
                         // v3 walks are ~3-4 orders of magnitude heavier per nonce than the hash
                         // walk: small batches keep template latency low at 10 BPS.
-                        let batch = if v3 { POM_V3_BATCH } else { POM_BATCH };
+                        let batch = if v4 { pom_v4_batch } else if v3 { POM_V3_BATCH } else { POM_BATCH };
                         let found = keryx_miner::pom_gpu::mine(worker_device_id, &pph, time, &target_le, pom_nonce, batch, h3, walk_v2, h5_1, h5_2, v3, v4);
                         pom_nonce = pom_nonce.wrapping_add(batch);
                         hashes_tried.fetch_add(batch, Ordering::AcqRel);
