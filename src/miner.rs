@@ -418,7 +418,16 @@ impl MinerManager {
                         let v4 = daa >= keryx_miner::pom::pom_v4_activation_daa();
                         // v3 walks are ~3-4 orders of magnitude heavier per nonce than the hash
                         // walk: small batches keep template latency low at 10 BPS.
-                        let batch = if v4 { pom_v4_batch } else if v3 { POM_V3_BATCH } else { POM_BATCH };
+                        // The large v4 batch is sized for the tensor-core solver. The classic v4 kernel is several
+                        // times heavier per nonce, so on a card that falls back to it the same batch would
+                        // overrun the ~100 ms block time and cost more in stale templates than it saves.
+                        let batch = if v4 {
+                            if keryx_miner::pom_gpu::v4_tc_active(worker_device_id) { pom_v4_batch } else { POM_V3_BATCH * 8 }
+                        } else if v3 {
+                            POM_V3_BATCH
+                        } else {
+                            POM_BATCH
+                        };
                         let found = keryx_miner::pom_gpu::mine(worker_device_id, &pph, time, &target_le, pom_nonce, batch, h3, walk_v2, h5_1, h5_2, v3, v4);
                         pom_nonce = pom_nonce.wrapping_add(batch);
                         hashes_tried.fetch_add(batch, Ordering::AcqRel);

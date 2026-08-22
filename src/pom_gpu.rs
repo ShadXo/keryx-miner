@@ -45,7 +45,8 @@ const POM_V4_TC_KERNEL_NAME: &str = "pom_mine_v4_tc";
 const POM_V4_CHASE_KERNEL_NAME: &str = "pom_mine_v4_chase";
 /// Warps (= nonces) per block in the TC kernel; must equal V4_TC_WARPS in cuda/pom_mine.cu.
 const POM_V4_TC_WARPS: u32 = 4;
-/// Per-warp shared: 3 tile buffers + 2 state buffers + the K-entry offset chain.
+/// Per-warp shared: 1 state buffer + V4_TC_PIPE tile buffers, 1 KB each. Offsets live in a
+/// device buffer, not shared. MUST match the kernel layout in cuda/pom_mine.cu.
 const POM_V4_TC_SMEM_PER_WARP: u32 = (1 + 3) * 1024;
 const POM_V4_SHARED_BYTES: u32 = 2048;
 /// v3 dynamic shared bytes (the 64 KB tile) — needs the opt-in attribute; cc >= 7.0 only.
@@ -333,12 +334,6 @@ impl LoadedPomKernel {
         Ok(if w == u64::MAX { None } else { Some(w) })
     }
 
-    /// v3 (H6) dump: re-walk ONE (winning) nonce and return (states S_0..=S_K concatenated,
-    /// snippets, fold64(root_K)) for the host proof-build.
-    #[allow(clippy::too_many_arguments)]
-    /// Dump variant of `launch_v4`: one nonce, one block, emitting every state and snippet so the
-    /// GPU walk can be checked against the Rust mirror in `pom_v4`. Test-only.
-    #[allow(clippy::too_many_arguments)]
     /// Tensor-core v4 launch: chase then walk.
     ///
     /// Two kernels, not one. The offset chase is serial per nonce (256 dependent loads), so it
@@ -448,6 +443,9 @@ impl LoadedPomKernel {
         Ok(if w == u64::MAX { None } else { Some(w) })
     }
 
+    /// Dump variant of `launch_v4`: one nonce, one block, emitting every state and snippet so
+    /// the GPU walk can be checked against the Rust mirror in `pom_v4`. Test-only.
+    #[allow(clippy::too_many_arguments)]
     fn launch_v4_dump(
         &self,
         stream: &Arc<CudaStream>,
@@ -501,6 +499,10 @@ impl LoadedPomKernel {
 
         Ok((stream.clone_dtoh(&states)?, stream.clone_dtoh(&snippets)?, stream.clone_dtoh(&final_state)?[0]))
     }
+
+    /// v3 (H6) dump: re-walk ONE (winning) nonce and return (states S_0..=S_K concatenated,
+    /// snippets, fold64(root_K)) for the host proof-build.
+    #[allow(clippy::too_many_arguments)]
     fn launch_v3_dump(
         &self,
         stream: &Arc<CudaStream>,
@@ -784,6 +786,10 @@ pub struct PomGpuMiner {
     prefix_dev: CudaSlice<u64>,
     t_count: u32,
     n_total_chunks: u64,
+    /// Does this device have the m16n8k32 int8 MMA (cc >= 8.0)? Below that `pom_mine_v4_tc` is
+    /// compiled as an empty stub -- dispatching to it would return no winner for every batch
+    /// while the worker still counted a full batch of hashes: zero blocks, full hashrate, silent.
+    tc_capable: bool,
     /// Cached offsets buffer for the tensor-core path, grown on demand and reused across
     /// batches. `Mutex` because `mine` takes `&self` from several worker threads.
     offsets_dev: Mutex<Option<CudaSlice<u32>>>,
@@ -840,6 +846,7 @@ impl PomGpuMiner {
             prefix_dev,
             t_count: bases.len() as u32,
             n_total_chunks,
+            tc_capable: gpu_compute_capability(device_id).map_or(false, |(maj, _)| maj >= 8),
             offsets_dev: Mutex::new(None),
             _uploads: uploads,
         })
@@ -961,6 +968,7 @@ impl PomGpuMiner {
             prefix_dev,
             t_count: bases.len() as u32,
             n_total_chunks,
+            tc_capable: gpu_compute_capability(device_id).map_or(false, |(maj, _)| maj >= 8),
             offsets_dev: Mutex::new(None),
             _uploads: uploads,
         })
@@ -988,7 +996,7 @@ impl PomGpuMiner {
             // Tensor-core path when the image has it and the operator has not opted out. The
             // kernel itself falls back to the classic walk on sm_75 and below, so no capability
             // gate is needed here -- an older card simply gets the same result more slowly.
-            if self.kernel.function_v4_tc.is_some() && self.kernel.function_v4_chase.is_some() && v4_tc_enabled() {
+            if self.tc_capable && self.kernel.function_v4_tc.is_some() && self.kernel.function_v4_chase.is_some() && v4_tc_enabled() {
                 // The offsets buffer is K u32 per nonce. Allocated once per device and reused:
                 // at a 16K batch that is 16 MB, and re-allocating + zeroing it every batch would
                 // cost more than the walk it feeds.
@@ -1043,7 +1051,11 @@ impl PomGpuMiner {
     /// what lets the GPU walk be proven byte-exact against the `pom_v4` mirror.
     pub fn dump_v4(&self, pre_pow_hash: &[u8; 32], timestamp: u64, nonce: u64, h3: bool, h5_1: bool, h5_2: bool) -> Result<(Vec<u8>, Vec<u8>, u64)> {
         self.ctx.bind_to_thread()?;
-        let s_words = crate::pom::seed_pph_words_for_era(pre_pow_hash, h3, h5_1, h5_2);
+        // MUST match the derivation in `mine()`'s v4 arm (pph_words_v4, POM_V4_PPH_SALT). Copying
+        // dump_v3's seed_pph_words_for_era here made the harness self-consistent with a seed the
+        // miner never uses -- it would pass while testing the wrong walk.
+        let _ = (h3, h5_1, h5_2);
+        let s_words = crate::pom::pph_words_v4(pre_pow_hash);
         let n_tiles = self.n_total_chunks / crate::pom_v4::POM_V4_TILE_CHUNKS;
         if n_tiles == 0 {
             return Err(anyhow!("PoM GPU: blob too small for the v4 walk"));
@@ -2004,6 +2016,7 @@ impl PomGpuMiner {
             prefix_dev,
             t_count: bases.len() as u32,
             n_total_chunks,
+            tc_capable: gpu_compute_capability(device_id).map_or(false, |(maj, _)| maj >= 8),
             offsets_dev: Mutex::new(None),
             _uploads: uploads,
         })
@@ -2080,7 +2093,8 @@ mod v3_kernel_tests {
         let nonce = 42u64;
         let (states, snippets, final_state) = miner.dump_v4(&PPH, TIMESTAMP, nonce, true, true, true).unwrap();
 
-        let seed = crate::pom::pom_block_seed(&PPH, TIMESTAMP, nonce, true, true, true);
+        // v4 has its own seed salt; pom_block_seed would derive the era seed the v4 walk never uses.
+        let seed = crate::pom::pom_block_seed_v4(&PPH, TIMESTAMP, nonce);
         let (ref_states, ref_snippets, _) = pom_v4::ref_walk(seed, &blob);
         assert_eq!(snippets, ref_snippets, "GPU snippets differ from the host reference");
         assert_eq!(states, ref_states, "GPU states differ from the host reference");
@@ -2146,5 +2160,22 @@ fn v4_tc_enabled() -> bool {
             info!("PoM v4: tensor-core solver disabled (KERYX_POM_V4_TC=0) — using the classic dp4a kernel");
         }
         !off
+    })
+}
+
+/// Will `device_id` actually run the tensor-core v4 solver? The batch that suits the TC path is
+/// far too large for the classic kernel on a slow card -- the walk is ~3x heavier per nonce there,
+/// and a launch that overruns the ~100 ms block time costs more in stale templates than the
+/// batching saves. Callers size the batch with this.
+pub fn v4_tc_active(device_id: u32) -> bool {
+    if !v4_tc_enabled() {
+        return false;
+    }
+    let g = match miners().lock() {
+        Ok(g) => g,
+        Err(_) => return false,
+    };
+    g.get(&device_id).map_or(false, |m| {
+        m.tc_capable && m.kernel.function_v4_tc.is_some() && m.kernel.function_v4_chase.is_some()
     })
 }

@@ -366,17 +366,11 @@ extern "C" __global__ void pom_mine_v3_dump(
 #define V4_TILE_BYTES 1024
 #define V4_TILE_CHUNKS 32
 #define V4_SNIPPET_BYTES 32
-#define V4_CHUNK_BYTES_C 32
 static_assert(V4_D == 32, "PoM v4 requires D=32");
 
 #define V4_S0_ROW_SALT       0x03421325594C3C51ULL
 #define V4_OFFSET_FIRST_SALT 0x6D1CCF96AC4D76F9ULL
 #define V4_OFFSET_STEP_SALT  0x89050E78D34609EFULL
-
-// rho tweak, identical to the classic kernel: step*A + row*B + col*C.
-__device__ __forceinline__ unsigned int v4_tweak(unsigned int step, unsigned int x, unsigned int j) {
-    return step * 0x9E3779B9u + x * 0xC2B2AE35u + j * 0x85EBCA6Bu;
-}
 
 // One 1 KB tile (32 canonical chunks) into shared, one chunk per lane.
 __device__ __forceinline__ void v4_load_tile(
