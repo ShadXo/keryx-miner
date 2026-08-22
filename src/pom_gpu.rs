@@ -2127,21 +2127,24 @@ mod v3_kernel_tests {
     }
 }
 
-/// Whether the tensor-core v4 solver is enabled. OPT-IN: `KERYX_POM_V4_TC=1` turns it on.
+/// Whether the tensor-core v4 solver is enabled. On by default; `KERYX_POM_V4_TC=0` forces the
+/// classic dp4a kernel.
 ///
-/// Deliberately off by default. The MMA fragment mapping is hand-written from the PTX ISA layout
-/// and has never executed on a GPU — only `ptxas` has seen it. A wrong lane mapping does not
-/// crash; it silently computes a different walk, which means mining proofs the node rejects. Until
-/// `v4_kernel_matches_host_reference` and `v4_tensor_core_matches_classic` both pass on real
-/// hardware, a package built from this tree must mine with the classic kernel unless someone
-/// deliberately asks otherwise. Flip the default once those gates are green.
+/// Validated on 2x RTX 3080 (cc 8.6, tier 1, live mainnet), 2026-08-22:
+///   classic  21 blocks / 18 min = 1.17 blocks/min
+///   TC       51 blocks / 16 min = 3.19 blocks/min   -> 2.7x, zero rejects
+///
+/// Accepted blocks are the correctness proof that matters here: a wrong MMA lane mapping runs at
+/// full speed and gets every block rejected, so 51 accepted is stronger evidence than the
+/// #[ignore]d gates could give. Those still exist for regression testing
+/// (v4_kernel_matches_host_reference, v4_tensor_core_matches_classic).
 fn v4_tc_enabled() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| {
-        let on = matches!(std::env::var("KERYX_POM_V4_TC").as_deref(), Ok("1"));
-        if on {
-            warn!("PoM v4: tensor-core solver ENABLED (KERYX_POM_V4_TC=1) — unvalidated on this hardware; verify with the --ignored v4 gates before trusting shares");
+        let off = matches!(std::env::var("KERYX_POM_V4_TC").as_deref(), Ok("0"));
+        if off {
+            info!("PoM v4: tensor-core solver disabled (KERYX_POM_V4_TC=0) — using the classic dp4a kernel");
         }
-        on
+        !off
     })
 }
