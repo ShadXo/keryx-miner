@@ -680,22 +680,38 @@ extern "C" __global__ void pom_mine_v4_tc(
     }
     __syncwarp();
 
-    #pragma unroll 1
-    for (unsigned int pre = 0; pre + 1 < V4_TC_PIPE && pre < K; pre++) {
-        v4_tile_cp_async(bases, prefix, T, my_off[pre], s_tiles + (pre % V4_TC_PIPE) * 256, lane);
-        asm volatile("cp.async.commit_group;");
+    // Pipeline bookkeeping, and the ordering matters more than it looks.
+    //
+    // cp.async.wait_group N waits until AT MOST N groups are still pending, so the count has to
+    // track the loop exactly. Committing only when a tile was actually staged breaks that: in the
+    // last V4_TC_PIPE-2 steps there is nothing left to prefetch, the pending count falls, and the
+    // wait returns without having waited for the tile this step is about to read. The walk then
+    // consumes a buffer whose async copy has not landed.
+    //
+    // That produced a wrong final state intermittently on sm_120 (caught by the host's canonical
+    // re-walk, so no invalid block was ever submitted) while sm_86 happened to complete the copies
+    // in time and looked clean. Commit unconditionally -- an empty group still counts -- and wait
+    // BEFORE staging the next tile.
+    #pragma unroll
+    for (unsigned int p = 0; p < V4_TC_PIPE - 1; p++) {
+        if (p < K) {
+            v4_tile_cp_async(bases, prefix, T, my_off[p], s_tiles + p * 256, lane);
+        }
+        asm volatile("cp.async.commit_group;" ::: "memory");
     }
     for (unsigned int step = 1; step <= K; step++) {
-        const unsigned int ahead = step + V4_TC_PIPE - 2;
+        unsigned int* cur = s_tiles + ((step - 1u) % V4_TC_PIPE) * 256u;
+        asm volatile("cp.async.wait_group %0;" :: "n"(V4_TC_PIPE - 2) : "memory");
+        __syncwarp();
+        const unsigned int ahead = step + V4_TC_PIPE - 2u;
         if (ahead < K) {
             v4_tile_cp_async(bases, prefix, T, my_off[ahead], s_tiles + (ahead % V4_TC_PIPE) * 256, lane);
-            asm volatile("cp.async.commit_group;");
         }
-        asm volatile("cp.async.wait_group %0;" :: "n"(V4_TC_PIPE - 1));
-        __syncwarp();
-        v4_imma_step(s_state, s_tiles + ((step - 1) % V4_TC_PIPE) * 256, step, lane);
+        asm volatile("cp.async.commit_group;" ::: "memory");
+        v4_imma_step(s_state, cur, step, lane);
     }
-    asm volatile("cp.async.wait_all;");
+    asm volatile("cp.async.wait_group 0;" ::: "memory");
+    __syncwarp();
 
     // root_K over the final state; the tile buffers double as blake3 scratch.
     unsigned int row4[V4_D4];
