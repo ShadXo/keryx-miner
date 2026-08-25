@@ -338,17 +338,10 @@ impl MinerManager {
                 let mut pom_nonce: u64 = thread_rng().next_u64();
                 const POM_BATCH: u64 = 1 << 20;
                 const POM_V3_BATCH: u64 = 512;
-                // v4 is ONE BLOCK OF 32 THREADS per nonce, where v3 is one block of 256, so the
-                // same nonce count feeds the device 8x less work. At the v3 batch of 512 a v4
-                // launch is 512 warps against ~3800 warps of capacity on a 3080 Ti -- the GPU
-                // sits mostly idle and pays a full stream sync every ~1 ms. Sized instead so a
-                // launch is tens of ms: above launch overhead, under the ~100 ms block time, so
-                // template latency is unaffected. KERYX_POM_V4_BATCH overrides.
-                let pom_v4_batch: u64 = std::env::var("KERYX_POM_V4_BATCH")
-                    .ok()
-                    .and_then(|s| s.trim().parse::<u64>().ok())
-                    .filter(|b| *b > 0)
-                    .unwrap_or(1 << 14);
+                // Env override follows the ocminer (suprnova) fork; default scales with the card.
+                let pom_v4_batch = std::env::var("KERYX_POM_V4_BATCH").ok()
+                    .and_then(|s| s.trim().parse::<u64>().ok()).filter(|&b| b > 0)
+                    .unwrap_or_else(|| keryx_miner::pom_gpu::v4_batch_for_device(worker_device_id));
 
                 loop {
                     nonces[0] = 0;
