@@ -71,24 +71,6 @@ pub struct GpuKernelInfo {
     pub load_path: String,
 }
 
-/// Per-device v4 tile-offset buffer, reused across batches (the chase overwrites every word).
-/// Ported from the ocminer (suprnova) fork.
-static V4_OFFSETS: OnceLock<Mutex<HashMap<usize, Arc<CudaSlice<u32>>>>> = OnceLock::new();
-
-fn v4_offsets_buf(stream: &Arc<CudaStream>, len: usize) -> Result<Arc<CudaSlice<u32>>> {
-    let m = V4_OFFSETS.get_or_init(|| Mutex::new(HashMap::new()));
-    let ord = stream.context().ordinal();
-    let mut g = m.lock().unwrap();
-    if let Some(s) = g.get(&ord) {
-        if s.len() >= len {
-            return Ok(s.clone());
-        }
-    }
-    let s = Arc::new(unsafe { stream.alloc::<u32>(len) }?);
-    g.insert(ord, s.clone());
-    Ok(s)
-}
-
 fn gpu_kernel_info() -> &'static Mutex<HashMap<u32, GpuKernelInfo>> {
     static GPU_KERNEL_INFO: OnceLock<Mutex<HashMap<u32, GpuKernelInfo>>> = OnceLock::new();
     GPU_KERNEL_INFO.get_or_init(|| Mutex::new(HashMap::new()))
