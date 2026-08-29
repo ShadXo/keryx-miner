@@ -43,6 +43,8 @@ const POM_V4_DUMP_KERNEL_NAME: &str = "pom_mine_v4_dump";
 const POM_V4_TC_KERNEL_NAME: &str = "pom_mine_v4_tc";
 /// Offset-chase kernel: resolves each nonce's tile-offset chain into a device buffer.
 const POM_V4_CHASE_KERNEL_NAME: &str = "pom_mine_v4_chase";
+/// Chaseless-fused v4 solver (ncf): no separate chase pass, Barrett mod, LUT segment resolve.
+const POM_V4_NCF_KERNEL_NAME: &str = "pom_mine_v4_ncf";
 /// Warps (= nonces) per block in the TC kernel; must equal V4_TC_WARPS in cuda/pom_mine.cu.
 const POM_V4_TC_WARPS: u32 = 4;
 /// Per-warp shared: 1 state buffer + V4_TC_PIPE tile buffers, 1 KB each. Offsets live in a
@@ -119,6 +121,8 @@ struct LoadedPomKernel {
     function_v4_tc: Option<sys::CUfunction>,
     /// Offset-chase entry, paired with `function_v4_tc`.
     function_v4_chase: Option<sys::CUfunction>,
+    /// Chaseless-fused v4 entry (ncf). Optional: absent on a pre-ncf image, skipped on sm_75-.
+    function_v4_ncf: Option<sys::CUfunction>,
 }
 
 impl Drop for LoadedPomKernel {
@@ -185,7 +189,9 @@ impl LoadedPomKernel {
             unsafe { result::module::get_function(module, CString::new(POM_V4_TC_KERNEL_NAME).unwrap()) }.ok();
         let function_v4_chase =
             unsafe { result::module::get_function(module, CString::new(POM_V4_CHASE_KERNEL_NAME).unwrap()) }.ok();
-        Ok(Self { module, function, function_v3, function_v3_dump, function_v4, function_v4_dump, function_v4_tc, function_v4_chase })
+        let function_v4_ncf =
+            unsafe { result::module::get_function(module, CString::new(POM_V4_NCF_KERNEL_NAME).unwrap()) }.ok();
+        Ok(Self { module, function, function_v3, function_v3_dump, function_v4, function_v4_dump, function_v4_tc, function_v4_chase, function_v4_ncf })
     }
 
     fn launch(
@@ -450,6 +456,83 @@ impl LoadedPomKernel {
             }?;
         }
 
+        stream.synchronize()?;
+        let w = stream.clone_dtoh(&winner)?[0];
+        Ok(if w == u64::MAX { None } else { Some(w) })
+    }
+
+    /// Chaseless fused v4 launch (ncf): one warp per nonce, offset derived inline from each tile's
+    /// snippet (no chase pass), `% n_tiles` via Barrett `inv_n`, segment via the `lut` hint.
+    /// Byte-identical output to `launch_v4`/`launch_v4_tc`. `V4_NCF_WARPS` = 4 must match the
+    /// kernel. Shared: 3 KB/warp (state + 2 tile buffers).
+    #[allow(clippy::too_many_arguments)]
+    fn launch_v4_ncf(
+        &self,
+        stream: &Arc<CudaStream>,
+        bases_dev: &CudaSlice<u64>,
+        prefix_dev: &CudaSlice<u64>,
+        t_count: u32,
+        n_tiles: u64,
+        p_words: &[u64; 4],
+        s_words: &[u64; 4],
+        timestamp: u64,
+        target_le: &[u8; 32],
+        start: u64,
+        batch: u64,
+        lut: &CudaSlice<u16>,
+        lut_sh: u32,
+        inv_n: u64,
+        h10_state: Option<&[u64; 25]>,
+    ) -> Result<Option<u64>> {
+        let walk = self
+            .function_v4_ncf
+            .ok_or_else(|| anyhow!("PoM GPU: loaded kernel image has no pom_mine_v4_ncf entry"))?;
+        let t = words4(target_le);
+        let k = crate::pom_v4::POM_V4_K as u32;
+        let winner = stream.clone_htod(&[u64::MAX])?;
+        let v5_buf = stream.clone_htod(&h10_state.copied().unwrap_or([0u64; 25]))?;
+        let seed_h10: u32 = h10_state.is_some() as u32;
+        const NCF_WARPS: u32 = 4; // must equal V4_NCF_WARPS in cuda/pom_mine.cu
+        const NCF_SMEM_PER_WARP: u32 = 3 * 1024; // state + 2 tile buffers
+
+        let (bases_ptr, _bg) = bases_dev.device_ptr(stream);
+        let (prefix_ptr, _pg) = prefix_dev.device_ptr(stream);
+        let (lut_ptr, _lg) = lut.device_ptr(stream);
+        let (winner_ptr, _wg) = winner.device_ptr(stream);
+        let (v5_ptr, _vg) = v5_buf.device_ptr(stream);
+        let grid = (batch as u32).div_ceil(NCF_WARPS).max(1);
+
+        let mut params: [*mut c_void; 26] = [
+            (&bases_ptr as *const _ as *mut c_void),
+            (&prefix_ptr as *const _ as *mut c_void),
+            (&t_count as *const _ as *mut c_void),
+            (&n_tiles as *const _ as *mut c_void),
+            (&k as *const _ as *mut c_void),
+            (&p_words[0] as *const _ as *mut c_void),
+            (&p_words[1] as *const _ as *mut c_void),
+            (&p_words[2] as *const _ as *mut c_void),
+            (&p_words[3] as *const _ as *mut c_void),
+            (&s_words[0] as *const _ as *mut c_void),
+            (&s_words[1] as *const _ as *mut c_void),
+            (&s_words[2] as *const _ as *mut c_void),
+            (&s_words[3] as *const _ as *mut c_void),
+            (&timestamp as *const _ as *mut c_void),
+            (&t[0] as *const _ as *mut c_void),
+            (&t[1] as *const _ as *mut c_void),
+            (&t[2] as *const _ as *mut c_void),
+            (&t[3] as *const _ as *mut c_void),
+            (&start as *const _ as *mut c_void),
+            (&batch as *const _ as *mut c_void),
+            (&lut_ptr as *const _ as *mut c_void),
+            (&lut_sh as *const _ as *mut c_void),
+            (&inv_n as *const _ as *mut c_void),
+            (&winner_ptr as *const _ as *mut c_void),
+            (&v5_ptr as *const _ as *mut c_void),
+            (&seed_h10 as *const _ as *mut c_void),
+        ];
+        unsafe {
+            result::launch_kernel(walk, (grid, 1, 1), (32 * NCF_WARPS, 1, 1), NCF_WARPS * NCF_SMEM_PER_WARP, stream.cu_stream(), &mut params)
+        }?;
         stream.synchronize()?;
         let w = stream.clone_dtoh(&winner)?[0];
         Ok(if w == u64::MAX { None } else { Some(w) })
@@ -830,9 +913,15 @@ pub struct PomGpuMiner {
     /// compiled as an empty stub -- dispatching to it would return no winner for every batch
     /// while the worker still counted a full batch of hashes: zero blocks, full hashrate, silent.
     tc_capable: bool,
+    /// Chaseless (ncf) solver profitable here? sm>=8 AND not HBM (cc 8.0 A100 / 9.0 H100 regress
+    /// on ncf per supr's fleet data). Env `KERYX_POM_V4_NCF` still overrides.
+    ncf_capable: bool,
     /// Cached offsets buffer for the tensor-core path, grown on demand and reused across
     /// batches. `Mutex` because `mine` takes `&self` from several worker threads.
     offsets_dev: Mutex<Option<CudaSlice<u32>>>,
+    /// Cached segment LUT for the chaseless (ncf) walk: (device buffer, shift). Built once per
+    /// resident blob from the prefix table; a tier change reinstalls the miner and rebuilds it.
+    ncf_lut: Mutex<Option<(std::sync::Arc<CudaSlice<u16>>, u32)>>,
     _uploads: Vec<CudaSlice<u8>>, // tensors we uploaded ourselves, kept alive for the gather
 }
 
@@ -887,7 +976,10 @@ impl PomGpuMiner {
             t_count: bases.len() as u32,
             n_total_chunks,
             tc_capable: gpu_compute_capability(device_id).map_or(false, |(maj, _)| maj >= 8),
+            ncf_capable: gpu_compute_capability(device_id)
+                .map_or(false, |(maj, min)| maj >= 8 && !(maj == 8 && min == 0) && !(maj == 9 && min == 0)),
             offsets_dev: Mutex::new(None),
+            ncf_lut: Mutex::new(None),
             _uploads: uploads,
         })
     }
@@ -1009,13 +1101,47 @@ impl PomGpuMiner {
             t_count: bases.len() as u32,
             n_total_chunks,
             tc_capable: gpu_compute_capability(device_id).map_or(false, |(maj, _)| maj >= 8),
+            ncf_capable: gpu_compute_capability(device_id)
+                .map_or(false, |(maj, min)| maj >= 8 && !(maj == 8 && min == 0) && !(maj == 9 && min == 0)),
             offsets_dev: Mutex::new(None),
+            ncf_lut: Mutex::new(None),
             _uploads: uploads,
         })
     }
 
     pub fn n_chunks(&self) -> u64 {
         self.n_total_chunks
+    }
+
+    /// Build (or return cached) the segment LUT for the chaseless walk: `lut[chunk >> sh]` is the
+    /// index of the segment containing that chunk. Built from the SAME prefix table the kernel's
+    /// forward walk refines against, so the resolved segment is identical to the binary search's.
+    /// Shift chosen so the LUT is <= ~16K u16 entries (~32 KB device-resident, L2-hot).
+    fn ncf_lut(&self) -> Result<(Arc<CudaSlice<u16>>, u32)> {
+        {
+            let g = self.ncf_lut.lock().unwrap();
+            if let Some((lut, sh)) = g.as_ref() {
+                return Ok((lut.clone(), *sh));
+            }
+        }
+        let prefix: Vec<u64> = self.stream.clone_dtoh(&self.prefix_dev)?;
+        let mut sh = 0u32;
+        while (self.n_total_chunks >> sh) > 16384 {
+            sh += 1;
+        }
+        let nbuck = (self.n_total_chunks >> sh) as usize + 1;
+        let mut lut = vec![0u16; nbuck];
+        let mut lo = 0usize;
+        for (bk, e) in lut.iter_mut().enumerate() {
+            let idx = (bk as u64) << sh;
+            while lo + 1 < prefix.len() && prefix[lo + 1] <= idx {
+                lo += 1;
+            }
+            *e = lo as u16;
+        }
+        let dev = Arc::new(self.stream.clone_htod(&lut)?);
+        *self.ncf_lut.lock().unwrap() = Some((dev.clone(), sh));
+        Ok((dev, sh))
     }
 
     /// Search nonces in `[start, start + batch)`. Returns the lowest nonce whose `pom_pow_value`
@@ -1034,6 +1160,24 @@ impl PomGpuMiner {
                 return Err(anyhow!("PoM GPU: blob too small for the v4 walk"));
             }
             let h10_state = seed_h10.then(|| crate::pom::pom_seed_h10_state(pre_pow_hash, timestamp));
+            // Chaseless fused solver (ncf): preferred on GDDR. No separate chase pass, Barrett mod,
+            // LUT segment resolve -- byte-identical to the tc/classic walk, measured +8-14% on GDDR
+            // by supr. Falls through to the tc pipeline if the image lacks the entry, the segment
+            // count overflows the u16 LUT, the card is HBM, or KERYX_POM_V4_NCF=0.
+            if self.tc_capable
+                && self.ncf_capable
+                && self.kernel.function_v4_ncf.is_some()
+                && self.t_count as u64 <= u16::MAX as u64
+                && v4_ncf_enabled()
+            {
+                let (lut, lut_sh) = self.ncf_lut()?;
+                let inv_n = u64::MAX / n_tiles;
+                return self.kernel.launch_v4_ncf(
+                    &self.stream, &self.bases_dev, &self.prefix_dev, self.t_count, n_tiles,
+                    &p_words, &s_words, timestamp, target_le, start, batch, &lut, lut_sh, inv_n,
+                    h10_state.as_ref(),
+                );
+            }
             // Tensor-core path when the image has it and the operator has not opted out. The
             // kernel itself falls back to the classic walk on sm_75 and below, so no capability
             // gate is needed here -- an older card simply gets the same result more slowly.
@@ -2058,7 +2202,10 @@ impl PomGpuMiner {
             t_count: bases.len() as u32,
             n_total_chunks,
             tc_capable: gpu_compute_capability(device_id).map_or(false, |(maj, _)| maj >= 8),
+            ncf_capable: gpu_compute_capability(device_id)
+                .map_or(false, |(maj, min)| maj >= 8 && !(maj == 8 && min == 0) && !(maj == 9 && min == 0)),
             offsets_dev: Mutex::new(None),
+            ncf_lut: Mutex::new(None),
             _uploads: uploads,
         })
     }
@@ -2117,6 +2264,34 @@ mod v3_kernel_tests {
                 .launch_v4_tc(&miner.stream, &miner.bases_dev, &miner.prefix_dev, &offsets, miner.t_count, n_tiles, &p_words, &s_words, TIMESTAMP, &target, base, 2048, None)
                 .unwrap();
             assert_eq!(tc, classic, "tensor-core and classic disagree at base {base}");
+        }
+    }
+
+    /// The chaseless (ncf) solver must agree with the classic kernel on every nonce -- Barrett mod,
+    /// the LUT resolve and the fused inline offset are all meant to be byte-exact, and a wrong
+    /// LUT/inv_n surfaces as a divergence here rather than as rejected blocks in the field.
+    #[test]
+    #[ignore]
+    fn v4_ncf_matches_classic() {
+        let blob = pom_v4::lockstep_blob();
+        let miner = PomGpuMiner::load_test_segments(0, split_blob(&blob)).unwrap();
+        assert!(miner.kernel.function_v4_ncf.is_some(), "image has no pom_mine_v4_ncf entry");
+        let (lut, lut_sh) = miner.ncf_lut().unwrap();
+        let target = [0xFFu8; 32];
+        for base in [0u64, 1_000, 1u64 << 20] {
+            let s_words = crate::pom::pph_words_v4(&PPH);
+            let p_words = crate::pom::pph_words_for_era(&PPH, true);
+            let n_tiles = miner.n_total_chunks / pom_v4::POM_V4_TILE_CHUNKS;
+            let inv_n = u64::MAX / n_tiles;
+            let classic = miner
+                .kernel
+                .launch_v4(&miner.stream, &miner.bases_dev, &miner.prefix_dev, miner.t_count, n_tiles, &p_words, &s_words, TIMESTAMP, &target, base, 2048, None)
+                .unwrap();
+            let ncf = miner
+                .kernel
+                .launch_v4_ncf(&miner.stream, &miner.bases_dev, &miner.prefix_dev, miner.t_count, n_tiles, &p_words, &s_words, TIMESTAMP, &target, base, 2048, &lut, lut_sh, inv_n, None)
+                .unwrap();
+            assert_eq!(ncf, classic, "chaseless and classic disagree at base {base}");
         }
     }
 
@@ -2199,6 +2374,19 @@ fn v4_tc_enabled() -> bool {
         let off = matches!(std::env::var("KERYX_POM_V4_TC").as_deref(), Ok("0"));
         if off {
             info!("PoM v4: tensor-core solver disabled (KERYX_POM_V4_TC=0) — using the classic dp4a kernel");
+        }
+        !off
+    })
+}
+
+/// Chaseless-fused (ncf) solver. On by default where `ncf_capable` (GDDR, sm>=8, non-HBM);
+/// `KERYX_POM_V4_NCF=0` forces the chase+tc pipeline. Byte-identical either way.
+fn v4_ncf_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let off = matches!(std::env::var("KERYX_POM_V4_NCF").as_deref(), Ok("0"));
+        if off {
+            info!("PoM v4: chaseless solver disabled (KERYX_POM_V4_NCF=0) — using the chase+tc pipeline");
         }
         !off
     })
