@@ -2110,11 +2110,11 @@ mod v3_kernel_tests {
             let offsets = miner.stream.alloc_zeros::<u32>(2048 * pom_v4::POM_V4_K).unwrap();
             let classic = miner
                 .kernel
-                .launch_v4(&miner.stream, &miner.bases_dev, &miner.prefix_dev, miner.t_count, n_tiles, &p_words, &s_words, TIMESTAMP, &target, base, 2048)
+                .launch_v4(&miner.stream, &miner.bases_dev, &miner.prefix_dev, miner.t_count, n_tiles, &p_words, &s_words, TIMESTAMP, &target, base, 2048, None)
                 .unwrap();
             let tc = miner
                 .kernel
-                .launch_v4_tc(&miner.stream, &miner.bases_dev, &miner.prefix_dev, &offsets, miner.t_count, n_tiles, &p_words, &s_words, TIMESTAMP, &target, base, 2048)
+                .launch_v4_tc(&miner.stream, &miner.bases_dev, &miner.prefix_dev, &offsets, miner.t_count, n_tiles, &p_words, &s_words, TIMESTAMP, &target, base, 2048, None)
                 .unwrap();
             assert_eq!(tc, classic, "tensor-core and classic disagree at base {base}");
         }
