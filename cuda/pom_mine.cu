@@ -5,6 +5,8 @@
 
 #include <cstdint>
 
+#include "keccak_f1600.cuh"
+
 __device__ __forceinline__ unsigned long long mix64(unsigned long long x) {
     x ^= x >> 30; x *= 0xbf58476d1ce4e5b9ULL;
     x ^= x >> 27; x *= 0x94d049bb133111ebULL;
@@ -504,11 +506,12 @@ extern "C" __global__ void pom_mine_v4(
     unsigned long long time_,
     unsigned long long t0, unsigned long long t1, unsigned long long t2, unsigned long long t3,
     unsigned long long nonce_base, unsigned long long n_nonces,
-    unsigned long long* winner) {
+    unsigned long long* winner,
+    const unsigned long long* h10_state, unsigned int seed_h10) {
     extern __shared__ unsigned int s_shared[];
     if ((unsigned long long)blockIdx.x >= n_nonces) return;
     const unsigned long long nonce = nonce_base + blockIdx.x;
-    const unsigned long long seed = pom_seed_fold(nonce, time_, s0, s1, s2, s3);
+    const unsigned long long seed = seed_h10 ? pom_seed_h10(nonce, h10_state) : pom_seed_fold(nonce, time_, s0, s1, s2, s3);
     const unsigned long long fin = v4_walk_block(bases, prefix, T, n_tiles, K, seed, s_shared, nullptr, nullptr);
     if (threadIdx.x == 0) {
         unsigned long long pv[4];
@@ -561,11 +564,12 @@ extern "C" __global__ void pom_mine_v4_chase(
     unsigned long long n_tiles, unsigned int K,
     unsigned long long s0, unsigned long long s1, unsigned long long s2, unsigned long long s3,
     unsigned long long time_, unsigned long long nonce_base, unsigned long long n_nonces,
-    unsigned int* offsets /* [n_nonces][K] */) {
+    unsigned int* offsets /* [n_nonces][K] */,
+    const unsigned long long* h10_state, unsigned int seed_h10) {
     const unsigned long long i = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n_nonces) return;
     const unsigned long long nonce = nonce_base + i;
-    const unsigned long long seed = pom_seed_fold(nonce, time_, s0, s1, s2, s3);
+    const unsigned long long seed = seed_h10 ? pom_seed_h10(nonce, h10_state) : pom_seed_fold(nonce, time_, s0, s1, s2, s3);
     unsigned long long off = mix64(seed ^ V4_OFFSET_FIRST_SALT) % n_tiles;
     unsigned int* my = offsets + i * (unsigned long long)K;
     for (unsigned int step = 1; step <= K; step++) {
@@ -657,7 +661,8 @@ extern "C" __global__ void pom_mine_v4_tc(
     unsigned long long time_,
     unsigned long long t0, unsigned long long t1, unsigned long long t2, unsigned long long t3,
     unsigned long long nonce_base, unsigned long long n_nonces,
-    const unsigned int* offsets, unsigned long long* winner) {
+    const unsigned int* offsets, unsigned long long* winner,
+    const unsigned long long* h10_state, unsigned int seed_h10) {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
     extern __shared__ unsigned int v4tc_smem[];
     const unsigned int lane = threadIdx.x & 31u;
@@ -665,7 +670,7 @@ extern "C" __global__ void pom_mine_v4_tc(
     const unsigned long long slot = (unsigned long long)blockIdx.x * V4_TC_WARPS + warp;
     if (slot >= n_nonces) return;
     const unsigned long long nonce = nonce_base + slot;
-    const unsigned long long seed = pom_seed_fold(nonce, time_, s0, s1, s2, s3);
+    const unsigned long long seed = seed_h10 ? pom_seed_h10(nonce, h10_state) : pom_seed_fold(nonce, time_, s0, s1, s2, s3);
 
     unsigned int* base = v4tc_smem + warp * ((1 + V4_TC_PIPE) * 256);
     unsigned int* s_state = base;
@@ -741,5 +746,6 @@ extern "C" __global__ void pom_mine_v4_tc(
     (void)p0; (void)p1; (void)p2; (void)p3; (void)s0; (void)s1; (void)s2; (void)s3;
     (void)time_; (void)t0; (void)t1; (void)t2; (void)t3;
     (void)nonce_base; (void)n_nonces; (void)offsets; (void)winner;
+    (void)h10_state; (void)seed_h10;
 #endif
 }
