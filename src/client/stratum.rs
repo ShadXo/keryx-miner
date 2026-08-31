@@ -2,15 +2,22 @@ use futures::prelude::*;
 use std::collections::{HashMap, HashSet};
 use std::fmt::{Display, Formatter};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::net::TcpStream;
 use tokio_util::codec::Framed;
 
+mod ai;
+mod protocol;
 mod statum_codec;
 
-use crate::client::stratum::statum_codec::{ErrorCode, MiningNotify, MiningSubmit, NewLineJsonCodecError, StratumLine};
+use ai::{AiRequest, InferenceGuard};
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
+
+use protocol::{difficulty_to_target, effective_target, nonce_range, MiningJob};
+
+use crate::client::stratum::statum_codec::{ErrorCode, MiningSubmit, NewLineJsonCodecError, StratumLine};
 use crate::client::stratum::statum_codec::{
     MiningSubscribe, SetExtranonce, StratumCommand, StratumError, StratumLinePayload, StratumResult,
 };
@@ -21,8 +28,6 @@ use crate::{miner::MinerManager, Error, Uint256};
 use async_trait::async_trait;
 use futures_util::TryStreamExt;
 use log::{error, info, warn};
-use num::Float;
-use rand::{thread_rng, RngCore};
 use statum_codec::NewLineJsonCodec;
 use std::sync::OnceLock;
 use tokio::sync::mpsc::{self, Sender};
@@ -32,9 +37,7 @@ use tokio::task::JoinHandle;
 use tokio::time::MissedTickBehavior;
 use tokio_stream::wrappers::ReceiverStream;
 
-//const DIFFICULTY_1_TARGET: Uint256 = Uint256([0x00000000ffff0000, 0x0000000000000000, 0x0000000000000000, 0x0000000000000000]);
-const DIFFICULTY_1_TARGET: (u64, i16) = (0xffffu64, 208); // 0xffff 2^208
-const KERYX_STRATUM_DAA_CAPABILITY: &str = "keryx-stratum-v2";
+const KERYX_STRATUM_DAA_CAPABILITY: &str = "keryx-stratum-v3";
 const LOG_RATE: Duration = Duration::from_secs(30);
 const CHALLENGE_MAX_TOKENS: usize = 128;
 
@@ -78,6 +81,7 @@ struct InferenceCacheInner {
 type InferenceCache = Arc<Mutex<InferenceCacheInner>>;
 
 type BlockHandle = JoinHandle<()>;
+type PendingShares = Arc<Mutex<HashMap<u32, String>>>;
 
 #[derive(Default)]
 pub struct ShareStats {
@@ -85,7 +89,6 @@ pub struct ShareStats {
     pub stale: AtomicU64,
     pub low_diff: AtomicU64,
     pub duplicate: AtomicU64,
-    pub shares_pending: Mutex<HashMap<u32, String>>,
 }
 
 static SHARE_STATS: OnceLock<Arc<ShareStats>> = OnceLock::new();
@@ -94,7 +97,7 @@ impl Display for ShareStats {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "Shares: {}{}{}{}Pending: {}",
+            "Shares: {}{}{}{}",
             match self.accepted.load(Ordering::SeqCst) {
                 0 => "".to_string(),
                 v => format!("Accepted: {} ", v),
@@ -111,7 +114,6 @@ impl Display for ShareStats {
                 0 => "".to_string(),
                 v => format!("Duplicate: {} ", v),
             },
-            self.shares_pending.try_lock().unwrap().len()
         )
     }
 }
@@ -119,25 +121,27 @@ impl Display for ShareStats {
 #[allow(dead_code)]
 pub struct StratumHandler {
     log_handler: JoinHandle<()>,
+    write_handle: JoinHandle<Result<(), NewLineJsonCodecError>>,
 
     //client: Framed<TcpStream, NewLineJsonCodec>,
     send_channel: Sender<StratumLine>,
     stream: Pin<Box<dyn Stream<Item = Result<StratumLine, NewLineJsonCodecError>>>>,
     miner_address: String,
     mine_when_not_synced: bool,
-    devfund_address: Option<String>,
-    devfund_percent: u16,
-    mining_dev: Option<bool>,
-    block_template_ctr: Arc<AtomicU16>,
 
     target_pool: Uint256,
-    target_real: Uint256,
     nonce_mask: u64,
     nonce_fixed: u64,
     extranonce: Option<String>,
     last_stratum_id: Arc<AtomicU32>,
 
     shares_stats: Arc<ShareStats>,
+    ai_response: Arc<Mutex<Option<(u32, Instant)>>>,
+    shares_pending: PendingShares,
+    keepalive_interval: Duration,
+    keepalive_timeout: Duration,
+    keepalive_pending: Option<(u32, Instant)>,
+    last_activity: Instant,
     block_channel: Sender<BlockSeed>,
     block_handle: BlockHandle,
 
@@ -153,11 +157,6 @@ pub struct StratumHandler {
 
 #[async_trait(?Send)]
 impl Client for StratumHandler {
-    fn add_devfund(&mut self, address: String, percent: u16) {
-        self.devfund_address = Some(address);
-        self.devfund_percent = percent;
-    }
-
     async fn register(&mut self) -> Result<(), Error> {
         let mut id = { Some(self.last_stratum_id.fetch_add(1, Ordering::SeqCst)) };
         self.send_channel
@@ -175,17 +174,7 @@ impl Client for StratumHandler {
             .await?;
         id = Some(self.last_stratum_id.fetch_add(1, Ordering::SeqCst));
 
-        let pay_address = match &self.devfund_address {
-            Some(devfund_address) if self.block_template_ctr.load(Ordering::SeqCst) <= self.devfund_percent => {
-                self.mining_dev = Some(true);
-                info!("Mining to devfund");
-                devfund_address.clone()
-            }
-            _ => {
-                self.mining_dev = Some(false);
-                self.miner_address.clone()
-            }
-        };
+        let pay_address = self.miner_address.clone();
         self.send_channel
             .send(StratumLine {
                 id,
@@ -199,19 +188,15 @@ impl Client for StratumHandler {
             .await?;
 
         // Declare loaded SLM models so the bridge can challenge with the right model.
-        let model_ids: Vec<String> = keryx_miner::slm::loaded_model_ids()
-            .into_iter()
-            .map(|id| hex::encode(id))
-            .collect();
+        let model_ids: Vec<String> =
+            keryx_miner::slm::loaded_model_ids().into_iter().map(|id| hex::encode(id)).collect();
         if !model_ids.is_empty() {
             info!("OPoI: declaring {} model(s) to pool bridge", model_ids.len());
             self.send_channel
                 .send(StratumLine {
                     id: None,
-                    payload: StratumLinePayload::StratumCommand(
-                        StratumCommand::MiningDeclareCapabilities(model_ids),
-                    ),
-                    jsonrpc: None,
+                    payload: StratumLinePayload::StratumCommand(StratumCommand::MiningDeclareCapabilities(model_ids)),
+                    jsonrpc: Some("2.0".into()),
                     error: None,
                 })
                 .await?;
@@ -220,20 +205,23 @@ impl Client for StratumHandler {
     }
 
     async fn listen(&mut self, miner: &mut MinerManager) -> Result<(), Error> {
-        info!("Waiting for stuff");
+        info!("Waiting for Stratum traffic");
+        let mut maintenance = tokio::time::interval(Duration::from_secs(1));
+        maintenance.set_missed_tick_behavior(MissedTickBehavior::Delay);
         loop {
-            {
-                if (!self.mining_dev.unwrap_or(true)
-                    && self.block_template_ctr.load(Ordering::SeqCst) <= self.devfund_percent)
-                    || (self.mining_dev.unwrap_or(false)
-                        && self.block_template_ctr.load(Ordering::SeqCst) > self.devfund_percent)
-                {
-                    return Ok(());
-                }
-            }
-            match self.stream.try_next().await? {
-                Some(msg) => self.handle_message(msg, miner).await?,
-                None => return Err("stratum message payload is empty".into()),
+            tokio::select! {
+                result = &mut self.write_handle => {
+                    result??;
+                    return Err("Stratum writer closed".into());
+                },
+                message = self.stream.try_next() => match message? {
+                    Some(msg) => {
+                        self.last_activity = Instant::now();
+                        self.handle_message(msg, miner).await?;
+                    }
+                    None => return Err("Stratum connection closed".into()),
+                },
+                _ = maintenance.tick() => self.maintain_keepalive().await?,
             }
         }
     }
@@ -248,50 +236,51 @@ impl StratumHandler {
         address: String,
         miner_address: String,
         mine_when_not_synced: bool,
-        block_template_ctr: Option<Arc<AtomicU16>>,
         ipfs_url: String,
+        keepalive_seconds: u64,
+        keepalive_timeout_seconds: u64,
     ) -> Result<Box<Self>, Error> {
         info!("Connecting to {}", address);
-        let socket = TcpStream::connect(address).await?;
+        let socket = tokio::time::timeout(Duration::from_secs(5), TcpStream::connect(address)).await??;
 
         let client = Framed::new(socket, NewLineJsonCodec::new());
         let (send_channel, recv) = mpsc::channel::<StratumLine>(3);
         let (sink, stream) = client.split();
-        tokio::spawn(async move { ReceiverStream::new(recv).map(Ok).forward(sink).await });
+        let write_handle = tokio::spawn(async move { ReceiverStream::new(recv).map(Ok).forward(sink).await });
 
         let share_state = SHARE_STATS.get_or_init(|| Arc::new(ShareStats::default())).clone();
+        let shares_pending = Arc::new(Mutex::new(HashMap::new()));
         let last_stratum_id = Arc::new(AtomicU32::new(0));
         let current_task_slot: Arc<Mutex<Option<CurrentTask>>> = Arc::new(Mutex::new(None));
-        let inference_cache: InferenceCache = Arc::new(Mutex::new(InferenceCacheInner {
-            results: HashMap::new(),
-            in_progress: HashSet::new(),
-        }));
+        let inference_cache: InferenceCache =
+            Arc::new(Mutex::new(InferenceCacheInner { results: HashMap::new(), in_progress: HashSet::new() }));
         let (block_channel, block_handle) = Self::create_block_channel(
             send_channel.clone(),
             miner_address.clone(),
             last_stratum_id.clone(),
-            share_state.clone(),
+            shares_pending.clone(),
             Arc::clone(&current_task_slot),
             Arc::clone(&inference_cache),
         );
         Ok(Box::new(Self {
-            log_handler: task::spawn(Self::log_shares(share_state.clone())),
+            log_handler: task::spawn(Self::log_shares(share_state.clone(), shares_pending.clone())),
+            write_handle,
             stream: Box::pin(stream),
             send_channel,
             miner_address,
             mine_when_not_synced,
-            devfund_address: None,
-            devfund_percent: 0,
-            block_template_ctr: block_template_ctr
-                .unwrap_or_else(|| Arc::new(AtomicU16::new((thread_rng().next_u64() % 10_000u64) as u16))),
             target_pool: Default::default(),
-            target_real: Default::default(),
             nonce_mask: u64::MAX, // full nonce space until set_extranonce assigns a sub-range
             nonce_fixed: 0,
             extranonce: None,
             last_stratum_id,
             shares_stats: share_state,
-            mining_dev: None,
+            ai_response: Arc::new(Mutex::new(None)),
+            shares_pending,
+            keepalive_interval: Duration::from_secs(keepalive_seconds.max(1)),
+            keepalive_timeout: Duration::from_secs(keepalive_timeout_seconds.max(1)),
+            keepalive_pending: None,
+            last_activity: Instant::now(),
             block_channel,
             block_handle,
             ipfs_url,
@@ -305,7 +294,7 @@ impl StratumHandler {
         send_channel: Sender<StratumLine>,
         miner_address: String,
         last_stratum_id: Arc<AtomicU32>,
-        share_stats: Arc<ShareStats>,
+        shares_pending: PendingShares,
         current_task_slot: Arc<Mutex<Option<CurrentTask>>>,
         inference_cache: InferenceCache,
     ) -> (Sender<BlockSeed>, BlockHandle) {
@@ -314,12 +303,12 @@ impl StratumHandler {
         let handle = tokio::spawn(async move {
             let mut recv_stream = ReceiverStream::new(recv);
             while let Some(seed) = recv_stream.next().await {
-                let (nonce, job_id) = match seed {
-                    BlockSeed::PartialBlock { nonce, id, .. } => (nonce, id),
+                let (nonce, job_id, pom_proof) = match seed {
+                    BlockSeed::PartialBlock { nonce, id, pom_proof, .. } => (nonce, id, pom_proof),
                     BlockSeed::FullBlock { .. } => unreachable!(),
                 };
                 let msg_id = last_stratum_id.fetch_add(1, Ordering::SeqCst);
-                share_stats.shares_pending.try_lock().unwrap().insert(msg_id, job_id.clone());
+                shares_pending.lock().await.insert(msg_id, job_id.clone());
                 let nonce_hex = format!("{:016x}", nonce);
                 let opoi_tag = keryx_inference::tag_fixed(nonce);
 
@@ -338,7 +327,23 @@ impl StratumHandler {
                     }
                 };
 
-                let line = if let Some(cid) = cid_opt {
+                let line = if !pom_proof.is_empty() {
+                    StratumLine {
+                        id: Some(msg_id),
+                        payload: StratumLinePayload::StratumCommand(StratumCommand::MiningSubmit(
+                            MiningSubmit::MiningSubmitWithPom((
+                                miner_address.clone(),
+                                job_id,
+                                nonce_hex,
+                                opoi_tag,
+                                cid_opt.unwrap_or_default(),
+                                hex::encode(pom_proof),
+                            )),
+                        )),
+                        jsonrpc: None,
+                        error: None,
+                    }
+                } else if let Some(cid) = cid_opt {
                     info!("OPoI Phase 2: submitting share with CID for job {}", job_id);
                     StratumLine {
                         id: Some(msg_id),
@@ -358,12 +363,7 @@ impl StratumHandler {
                     StratumLine {
                         id: Some(msg_id),
                         payload: StratumLinePayload::StratumCommand(StratumCommand::MiningSubmit(
-                            MiningSubmit::MiningSubmitWithTag((
-                                miner_address.clone(),
-                                job_id,
-                                nonce_hex,
-                                opoi_tag,
-                            )),
+                            MiningSubmit::MiningSubmitWithTag((miner_address.clone(), job_id, nonce_hex, opoi_tag)),
                         )),
                         jsonrpc: None,
                         error: None,
@@ -371,6 +371,7 @@ impl StratumHandler {
                 };
 
                 if send_channel.send(line).await.is_err() {
+                    shares_pending.lock().await.remove(&msg_id);
                     break;
                 }
             }
@@ -379,6 +380,26 @@ impl StratumHandler {
     }
 
     async fn handle_message(&mut self, msg: StratumLine, miner: &mut MinerManager) -> Result<(), Error> {
+        {
+            let mut pending = self.ai_response.lock().await;
+            if pending.map(|(id, _)| Some(id)) == Some(msg.id) {
+                *pending = None;
+                match (&msg.payload, &msg.error) {
+                    (StratumLinePayload::StratumResult { result: StratumResult::Plain(Some(true)) }, None) => {
+                        info!("AI response accepted")
+                    }
+                    _ => warn!("AI response rejected: {:?}", msg.error),
+                }
+                return Ok(());
+            }
+        }
+        if self.keepalive_pending.map(|(id, _)| Some(id)) == Some(msg.id) {
+            self.keepalive_pending = None;
+            return match (&msg.payload, &msg.error) {
+                (StratumLinePayload::StratumResult { result: StratumResult::Plain(Some(true)) }, None) => Ok(()),
+                _ => Err("Stratum keepalive rejected".into()),
+            };
+        }
         match msg.clone() {
             StratumLine { id, payload, error: None, .. } => {
                 match payload {
@@ -386,10 +407,9 @@ impl StratumHandler {
                         match result {
                             StratumResult::Plain(Some(true)) | StratumResult::Eth((true, _)) => {
                                 if let Some(_jobid) = self
-                                    .shares_stats
                                     .shares_pending
-                                    .try_lock()
-                                    .unwrap()
+                                    .lock()
+                                    .await
                                     .remove(&id.expect("We checked id is not none"))
                                 {
                                     self.shares_stats.accepted.fetch_add(1, Ordering::SeqCst);
@@ -419,106 +439,40 @@ impl StratumHandler {
                             ref nonce_size,
                         ))) => self.set_extranonce(extranonce.as_str(), nonce_size),
                         StratumCommand::MiningSetDifficulty((ref difficulty,)) => self.set_difficulty(difficulty),
-                        // Phase 2 OPoI: bridge dispatches an AiRequest task alongside the block.
-                        StratumCommand::MiningNotify(MiningNotify::MiningNotifyWithTask((
-                            id,
-                            header_hash,
-                            timestamp,
-                            daa_score,
-                            task_json,
-                        ))) => {
-                            self.block_template_ctr
-                                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| Some((v + 1) % 10_000))
-                                .unwrap();
-                            // OPoI hard gate (mirrors solo grpc.rs): no models ready = no mining.
+                        StratumCommand::MiningNotify(notify) => {
+                            let job = MiningJob::try_from(notify)?;
                             if keryx_miner::slm::loaded_model_ids().is_empty() {
-                                if self.block_template_ctr.load(Ordering::SeqCst) % 200 == 0 {
-                                    warn!("OPoI: no models ready — mining suspended (no inference = no mining)");
-                                }
                                 return miner.process_block(None).await;
                             }
-                            let inference_started =
-                                self.handle_ai_task(id.clone(), task_json, miner).await;
-                            if inference_started {
-                                // PoW already paused inside handle_ai_task — do NOT feed a new
-                                // block template or the GPU immediately resumes hashing.
-                                Ok(())
+                            let target = effective_target(self.target_pool, job.block_bits)?;
+                            if self.challenge_in_flight.load(Ordering::SeqCst) {
+                                return miner.process_block(None).await;
+                            }
+                            if let Some(task_json) = job.task_json {
+                                if self.handle_ai_task(job.id.clone(), task_json, miner).await {
+                                    return Ok(());
+                                }
                             } else {
-                                miner
-                                    .process_block(Some(PartialBlock {
-                                        id,
-                                        header_hash,
-                                        timestamp,
-                                        daa_score,
-                                        nonce: 0,
-                                        target: self.target_pool,
-                                        nonce_mask: self.nonce_mask,
-                                        nonce_fixed: self.nonce_fixed,
-                                        hash: None,
-                                    }))
-                                    .await
+                                *self.current_task_slot.lock().await = None;
                             }
-                        }
-                        StratumCommand::MiningNotify(MiningNotify::MiningNotifyShortV2((
-                            id,
-                            header_hash,
-                            timestamp,
-                            daa_score,
-                        ))) => {
-                            self.block_template_ctr
-                                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| Some((v + 1) % 10_000))
-                                .unwrap();
-                            // OPoI hard gate (mirrors solo grpc.rs): no models ready = no mining.
-                            if keryx_miner::slm::loaded_model_ids().is_empty() {
-                                if self.block_template_ctr.load(Ordering::SeqCst) % 200 == 0 {
-                                    warn!("OPoI: no models ready — mining suspended (no inference = no mining)");
-                                }
-                                return miner.process_block(None).await;
-                            }
-                            // No AiRequest in this job — clear the task slot.
-                            *self.current_task_slot.lock().await = None;
                             miner
                                 .process_block(Some(PartialBlock {
-                                    id,
-                                    header_hash,
-                                    timestamp,
-                                    daa_score,
+                                    id: job.id,
+                                    header_hash: job.header_hash,
+                                    timestamp: job.timestamp,
+                                    daa_score: job.daa_score,
                                     nonce: 0,
-                                    target: self.target_pool,
+                                    target,
                                     nonce_mask: self.nonce_mask,
                                     nonce_fixed: self.nonce_fixed,
                                     hash: None,
+                                    pom_proof: Vec::new(),
                                 }))
                                 .await
                         }
-                        StratumCommand::MiningNotify(MiningNotify::MiningNotifyShort((id, header_hash, timestamp))) => {
-                            self.block_template_ctr
-                                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| Some((v + 1) % 10_000))
-                                .unwrap();
-                            // OPoI hard gate (mirrors solo grpc.rs): no models ready = no mining.
-                            if keryx_miner::slm::loaded_model_ids().is_empty() {
-                                if self.block_template_ctr.load(Ordering::SeqCst) % 200 == 0 {
-                                    warn!("OPoI: no models ready — mining suspended (no inference = no mining)");
-                                }
-                                return miner.process_block(None).await;
-                            }
-                            *self.current_task_slot.lock().await = None;
-                            miner
-                                .process_block(Some(PartialBlock {
-                                    id,
-                                    header_hash,
-                                    timestamp,
-                                    // Short stratum notify carries no daa_score; pin it to the
-                                    // current salt era so the host generates the right matrix.
-                                    // Post-relaunch the chain is on SALT v4, so force v4.
-                                    daa_score: crate::pow::heavy_hash::pow_salt_v4_activation_daa(),
-                                    nonce: 0,
-                                    target: self.target_pool,
-                                    nonce_mask: self.nonce_mask,
-                                    nonce_fixed: self.nonce_fixed,
-                                    hash: None,
-                                }))
-                                .await
+                        StratumCommand::MiningAiRequest(fields) => {
+                            self.handle_ai_request(fields, miner).await;
+                            Ok(())
                         }
                         StratumCommand::MiningChallenge((model_id_hex, nonce_hex)) => {
                             self.handle_challenge(model_id_hex, nonce_hex, miner).await;
@@ -535,7 +489,9 @@ impl StratumHandler {
                 error: Some(StratumError(code, error, _)),
                 ..
             } => {
-                let jobid = { self.shares_stats.shares_pending.try_lock().unwrap().remove(&id) }.unwrap();
+                let Some(jobid) = self.shares_pending.lock().await.remove(&id) else {
+                    return Err(format!("Stratum request {} rejected: {}", id, error).into());
+                };
                 match code {
                     ErrorCode::Unknown => {
                         // Match solo-mining behaviour (grpc.rs SubmitBlockResponse): a rejected
@@ -574,47 +530,109 @@ impl StratumHandler {
         }
     }
 
-    fn set_difficulty(&mut self, difficulty: &f32) -> Result<(), Error> {
-        let mut buf = [0u64, 0u64, 0u64, 0u64];
-        let (mantissa, exponent, _) = difficulty.recip().integer_decode();
-        let new_mantissa = mantissa * DIFFICULTY_1_TARGET.0;
-        let new_exponent = (DIFFICULTY_1_TARGET.1 + exponent) as u64;
-        let start = (new_exponent / 64) as usize;
-        let remainder = new_exponent % 64;
-
-        buf[start] = new_mantissa << remainder; // bottom
-        if start < 3 {
-            buf[start + 1] = new_mantissa >> (64 - remainder); // top
-        } else if new_mantissa.leading_zeros() < remainder as u32 {
-            return Err("Target is too big".into());
+    async fn maintain_keepalive(&mut self) -> Result<(), Error> {
+        let now = Instant::now();
+        if self
+            .ai_response
+            .lock()
+            .await
+            .as_ref()
+            .is_some_and(|(_, since)| now.duration_since(*since) >= self.keepalive_timeout)
+        {
+            return Err("AI response acknowledgement timed out".into());
         }
+        if let Some((_, since)) = self.keepalive_pending {
+            if now.duration_since(since) >= self.keepalive_timeout {
+                return Err("Stratum keepalive timed out".into());
+            }
+        } else if now.duration_since(self.last_activity) >= self.keepalive_interval {
+            let id = self.last_stratum_id.fetch_add(1, Ordering::SeqCst);
+            self.send_channel
+                .send(StratumLine {
+                    id: Some(id),
+                    payload: StratumLinePayload::StratumCommand(StratumCommand::MiningKeepalive([])),
+                    jsonrpc: Some("2.0".into()),
+                    error: None,
+                })
+                .await?;
+            self.keepalive_pending = Some((id, now));
+        }
+        Ok(())
+    }
 
-        self.target_pool = Uint256::new(buf);
+    fn set_difficulty(&mut self, difficulty: &f32) -> Result<(), Error> {
+        self.target_pool = difficulty_to_target(*difficulty)?;
         info!("Difficulty: {:?}, Target: 0x{}", difficulty, hex::encode(self.target_pool.to_be_bytes()));
         Ok(())
     }
 
     fn set_extranonce(&mut self, extranonce: &str, nonce_size: &u32) -> Result<(), Error> {
+        let (mask, fixed) = nonce_range(extranonce, *nonce_size)?;
         self.extranonce = Some(extranonce.to_string());
-        info!("Extra! {:?}", extranonce);
-        self.nonce_fixed = u64::from_str_radix(extranonce, 16)? << (nonce_size * 8);
-        info!("Extra Done!");
-        self.nonce_mask = (1 << (nonce_size * 8)) - 1;
+        self.nonce_mask = mask;
+        self.nonce_fixed = fixed;
         Ok(())
     }
 
-    async fn log_shares(shares_info: Arc<ShareStats>) {
+    async fn log_shares(shares_info: Arc<ShareStats>, shares_pending: PendingShares) {
         let mut ticker = tokio::time::interval(LOG_RATE);
         ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
         let mut _last_instant = ticker.tick().await;
         loop {
             let _now = ticker.tick().await;
-            info!("{}", shares_info)
+            let pending_count = shares_pending.lock().await.len();
+            info!("{}Pending: {}", shares_info, pending_count)
         }
     }
 
-    /// Parse the task JSON from a `MiningNotifyWithTask`, store it in `current_task_slot`,
-    /// and spawn a background inference+IPFS upload if the result is not already cached.
+    async fn handle_ai_request(
+        &mut self,
+        fields: (String, String, String, String, String, u32, String),
+        miner: &mut MinerManager,
+    ) {
+        let request = match AiRequest::parse(fields) {
+            Ok(request) => request,
+            Err(error) => {
+                warn!("Invalid AI request: {}", error);
+                return;
+            }
+        };
+        if !keryx_miner::slm::is_model_ready(&request.model_id) {
+            warn!("AI request {}: model is not ready", request.task_id);
+            return;
+        }
+        if self.ai_response.lock().await.is_some() || self.challenge_in_flight.swap(true, Ordering::SeqCst) {
+            warn!("AI request {}: inference is busy", request.task_id);
+            return;
+        }
+        let guard = InferenceGuard::new(miner.opoi_challenge_flag(), self.challenge_in_flight.clone());
+        if let Err(error) = miner.process_block(None).await {
+            warn!("Could not pause mining for AI request: {}", error);
+            return;
+        }
+        let sender = self.send_channel.clone();
+        let worker = self.miner_address.clone();
+        let pending = self.ai_response.clone();
+        let last_id = self.last_stratum_id.clone();
+        tokio::task::spawn_blocking(move || {
+            let _guard = guard;
+            let result =
+                keryx_miner::slm::load_and_run_inference(&request.model_id, &request.prompt, request.max_tokens)
+                    .unwrap_or_default();
+            let id = last_id.fetch_add(1, Ordering::SeqCst);
+            match request.response(id, worker, &result) {
+                Ok(line) => {
+                    *pending.blocking_lock() = Some((id, Instant::now()));
+                    if sender.blocking_send(line).is_err() {
+                        *pending.blocking_lock() = None;
+                        warn!("AI response {}: connection closed", request.task_id);
+                    }
+                }
+                Err(error) => warn!("AI request {}: {}", request.task_id, error),
+            }
+        });
+    }
+
     /// Handle a `mining.challenge` from the bridge.
     ///
     /// The bridge relays the node's periodic capability challenge: the miner must prove
@@ -658,18 +676,22 @@ impl StratumHandler {
         tokio::task::spawn_blocking(move || {
             let result = keryx_miner::slm::load_and_run_inference(&model_id, &prompt, CHALLENGE_MAX_TOKENS);
             let text = result.unwrap_or_default();
-            // Clear both flags — PoW resumes on the next mining.notify from the bridge.
+            // PoW resumes on the next mining.notify from the bridge.
             miner_flag.store(false, Ordering::SeqCst);
-            challenge_flag.store(false, Ordering::SeqCst);
             if text.is_empty() {
                 warn!("OPoI challenge: inference returned empty text for model {:.8}", model_id_hex);
             } else {
-                info!("OPoI challenge: done for model {:.8} ({} chars) — PoW resumes on next notify", model_id_hex, text.len());
+                info!(
+                    "OPoI challenge: done for model {:.8} ({} chars) — PoW resumes on next notify",
+                    model_id_hex,
+                    text.len()
+                );
             }
             let line = make_challenge_response_line(&model_id_hex, &nonce_hex, &text);
             if send_channel.blocking_send(line).is_err() {
                 warn!("OPoI challenge: send_channel closed, could not deliver response");
             }
+            challenge_flag.store(false, Ordering::SeqCst);
         });
     }
 
@@ -757,6 +779,7 @@ impl StratumHandler {
 impl Drop for StratumHandler {
     fn drop(&mut self) {
         self.log_handler.abort();
+        self.write_handle.abort();
         self.block_handle.abort()
     }
 }
@@ -791,9 +814,9 @@ fn make_challenge_response_line(model_id_hex: &str, nonce_hex: &str, result: &st
         payload: StratumLinePayload::StratumCommand(StratumCommand::MiningChallengeResponse((
             model_id_hex.to_string(),
             nonce_hex.to_string(),
-            result.to_string(),
+            BASE64.encode(result.as_bytes()),
         ))),
-        jsonrpc: None,
+        jsonrpc: Some("2.0".into()),
         error: None,
     }
 }

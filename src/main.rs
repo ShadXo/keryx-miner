@@ -12,9 +12,8 @@ use std::os::fd::AsRawFd;
 use clap::{App, FromArgMatches, IntoApp};
 use keryx_miner::PluginManager;
 use log::{error, info, warn};
-use rand::{thread_rng, RngCore};
 use std::fs;
-use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -580,12 +579,13 @@ async fn get_client(
     keryxd_address: String,
     mining_address: String,
     mine_when_not_synced: bool,
-    block_template_ctr: Arc<AtomicU16>,
     escrow_privkey: Option<String>,
     escrow_state_file: String,
     escrow_cert: Option<String>,
     chain_daa: Option<u64>,
     ipfs_url: String,
+    keepalive_seconds: u64,
+    keepalive_timeout_seconds: u64,
 ) -> Result<Box<dyn Client + 'static>, Error> {
     if keryxd_address.starts_with("stratum+tcp://") {
         let (_schema, address) = keryxd_address.split_once("://").unwrap();
@@ -593,8 +593,9 @@ async fn get_client(
             address.to_string().clone(),
             mining_address.clone(),
             mine_when_not_synced,
-            Some(block_template_ctr.clone()),
             ipfs_url.clone(),
+            keepalive_seconds,
+            keepalive_timeout_seconds,
         )
         .await?)
     } else if keryxd_address.starts_with("grpc://") {
@@ -602,7 +603,6 @@ async fn get_client(
             keryxd_address.clone(),
             mining_address.clone(),
             mine_when_not_synced,
-            Some(block_template_ctr.clone()),
             escrow_privkey,
             escrow_state_file,
             escrow_cert,
@@ -683,7 +683,6 @@ fn recovered_escrow_state(api_entries: Vec<ApiEscrowEntry>) -> Result<(escrow::E
 
 async fn client_main(
     opt: &Opt,
-    block_template_ctr: Arc<AtomicU16>,
     plugin_manager: &PluginManager,
     escrow_privkey: Option<String>,
     escrow_cert: Option<String>,
@@ -695,18 +694,16 @@ async fn client_main(
         opt.keryxd_address.clone(),
         opt.mining_address.clone().unwrap_or_default(),
         opt.mine_when_not_synced,
-        block_template_ctr.clone(),
         escrow_privkey,
         opt.escrow_state_file.clone(),
         escrow_cert,
         chain_daa,
         opt.ipfs_url.clone(),
+        opt.stratum_keepalive_seconds,
+        opt.stratum_keepalive_timeout_seconds,
     )
     .await?;
 
-    if opt.devfund_percent > 0 {
-        client.add_devfund(opt.devfund_address.clone(), opt.devfund_percent);
-    }
     client.register().await?;
     let mut miner_manager = MinerManager::new(client.get_block_channel(), opt.num_threads, plugin_manager, stats);
     let listen_result = tokio::select! {
@@ -796,12 +793,11 @@ async fn run() -> Result<(), Error> {
     let mut opt: Opt = Opt::from_arg_matches(&matches)?;
 
     // Logging is initialised BEFORE opt.process(). process() emits the resolved node/pool
-    // address and the devfund network-mismatch warning; with the init after it, both went to a
-    // logger that did not exist yet and were silently dropped — precisely the two lines an
-    // operator reads to confirm where the miner points and whether the devfund got disabled.
+    // address; with the init after it, that line went to a logger that did not exist yet and was
+    // silently dropped — precisely the line an operator reads to confirm where the miner points.
     // Nothing here depends on process(): log_level() reads --debug, is_tty comes from the
     // terminal, and the plain-log path comes from clap or the environment. process() only
-    // mutates the testnet gates, keryxd_address, num_threads and devfund_*.
+    // mutates the testnet gates, keryxd_address and num_threads.
     let is_tty = std::io::stdout().is_terminal();
     let shutdown_requested = Arc::new(AtomicBool::new(false));
     {
@@ -1005,14 +1001,19 @@ async fn run() -> Result<(), Error> {
     };
 
     // Resolve OPoI escrow private key (once, before the reconnect loop).
-    let escrow_privkey: Option<String> = match escrow::load_or_generate_key(&opt.escrow_key_file) {
-        Ok(k) => {
-            info!("OPoI: escrow key loaded from '{}'.", opt.escrow_key_file);
-            Some(k)
-        }
-        Err(e) => {
-            error!("Failed to load/generate OPoI escrow key: {}", e);
-            return Err(e.into());
+    let pool_mode = opt.keryxd_address.starts_with("stratum+tcp://");
+    let escrow_privkey: Option<String> = if pool_mode {
+        None
+    } else {
+        match escrow::load_or_generate_key(&opt.escrow_key_file) {
+            Ok(k) => {
+                info!("OPoI: escrow key loaded from '{}'.", opt.escrow_key_file);
+                Some(k)
+            }
+            Err(e) => {
+                error!("Failed to load/generate OPoI escrow key: {}", e);
+                return Err(e.into());
+            }
         }
     };
 
@@ -1271,20 +1272,13 @@ async fn run() -> Result<(), Error> {
     // spinning reconnect attempts, and the miner never advertises/serves inference it cannot
     // publish. `ensure_daemon` returns only when the API is reachable (waiting up to 60
     // seconds, failing immediately if the child exits).
-    let ipfs_url = opt.ipfs_url.clone();
-    tokio::task::spawn_blocking(move || crate::ipfs::ensure_daemon(&ipfs_url))
-        .await
-        .map_err(|e| format!("IPFS startup task failed: {}", e))??;
-
-    let block_template_ctr = Arc::new(AtomicU16::new((thread_rng().next_u64() % 10_000u64) as u16));
-    if opt.devfund_percent > 0 {
-        info!(
-            "devfund enabled, mining {}.{}% of the time to devfund address: {} ",
-            opt.devfund_percent / 100,
-            opt.devfund_percent % 100,
-            opt.devfund_address
-        );
+    if !pool_mode {
+        let ipfs_url = opt.ipfs_url.clone();
+        tokio::task::spawn_blocking(move || crate::ipfs::ensure_daemon(&ipfs_url))
+            .await
+            .map_err(|e| format!("IPFS startup task failed: {}", e))??;
     }
+
     loop {
         if shutdown_requested.load(Ordering::Acquire) {
             info!("Shutdown requested, exiting miner main loop");
@@ -1292,7 +1286,6 @@ async fn run() -> Result<(), Error> {
         }
         match client_main(
             &opt,
-            block_template_ctr.clone(),
             &plugin_manager,
             escrow_privkey.clone(),
             escrow_cert.clone(),
