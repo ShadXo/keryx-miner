@@ -678,7 +678,7 @@ fn recovered_escrow_state(api_entries: Vec<ApiEscrowEntry>) -> Result<(escrow::E
             csv_window: escrow::csv_window_for_daa(confirm_daa),
         });
     }
-    Ok((escrow::EscrowState { entries }, total_sompi))
+    Ok((escrow::EscrowState { entries, journal_seq: 0 }, total_sompi))
 }
 
 async fn client_main(
@@ -714,6 +714,10 @@ async fn client_main(
             info!("Shutdown requested, stopping client listen loop");
             Ok(())
         }
+        _ = wait_for_fatal_gpu_fault() => {
+            error!("Fatal CUDA fault detected; stopping the client so the process can restart with fresh CUDA contexts");
+            Err("fatal CUDA fault — process restart required".into())
+        }
     };
     // Flush funds-critical client state before potentially blocking on worker shutdown.
     let mut flush_error = None;
@@ -746,6 +750,12 @@ async fn wait_for_shutdown(shutdown_requested: Arc<AtomicBool>) {
     }
 }
 
+async fn wait_for_fatal_gpu_fault() {
+    while !crate::miner::fatal_gpu_fault() && !keryx_miner::pom_gpu::fatal_gpu_fault() {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
 /// Tokio async worker count. The miner's async workload is tiny (one gRPC/stratum connection +
 /// a few tasks and timers), so we cap workers instead of spawning one per logical CPU — dozens of
 /// idle executor threads on a many-core rig are pure scheduler overhead. Override with
@@ -763,6 +773,12 @@ fn tokio_blocking_threads() -> Option<usize> {
 }
 
 fn main() -> Result<(), Error> {
+    // Hidden child mode of the startup engine check (see llama_engine::probe_device).
+    let argv: Vec<String> = std::env::args().collect();
+    if let Some(i) = argv.iter().position(|a| a == "--probe-engine-device") {
+        let gpu = argv.get(i + 1).and_then(|s| s.parse().ok()).unwrap_or(0);
+        std::process::exit(keryx_miner::llama_engine::run_device_probe_child(gpu));
+    }
     let mut builder = tokio::runtime::Builder::new_multi_thread();
     builder.worker_threads(tokio_worker_threads()).enable_all();
     if let Some(n) = tokio_blocking_threads() {
@@ -1260,6 +1276,32 @@ async fn run() -> Result<(), Error> {
             return Err(e.into());
         }
     }
+    // A library without kernels for a mining GPU passes the load probe and aborts the process on
+    // the first request; check every mining GPU up front (in a child process) instead.
+    if opt.skip_engine_probe {
+        warn!("Engine device check skipped (--skip-engine-probe).");
+    } else {
+        let mut gpus: Vec<u32> = pom_assignments.iter().map(|(device_id, _, _)| *device_id).collect();
+        gpus.sort_unstable();
+        gpus.dedup();
+        for gpu in gpus {
+            match tokio::task::spawn_blocking(move || keryx_miner::llama_engine::probe_device(gpu as usize)).await {
+                Ok(keryx_miner::llama_engine::DeviceProbe::Ok) => {
+                    info!("GPU {}: inference library verified on this device.", gpu)
+                }
+                Ok(keryx_miner::llama_engine::DeviceProbe::Unknown(why)) => {
+                    warn!("GPU {}: engine device check inconclusive ({}).", gpu, why)
+                }
+                Ok(keryx_miner::llama_engine::DeviceProbe::Unsupported(why)) => {
+                    error!("GPU {}: the inference library cannot run on this device ({}).", gpu, why);
+                    error!("This package has no CUDA kernels for GPU {}: install the release built for this GPU generation.", gpu);
+                    error!("If you are sure this check is wrong, restart with --skip-engine-probe.");
+                    return Err("inference library has no kernels for a mining GPU — cannot start OPoI mining".into());
+                }
+                Err(e) => warn!("GPU {}: engine device check task failed: {}", gpu, e),
+            }
+        }
+    }
     info!("Found plugins: {:?}", plugins);
     info!("Plugins found {} workers", worker_count);
     if worker_count == 0 && opt.num_threads.unwrap_or(0) == 0 {
@@ -1277,6 +1319,55 @@ async fn run() -> Result<(), Error> {
         tokio::task::spawn_blocking(move || crate::ipfs::ensure_daemon(&ipfs_url))
             .await
             .map_err(|e| format!("IPFS startup task failed: {}", e))??;
+    }
+
+    // Solo only: the pool owns the IPFS node in stratum mode.
+    if !pool_mode {
+        let ipfs_url = opt.ipfs_url.clone();
+        tokio::task::spawn_blocking(move || crate::ipfs::verify_public_reachability(&ipfs_url))
+            .await
+            .map_err(|e| format!("IPFS reachability task failed: {}", e))??;
+
+        let ipfs_url = opt.ipfs_url.clone();
+        let shutdown = Arc::clone(&shutdown_requested);
+        tokio::spawn(async move {
+            let interval = crate::ipfs::reachability_recheck_interval();
+            loop {
+                tokio::time::sleep(interval).await;
+                if shutdown.load(Ordering::Acquire) {
+                    break;
+                }
+                let url = ipfs_url.clone();
+                let verdict = tokio::task::spawn_blocking(move || crate::ipfs::verify_public_reachability(&url)).await;
+                match verdict {
+                    Ok(Ok(())) => keryx_miner::slm::set_publishing_blocked(false),
+                    Ok(Err(e)) => {
+                        warn!("{}", e);
+                        keryx_miner::slm::set_publishing_blocked(true);
+                    }
+                    Err(e) => warn!("IPFS reachability recheck task failed: {}", e),
+                }
+            }
+        });
+    }
+
+    {
+        let shutdown = Arc::clone(&shutdown_requested);
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(keryx_miner::slm::probe_tick()).await;
+                if shutdown.load(Ordering::Acquire) {
+                    break;
+                }
+                if let Some(model_id) = keryx_miner::slm::withdrawn_model_due_for_probe() {
+                    if let Err(e) =
+                        tokio::task::spawn_blocking(move || keryx_miner::slm::probe_withdrawn_model(&model_id)).await
+                    {
+                        warn!("SlmEngine: probe task failed: {}", e);
+                    }
+                }
+            }
+        });
     }
 
     loop {
@@ -1305,6 +1396,13 @@ async fn run() -> Result<(), Error> {
         if shutdown_requested.load(Ordering::Acquire) {
             info!("Shutdown requested, skipping reconnect");
             break;
+        }
+        // A sticky CUDA fault outlives every context in this process: only a new process recovers.
+        if crate::miner::fatal_gpu_fault() || keryx_miner::pom_gpu::fatal_gpu_fault() {
+            return Err("fatal CUDA fault — exiting for a clean process restart".into());
+        }
+        if opt.exit_on_disconnect && worker_count > 0 {
+            return Err("client disconnected with GPU workers active — exiting as requested by --exit-on-disconnect".into());
         }
         info!("Client closed, reconnecting");
         tokio::time::sleep(Duration::from_millis(100)).await;

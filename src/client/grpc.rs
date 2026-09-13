@@ -582,7 +582,7 @@ impl KeryxdHandler {
     }
 
     fn try_start_inference(&mut self) {
-        if self.inference_rx.is_some() || self.challenge_inference_rx.is_some() {
+        if self.inference_rx.is_some() || self.challenge_inference_rx.is_some() || keryx_miner::slm::probe_in_flight() {
             return;
         }
         if let Some((stable_id, request_hash, model_id, prompt, max_tokens)) = self.ai_request_queue.pop_front() {
@@ -719,6 +719,19 @@ impl KeryxdHandler {
             Ok(Err(e)) => { warn!("OPoI: IPFS upload failed: {} — AiResponse tx skipped", e); return true; }
             Err(e) => { warn!("OPoI: IPFS spawn_blocking failed: {} — AiResponse tx skipped", e); return true; }
         };
+
+        // Off the submission path: makes the project gateway fetch the response and reports a
+        // node nobody can read from.
+        let probe_cid = crate::ipfs::multihash_to_cid_v0(&cid);
+        tokio::task::spawn_blocking(move || match crate::ipfs::response_is_retrievable(&probe_cid) {
+            crate::ipfs::GatewayProbe::Reachable => {}
+            crate::ipfs::GatewayProbe::NotFound(status) => {
+                warn!("OPoI: gateway refused response CID {} (HTTP {}) — this node's responses may be unreadable", probe_cid, status)
+            }
+            crate::ipfs::GatewayProbe::Undetermined(e) => {
+                warn!("OPoI: gateway could not fetch response CID {} ({}) — check that kubo port 4001 is reachable", probe_cid, e)
+            }
+        });
 
         let challenge_window_end = self.last_known_daa + 1000;
         let response_length = result.split_whitespace().count() as u32;
@@ -939,7 +952,11 @@ impl KeryxdHandler {
                 if keryx_miner::slm::loaded_model_ids().is_empty() {
                     // Throttle to one log per ~200 templates (~every 20s at 10 BPS) to avoid spam.
                     if self.last_known_daa % 200 == 0 {
-                        log::warn!("OPoI: no models ready — mining suspended until model files are available");
+                        if keryx_miner::slm::publishing_blocked() {
+                            log::warn!("OPoI: IPFS node unreachable from the public gateways — mining suspended until it is reachable again (kubo port 4001)");
+                        } else {
+                            log::warn!("OPoI: no models ready — mining suspended until model files are available");
+                        }
                     }
                     self.set_opoi_pause(true);
                     miner.process_block(None).await?;
@@ -1149,10 +1166,12 @@ impl KeryxdHandler {
             },
             // Virtual chain advanced: fetch every added chain block in full. Their coinbases
             // are the only ones that materialize UTXOs, so escrow tracking feeds off this
-            // stream (handle_block gates tracking on is_chain_block). Removed chain blocks
-            // are ignored: entries from reorged-out blocks fail their claims as orphans and
-            // are cleaned up by the existing retry/slash machinery.
+            // stream (handle_block gates tracking on is_chain_block). Entries of removed
+            // chain blocks are purged right away: their coinbase no longer exists.
             Payload::VirtualSelectedParentChainChangedNotification(notif) => {
+                if let Some(watcher) = self.escrow_watcher.as_mut() {
+                    watcher.on_chain_blocks_removed(&notif.removed_chain_block_hashes);
+                }
                 for hash in notif.added_chain_block_hashes {
                     self.client_send(GetBlockRequestMessage { hash, include_transactions: true }).await?;
                 }

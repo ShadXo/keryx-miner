@@ -1,6 +1,6 @@
 [package]
 name = "keryx-miner"
-version = "0.5.4"
+version = "0.5.5"
 edition = "2021"
 license = "MIT/Apache-2.0"
 repository = "https://github.com/keryx-labs/keryx-miner"
@@ -81,7 +81,6 @@ block-celebration = ["dep:soloud"]
 
 [target.'cfg(target_os = "windows")'.dependencies]
 keccak = "0.1"
-kernel32-sys = "0.2"
 win32console = "0.1"
 windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }
 
