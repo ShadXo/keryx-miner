@@ -49,7 +49,7 @@ fn mark_fatal_gpu_fault(device: &str, message: &str) {
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 extern "C-unwind" fn signal_panic(_signal: nix::libc::c_int) {
     // MUST be `extern "C-unwind"`: a plain `extern "C"` handler turns this panic into a
-    // process-wide abort ("panic in a function that cannot unwind") — the OPoI shutdown
+    // process-wide abort ("panic in a function that cannot unwind") — the inference shutdown
     // crash-loop. Unwinding lets a genuinely stuck worker's join() return instead. This
     // is a last resort; the cooperative Close checks below normally let workers exit
     // before this handler ever fires.
@@ -75,7 +75,7 @@ fn trigger_freeze_handler(kill_switch: Arc<AtomicBool>, handle: &MinerHandler) -
     let pthread_handle = handle.as_pthread_t();
     std::thread::spawn(move || {
         // Grace before force-killing a still-busy worker. A resident-model reload after an
-        // OPoI inference can take several seconds; the old 1s deadline nuked those healthy
+        // inference can take several seconds; the old 1s deadline nuked those healthy
         // reloads (and, pre-C-unwind, aborted the whole process). Wait long enough for
         // legitimate work to finish — a genuinely hung thread (e.g. a wedged driver call)
         // is still force-killed once this elapses.
@@ -172,7 +172,7 @@ pub fn get_num_cpus(n_cpus: Option<u16>) -> u16 {
 
 const LOG_RATE: Duration = Duration::from_secs(10);
 const GPU_TELEMETRY_RATE: Duration = Duration::from_secs(10);
-// Number of consecutive all-zero hashrate ticks (outside an OPoI inference pause)
+// Number of consecutive all-zero hashrate ticks (outside an inference pause)
 // tolerated before reporting a real stall. A brief run of zeros is normal — model
 // load/eviction or a gap between block templates — so we wait past this grace window
 // to avoid scary "stalled or crashed" warnings during routine operation.
@@ -316,7 +316,7 @@ impl MinerManager {
                 // A pause we chose says nothing about the node: leave its status alone, or the
                 // header reports it out of sync for the length of every inference.
                 if self.opoi_challenge_active.load(Ordering::Relaxed) {
-                    info!("OPoI work in progress — PoW template suspended, stand by");
+                    info!("Inference in progress — PoW template suspended, stand by");
                 } else {
                     self.stats.set_synced(false);
                     warn!("Keryxd is not synced, skipping current template");
@@ -384,7 +384,7 @@ impl MinerManager {
                     // over the resident weights instead of kHeavyHash. On a winning nonce we build
                     // the proof (host) and submit; the legacy plugin path below is skipped.
                     if matches!(state.as_ref(), Some(s) if s.daa_score >= keryx_miner::pom::pom_activation_daa()) {
-                        // The OPoI gate is raised before inference is spawned. A worker that has
+                        // The inference gate is raised before inference is spawned. A worker that has
                         // not consumed the watch::None pause yet must not start another PoM op.
                         if keryx_miner::pom_gpu::inference_paused() {
                             if let Some(cmd) = block_channel.get_changed()? {
@@ -440,6 +440,7 @@ impl MinerManager {
                         let v3 = daa >= keryx_miner::pom::pom_v3_activation_daa();
                         let v4 = daa >= keryx_miner::pom::pom_v4_activation_daa();
                         let h10 = v4 && daa >= keryx_miner::pom::h10_activation_daa();
+                        let h14 = h10 && daa >= keryx_miner::pom::private_inference_activation_daa();
                         // v3 walks are ~3-4 orders of magnitude heavier per nonce than the hash
                         // walk: small batches keep template latency low at 10 BPS.
                         // The large v4 batch is sized for the tensor-core solver. The classic v4 kernel is several
@@ -452,7 +453,7 @@ impl MinerManager {
                         } else {
                             POM_BATCH
                         };
-                        let found = keryx_miner::pom_gpu::mine(worker_device_id, &pph, time, &target_le, pom_nonce, batch, h3, walk_v2, h5_1, h5_2, v3, v4, h10);
+                        let found = keryx_miner::pom_gpu::mine(worker_device_id, &pph, time, &target_le, pom_nonce, batch, h3, walk_v2, h5_1, h5_2, v3, v4, h10, h14);
                         if keryx_miner::pom_gpu::fatal_gpu_fault() {
                             mark_fatal_gpu_fault(&device_id, "sticky CUDA runtime fault while mining");
                             return Err("fatal CUDA fault during PoM mining".into());
@@ -687,7 +688,7 @@ impl MinerManager {
         stats: Arc<MinerStats>,
     ) {
         let mut last_instant = Instant::now();
-        // Consecutive all-zero ticks while NOT in an OPoI inference pause.
+        // Consecutive all-zero ticks while NOT in an inference pause.
         let mut zero_streak: u32 = 0;
         while !stop.load(Ordering::Acquire) {
             thread::sleep(LOG_RATE);
@@ -729,7 +730,7 @@ impl MinerManager {
             if challenge_active {
                 // PoW is intentionally paused while the GPU runs inference / loads a model.
                 zero_streak = 0;
-                info!("OPoI inference in progress — PoW paused, stand by");
+                info!("Inference in progress — PoW paused, stand by");
             } else {
                 zero_streak = zero_streak.saturating_add(1);
                 if zero_streak >= STALL_GRACE_TICKS {
@@ -740,7 +741,7 @@ impl MinerManager {
                     }
                 } else {
                     // Transient pause (model load/eviction or template gap) — not a crash yet.
-                    info!("PoW paused (OPoI inference / model load) — stand by");
+                    info!("PoW paused (inference / model load) — stand by");
                 }
             }
         }

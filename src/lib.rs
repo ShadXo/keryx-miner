@@ -13,7 +13,7 @@ pub mod pom;
 pub mod pom_gpu;
 pub mod pom_v3;
 pub mod pom_v4;
-pub mod slm;
+pub mod llm;
 pub mod xoshiro256starstar;
 use libloading::{Library, Symbol};
 

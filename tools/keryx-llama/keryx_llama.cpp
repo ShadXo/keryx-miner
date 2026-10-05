@@ -72,6 +72,7 @@ struct KeryxLlama {
     llama_sampler* smpl  = nullptr;
     std::vector<std::string> names; // canonical (byte-lexicographic) order — matches pom.rs
     std::mutex gen_lock;
+    std::string ctx_info;           // "n_ctx=… kv=… flash_attn=…" for the miner log
 };
 
 // llama.cpp/ggml emit a large INFO-level dump on every model load (full tensor list, per-layer
@@ -117,9 +118,24 @@ KERYX_EXPORT KeryxLlama* keryx_llama_load(const char* gguf_path, int gpu, int n_
 
     llama_context_params cp = llama_context_default_params();
     cp.n_ctx = n_ctx > 0 ? n_ctx : 4096;
-    cp.n_batch = std::min(cp.n_batch, cp.n_ctx);
-    cp.n_ubatch = std::min(cp.n_ubatch, std::max(1u, cp.n_ctx / 4));
+    // The logical batch bounds one decode call; the physical one bounds the compute buffers,
+    // which grow with it and not with the context.
+    cp.n_batch = std::min(2048u, cp.n_ctx);
+    cp.n_ubatch = std::min(512u, cp.n_batch);
+    // 8-bit KV cache with flash attention: half the per-token VRAM of f16. Falls back to the
+    // default cache for an architecture the fast path cannot serve.
+    cp.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+    cp.type_k = GGML_TYPE_Q8_0;
+    cp.type_v = GGML_TYPE_Q8_0;
+    const char* kv = "q8_0";
     llama_context* ctx = llama_init_from_model(model, cp);
+    if (!ctx) {
+        cp.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_AUTO;
+        cp.type_k = GGML_TYPE_F16;
+        cp.type_v = GGML_TYPE_F16;
+        kv = "f16";
+        ctx = llama_init_from_model(model, cp);
+    }
     if (!ctx) {
         keryx_set_error("context", "llama_init_from_model failed");
         llama_model_free(model);
@@ -148,12 +164,18 @@ KERYX_EXPORT KeryxLlama* keryx_llama_load(const char* gguf_path, int gpu, int n_
 
     auto* h = new KeryxLlama();
     h->model = model; h->ctx = ctx; h->smpl = smpl;
+    h->ctx_info = "n_ctx=" + std::to_string(llama_n_ctx(ctx)) + " kv=" + kv +
+                  " flash_attn=" + llama_flash_attn_type_name(cp.flash_attn_type) +
+                  " n_batch=" + std::to_string(llama_n_batch(ctx)) + " n_ubatch=" + std::to_string(llama_n_ubatch(ctx));
     for (auto& p : model->tensors_by_name) h->names.push_back(p.first);
     std::sort(h->names.begin(), h->names.end());
     return h;
 }
 
 KERYX_EXPORT size_t keryx_llama_tensor_count(KeryxLlama* h) { return h ? h->names.size() : 0; }
+
+// Context parameters the engine ended up with, for the miner log.
+KERYX_EXPORT const char* keryx_llama_context_info(KeryxLlama* h) { return h ? h->ctx_info.c_str() : ""; }
 
 // Tensor i in CANONICAL order. *is_device = the data pointer is CUDA device memory (walkable
 // in-place); 0 = host memory (the caller uploads its own device copy for the walk).
@@ -197,6 +219,9 @@ KERYX_EXPORT int keryx_llama_tensor_device(KeryxLlama* h, size_t i) {
 #endif
 }
 
+// Returns the bytes written, or -1 (arguments / tokenizer), -2 (prompt longer than the context,
+// detail in keryx_llama_last_error), -3 (prompt decode failed). The prompt is fed in batches of
+// at most n_batch tokens; generation stops when the context is full.
 KERYX_EXPORT int keryx_llama_generate(KeryxLlama* h, const char* prompt, int max_tokens, char* out, int cap) {
     if (!h || !prompt || !out || cap < 2) return -1;
     std::lock_guard<std::mutex> g(h->gen_lock);
@@ -204,14 +229,28 @@ KERYX_EXPORT int keryx_llama_generate(KeryxLlama* h, const char* prompt, int max
 
     std::vector<llama_token> toks(strlen(prompt) + 16);
     int n = llama_tokenize(vocab, prompt, (int32_t)strlen(prompt), toks.data(), (int32_t)toks.size(), true, true);
-    if (n < 0) return -1;
+    if (n <= 0) return -1;
     toks.resize(n);
 
+    const int n_ctx = (int)llama_n_ctx(h->ctx);
+    const int n_batch = std::max(1, (int)llama_n_batch(h->ctx));
+    if (n > n_ctx - 16) {
+        keryx_set_error("prompt", std::to_string(n) + " prompt tokens do not fit the " + std::to_string(n_ctx) + "-token context");
+        return -2;
+    }
+
     llama_memory_clear(llama_get_memory(h->ctx), true);
-    llama_batch batch = llama_batch_get_one(toks.data(), (int32_t)toks.size());
+    // Penalty history must not carry over from earlier requests.
+    llama_sampler_reset(h->smpl);
+    for (int i = 0; i < n; i += n_batch) {
+        llama_batch batch = llama_batch_get_one(toks.data() + i, std::min(n_batch, n - i));
+        if (llama_decode(h->ctx, batch) != 0) {
+            keryx_set_error("decode", "llama_decode failed while reading the prompt");
+            return -3;
+        }
+    }
     int written = 0;
     for (int i = 0; i < max_tokens; i++) {
-        if (llama_decode(h->ctx, batch) != 0) break;
         llama_token tok = llama_sampler_sample(h->smpl, h->ctx, -1);
         if (llama_vocab_is_eog(vocab, tok)) break;
         char piece[256];
@@ -220,7 +259,8 @@ KERYX_EXPORT int keryx_llama_generate(KeryxLlama* h, const char* prompt, int max
         if (written + pn >= cap - 1) break;
         memcpy(out + written, piece, pn);
         written += pn;
-        batch = llama_batch_get_one(&tok, 1);
+        llama_batch batch = llama_batch_get_one(&tok, 1);
+        if (llama_decode(h->ctx, batch) != 0) break;
     }
     out[written] = 0;
     return written;

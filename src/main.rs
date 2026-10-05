@@ -124,7 +124,7 @@ loader_has libcudart.so.12 "$cudart_path"
 
 /// Attempt to install the CUDA runtime libraries inference needs, on a Debian/Ubuntu host (HiveOS).
 ///
-/// OPoI GPU inference (the in-process llama engine) needs cuBLAS/cuBLASLt; cuRAND is kept for
+/// GPU inference (the in-process llama engine) needs cuBLAS/cuBLASLt; cuRAND is kept for
 /// compatibility. These ship with the CUDA toolkit but not with the bare NVIDIA
 /// driver that mining rigs usually have. Rather than forcing miners to run apt by hand, we add
 /// the NVIDIA CUDA repo and install `libcublas-12-2` (cuBLAS + cuBLASLt) and `libcurand-12-2`
@@ -375,7 +375,7 @@ fn check_gpu_power_limit(needs_high: bool, needs_very_high: bool) {
     let tier_label = if needs_very_high {
         "4 (Kimi-Linear-48B)"
     } else if needs_high {
-        "3 (Qwen3.6-27B)"
+        "3 (Qwen3.6/3.8-27B)"
     } else {
         "≤2"
     };
@@ -764,7 +764,7 @@ fn tokio_worker_threads() -> usize {
     std::env::var("KERYX_ASYNC_WORKERS").ok().and_then(|s| s.parse::<usize>().ok()).unwrap_or(2).clamp(1, 8)
 }
 
-/// Optional cap for the `spawn_blocking` pool (SLM inference, IPFS upload, model prefetch). Only
+/// Optional cap for the `spawn_blocking` pool (LLM inference, IPFS upload, model prefetch). Only
 /// applied when KERYX_BLOCKING_THREADS is set: the blocking pool spawns lazily and idles out, so
 /// tokio's default costs nothing at rest and capping it low would bottleneck parallel multi-model
 /// prefetch on multi-GPU rigs.
@@ -1005,6 +1005,7 @@ async fn run() -> Result<(), Error> {
         {
             Ok(Some(daa)) => {
                 info!("Node at DAA {}.", daa);
+                keryx_miner::llm::note_chain_daa(daa);
                 Some(daa)
             }
             _ => {
@@ -1016,18 +1017,18 @@ async fn run() -> Result<(), Error> {
         None
     };
 
-    // Resolve OPoI escrow private key (once, before the reconnect loop).
+    // Resolve escrow private key (once, before the reconnect loop).
     let pool_mode = opt.keryxd_address.starts_with("stratum+tcp://");
     let escrow_privkey: Option<String> = if pool_mode {
         None
     } else {
         match escrow::load_or_generate_key(&opt.escrow_key_file) {
             Ok(k) => {
-                info!("OPoI: escrow key loaded from '{}'.", opt.escrow_key_file);
+                info!("Escrow key loaded from '{}'.", opt.escrow_key_file);
                 Some(k)
             }
             Err(e) => {
-                error!("Failed to load/generate OPoI escrow key: {}", e);
+                error!("Failed to load/generate escrow key: {}", e);
                 return Err(e.into());
             }
         }
@@ -1111,13 +1112,13 @@ async fn run() -> Result<(), Error> {
         _ => None,
     };
 
-    // Phase-3 OPoI / PoM: load inference models before mining starts. Under PoM each tier
+    // PoM: load inference models before mining starts. Under PoM each tier
     // mines AND serves exactly ONE model (1 GPU = 1 tier); multi-tier coverage is a network
     // property, not a per-GPU one.
     //   --very-light → Qwen3.5-9B-abliterated
     //   --light      → GLM-4-9B
     //   (no flag)    → the highest tier this GPU's VRAM holds, per card (NOT a fixed tier 2)
-    //   --high       → Qwen3.6-27B
+    //   --high       → Qwen3.6-27B, Qwen3.8-27B from H14
     //   --very-high  → Kimi-Linear-48B
     // The flags are a ceiling, not a selection: `assign_pom_tiers` picks the largest tier ≤ the
     // flag that fits each card, so a 24 GB card under no flag takes tier 3, not tier 2.
@@ -1181,15 +1182,15 @@ async fn run() -> Result<(), Error> {
     }
     // The served/announced lineup (ai:cap) = the current-era models across all GPUs.
     let specs = lineup_from_assignments(&pom_assignments, tier);
-    keryx_miner::slm::init_supported(specs);
-    log::debug!("OPoI Phase-3 active — {} model(s) staged.", specs.len());
+    keryx_miner::llm::init_supported(specs);
+    log::debug!("Inference active — {} model(s) staged.", specs.len());
     // Where the chain actually is, so the eras it has already left are not downloaded. Bounded and
     // fail-open: an unreachable node (or pool mining) just falls back to prefetching every era.
     // Prefetch every era this miner can still reach, so a crossing ahead of us hot-swaps without a
     // mid-run download stall. Block until every such model is downloaded before mining: never start
     // hashing while a model is still downloading.
     let prefetch_specs = prefetch_lineup_from_assignments(&pom_assignments, tier, chain_daa);
-    match tokio::task::spawn_blocking(move || keryx_miner::slm::prefetch_models(prefetch_specs)).await {
+    match tokio::task::spawn_blocking(move || keryx_miner::llm::prefetch_models(prefetch_specs)).await {
         Ok(Ok(())) => info!("Model files ready ({}) — starting mining.", prefetch_specs.len()),
         Ok(Err(e)) => {
             error!("Model prefetch failed — refusing to mine without the lineup: {}", e);
@@ -1208,7 +1209,7 @@ async fn run() -> Result<(), Error> {
         // this binary refuses to mine pre-H4 blocks), so only the model is recorded here. The
         // fixed hardware tier is recorded too, so the H5 era crossing can hot-swap tier 0's model.
         for (device_id, gpu_tier, spec) in &pom_assignments {
-            let gpath = keryx_miner::slm::gguf_path_for(spec).to_string_lossy().into_owned();
+            let gpath = keryx_miner::llm::gguf_path_for(spec).to_string_lossy().into_owned();
             keryx_miner::pom_gpu::set_mining_tier(*device_id, spec.model_id, gpath);
             keryx_miner::pom_gpu::set_device_tier(*device_id, *gpu_tier);
             info!(
@@ -1218,24 +1219,24 @@ async fn run() -> Result<(), Error> {
         }
     }
 
-    // Verify GPU inference works before mining. OPoI challenges are mandatory, so a miner
+    // Verify GPU inference works before mining. inference challenges are mandatory, so a miner
     // that cannot run inference must fail fast with a clear message rather than spam panics.
     info!("Probing GPU inference (cuBLAS + llama engine) before mining…");
-    match tokio::task::spawn_blocking(keryx_miner::slm::probe_gpu_inference).await {
-        Ok(keryx_miner::slm::GpuProbe::Ok) => {
+    match tokio::task::spawn_blocking(keryx_miner::llm::probe_gpu_inference).await {
+        Ok(keryx_miner::llm::GpuProbe::Ok) => {
             info!("GPU inference verified — cuBLAS and the llama engine loaded successfully.")
         }
-        Ok(keryx_miner::slm::GpuProbe::NoCuda) => {
-            error!("No CUDA device detected — OPoI inference is GPU-only and is mandatory, cannot mine.");
-            return Err("No CUDA device — cannot start OPoI mining".into());
+        Ok(keryx_miner::llm::GpuProbe::NoCuda) => {
+            error!("No CUDA device detected — Inference is GPU-only and is mandatory, cannot mine.");
+            return Err("No CUDA device — cannot start mining".into());
         }
-        Ok(keryx_miner::slm::GpuProbe::EngineMissing(why)) => {
+        Ok(keryx_miner::llm::GpuProbe::EngineMissing(why)) => {
             error!("Inference engine unavailable: {}", why);
-            error!("OPoI inference is mandatory: mining without it would answer no request at all.");
+            error!("Inference is mandatory: mining without it would answer no request at all.");
             error!("Restore the library shipped with this release next to the miner binary, then restart.");
-            return Err("llama inference engine unavailable — cannot start OPoI mining".into());
+            return Err("llama inference engine unavailable — cannot start mining".into());
         }
-        Ok(keryx_miner::slm::GpuProbe::CublasMissing) => {
+        Ok(keryx_miner::llm::GpuProbe::CublasMissing) => {
             warn!("CUDA GPU detected but a CUDA runtime lib is missing — installing them automatically (one-time)…");
             #[cfg(target_os = "linux")]
             {
@@ -1243,21 +1244,21 @@ async fn run() -> Result<(), Error> {
                 if !installed {
                     error!("Automatic CUDA lib install failed — install them manually then restart:");
                     error!("  apt-get install -y libcublas-12-2 libcurand-12-2 cuda-cudart-12-2");
-                    return Err("CUDA runtime libs missing — cannot start OPoI mining".into());
+                    return Err("CUDA runtime libs missing — cannot start mining".into());
                 }
                 // Re-probe in-process. The dynamic loader may still hold a stale cache, so if
                 // the freshly-installed libs aren't picked up here, exit cleanly and let the
                 // supervisor (HiveOS/PM2) relaunch us with a fresh loader cache.
-                match tokio::task::spawn_blocking(keryx_miner::slm::probe_gpu_inference).await {
-                    Ok(keryx_miner::slm::GpuProbe::Ok) => {
+                match tokio::task::spawn_blocking(keryx_miner::llm::probe_gpu_inference).await {
+                    Ok(keryx_miner::llm::GpuProbe::Ok) => {
                         info!("CUDA libs installed — GPU inference verified, starting mining.");
                     }
                     // Restarting cannot conjure a library that is not on disk; fail here rather
                     // than hand the supervisor a restart loop.
-                    Ok(keryx_miner::slm::GpuProbe::EngineMissing(why)) => {
+                    Ok(keryx_miner::llm::GpuProbe::EngineMissing(why)) => {
                         error!("CUDA libs installed, but the inference engine is unavailable: {}", why);
                         error!("Restore the library shipped with this release next to the miner binary, then restart.");
-                        return Err("llama inference engine unavailable — cannot start OPoI mining".into());
+                        return Err("llama inference engine unavailable — cannot start mining".into());
                     }
                     _ => {
                         info!("CUDA libs installed successfully — restarting miner to activate them.");
@@ -1268,7 +1269,7 @@ async fn run() -> Result<(), Error> {
             #[cfg(not(target_os = "linux"))]
             {
                 error!("CUDA GPU detected but a CUDA runtime lib failed to load — install the CUDA 12.6 toolkit and restart.");
-                return Err("CUDA runtime libs missing — cannot start OPoI mining".into());
+                return Err("CUDA runtime libs missing — cannot start mining".into());
             }
         }
         Err(e) => {
@@ -1296,7 +1297,7 @@ async fn run() -> Result<(), Error> {
                     error!("GPU {}: the inference library cannot run on this device ({}).", gpu, why);
                     error!("This package has no CUDA kernels for GPU {}: install the release built for this GPU generation.", gpu);
                     error!("If you are sure this check is wrong, restart with --skip-engine-probe.");
-                    return Err("inference library has no kernels for a mining GPU — cannot start OPoI mining".into());
+                    return Err("inference library has no kernels for a mining GPU — cannot start mining".into());
                 }
                 Err(e) => warn!("GPU {}: engine device check task failed: {}", gpu, e),
             }
@@ -1314,56 +1315,26 @@ async fn run() -> Result<(), Error> {
     // spinning reconnect attempts, and the miner never advertises/serves inference it cannot
     // publish. `ensure_daemon` returns only when the API is reachable (waiting up to 60
     // seconds, failing immediately if the child exits).
-    if !pool_mode {
+    if !pool_mode && !keryx_miner::llm::inline_answers() {
         let ipfs_url = opt.ipfs_url.clone();
         tokio::task::spawn_blocking(move || crate::ipfs::ensure_daemon(&ipfs_url))
             .await
             .map_err(|e| format!("IPFS startup task failed: {}", e))??;
     }
 
-    // Solo only: the pool owns the IPFS node in stratum mode.
-    if !pool_mode {
-        let ipfs_url = opt.ipfs_url.clone();
-        tokio::task::spawn_blocking(move || crate::ipfs::verify_public_reachability(&ipfs_url))
-            .await
-            .map_err(|e| format!("IPFS reachability task failed: {}", e))??;
-
-        let ipfs_url = opt.ipfs_url.clone();
-        let shutdown = Arc::clone(&shutdown_requested);
-        tokio::spawn(async move {
-            let interval = crate::ipfs::reachability_recheck_interval();
-            loop {
-                tokio::time::sleep(interval).await;
-                if shutdown.load(Ordering::Acquire) {
-                    break;
-                }
-                let url = ipfs_url.clone();
-                let verdict = tokio::task::spawn_blocking(move || crate::ipfs::verify_public_reachability(&url)).await;
-                match verdict {
-                    Ok(Ok(())) => keryx_miner::slm::set_publishing_blocked(false),
-                    Ok(Err(e)) => {
-                        warn!("{}", e);
-                        keryx_miner::slm::set_publishing_blocked(true);
-                    }
-                    Err(e) => warn!("IPFS reachability recheck task failed: {}", e),
-                }
-            }
-        });
-    }
-
     {
         let shutdown = Arc::clone(&shutdown_requested);
         tokio::spawn(async move {
             loop {
-                tokio::time::sleep(keryx_miner::slm::probe_tick()).await;
+                tokio::time::sleep(keryx_miner::llm::probe_tick()).await;
                 if shutdown.load(Ordering::Acquire) {
                     break;
                 }
-                if let Some(model_id) = keryx_miner::slm::withdrawn_model_due_for_probe() {
+                if let Some(model_id) = keryx_miner::llm::withdrawn_model_due_for_probe() {
                     if let Err(e) =
-                        tokio::task::spawn_blocking(move || keryx_miner::slm::probe_withdrawn_model(&model_id)).await
+                        tokio::task::spawn_blocking(move || keryx_miner::llm::probe_withdrawn_model(&model_id)).await
                     {
-                        warn!("SlmEngine: probe task failed: {}", e);
+                        warn!("LlmEngine: probe task failed: {}", e);
                     }
                 }
             }

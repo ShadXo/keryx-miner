@@ -246,7 +246,9 @@ impl State {
         // v4: re-walk era — the winning nonce is re-walked on the host (reading tiles from the
         // canonical index) and the proof carries those tiles + Merkle range proofs.
         if self.daa_score >= pom::pom_v4_activation_daa() {
-            let seed_v4 = if self.daa_score >= pom::h10_activation_daa() {
+            let seed_v4 = if self.daa_score >= pom::private_inference_activation_daa() {
+                pom::pom_block_seed_h14(&pph, timestamp, nonce)
+            } else if self.daa_score >= pom::h10_activation_daa() {
                 pom::pom_block_seed_h10(&pph, timestamp, nonce)
             } else {
                 pom::pom_block_seed_v4(&pph, timestamp, nonce)

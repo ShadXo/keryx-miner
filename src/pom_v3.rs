@@ -424,12 +424,9 @@ mod tests {
             v4: None,
         };
         let bytes = with_v3.to_wire_bytes();
-        // A v3-but-not-v4 proof goes out in the PreV4 layout, NOT the full struct: adding the
-        // trailing v4 discriminant would change the bytes a v3-era proof puts on the wire. Borsh
-        // is not self-describing, so the full PomProof cannot decode a stream that ends one field
-        // early -- asserting it could (as this did before v4 was introduced) fails against a
-        // correct encoder.
+        // A v3 proof travels in the pre-v4 layout: the v4-aware and pre-v3 layouts both reject it.
         assert!(borsh::from_slice::<crate::pom::PomProofPreV4>(&bytes).is_ok());
+        assert!(borsh::from_slice::<crate::pom::PomProof>(&bytes).is_err());
         assert!(borsh::from_slice::<crate::pom::PomProofPreV3>(&bytes).is_err());
 
         // Without v3 the wire re-encodes through the pre-H6 layout byte-identically.
