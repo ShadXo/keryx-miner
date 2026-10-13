@@ -129,3 +129,27 @@ At startup, look for PoM logs that show per-GPU selection, for example:
 - `startup loaded legacy fatbin`
 
 If fatbins are not available/compatible on a card, runtime falls back to the PoM PTX ladder.
+
+## v4 Walk Kernels and Autotune
+
+Each card picks its v4 walk and batch on the first v4 launch and caches the result in
+`~/.keryx/v4tune.json` (`%USERPROFILE%\.keryx\v4tune.json` on Windows), keyed by GPU, model
+layout, seed era, override policy and miner version. Candidates: `chase+tensor-core`,
+`chaseless`, and on sm_80–sm_11x the two sidecar walks (`sidecar-chase+tensor-core`,
+`sidecar-chase+addr-tensor-core`), which need `pom_build_v4_snippet_folds`,
+`pom_build_v4_tile_addrs`, `pom_mine_v4_chase_sidecar` and `pom_mine_v4_tc_addr` in the loaded
+image. Fatbins built before those kernels lack them, so the sidecar walks stay off until both
+fatbins are regenerated. Every candidate must match the classic walk on a startup probe before
+it may mine; a sidecar must also beat the best established walk by 2%.
+
+| Variable | Effect |
+|---|---|
+| `KERYX_POM_V4_AUTOTUNE=0` | No tuning: chaseless (GDDR) or chase+tc (HBM), SM-derived batch |
+| `KERYX_POM_V4_AUTOTUNE=force` | Ignore the disk cache and re-measure |
+| `KERYX_POM_V4_BATCH=<n>` | Fixed batch, no tuning |
+| `KERYX_POM_V4_TC=0` | Classic walk only |
+| `KERYX_POM_V4_NCF=0` / `=1` | Exclude / force the chaseless walk |
+| `KERYX_POM_V4_SIDECAR=0` / `=1` | Exclude the sidecar walks / allow them on sm_12x+ too |
+
+The probe and the walks can be checked on a card with
+`cargo test --release -- --ignored v4_backend`.

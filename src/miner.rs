@@ -381,9 +381,9 @@ impl MinerManager {
                 const POM_BATCH: u64 = 1 << 20;
                 const POM_V3_BATCH: u64 = 512;
                 const POM_V4_BATCH_UNSIZED: u64 = 32768;
-                // Env override follows the ocminer (suprnova) fork; default scales with the card.
-                // Sized at the first v4 launch, once the model is resident and free VRAM is real.
-                let mut pom_v4_batch = std::env::var("KERYX_POM_V4_BATCH").ok()
+                // Env override follows the ocminer (suprnova) fork and skips the autotune; otherwise
+                // the card tunes its walk and batch at the first v4 launch, once the model is resident.
+                let pom_v4_batch_env = std::env::var("KERYX_POM_V4_BATCH").ok()
                     .and_then(|s| s.trim().parse::<u64>().ok()).filter(|&b| b > 0);
                 let pom_proof_overlap = std::env::var("KERYX_POM_PROOF_OVERLAP").ok().as_deref() != Some("0");
                 let inflight_proofs = Arc::new(AtomicUsize::new(0));
@@ -466,18 +466,12 @@ impl MinerManager {
                         let h14 = h10 && daa >= keryx_miner::pom::private_inference_activation_daa();
                         // v3 walks are ~3-4 orders of magnitude heavier per nonce than the hash
                         // walk: small batches keep template latency low at 10 BPS.
-                        if v4 && pom_v4_batch.is_none() {
-                            pom_v4_batch = keryx_miner::pom_gpu::v4_batch_for_device(worker_device_id);
-                        }
-                        // The large v4 batch is sized for the tensor-core solver. The classic v4 kernel is several
-                        // times heavier per nonce, so on a card that falls back to it the same batch would
-                        // overrun the ~100 ms block time and cost more in stale templates than it saves.
+                        // The tuned v4 batch is a cached lookup after the first call per model and
+                        // seed era; a card on the classic walk gets a small one (see pom_gpu).
                         let batch = if v4 {
-                            if keryx_miner::pom_gpu::v4_tc_active(worker_device_id) {
-                                pom_v4_batch.unwrap_or(POM_V4_BATCH_UNSIZED)
-                            } else {
-                                POM_V3_BATCH * 8
-                            }
+                            pom_v4_batch_env
+                                .or_else(|| keryx_miner::pom_gpu::v4_batch_for_device(worker_device_id, h10))
+                                .unwrap_or(POM_V4_BATCH_UNSIZED)
                         } else if v3 {
                             POM_V3_BATCH
                         } else {
