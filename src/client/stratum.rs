@@ -445,9 +445,9 @@ impl StratumHandler {
                                 return miner.process_block(None).await;
                             }
                             let target = effective_target(self.target_pool, job.block_bits)?;
-                            if self.challenge_in_flight.load(Ordering::SeqCst) {
-                                return miner.process_block(None).await;
-                            }
+                            // No longer dropped while an inference is in flight: only the card
+                            // serving it is paused (inside llm::load_and_run_inference), and every
+                            // other card keeps mining fresh pool jobs.
                             if let Some(task_json) = job.task_json {
                                 // The task path publishes plaintext answers to IPFS; from the
                                 // private-inference gate on only the pool can build an answer.
@@ -614,11 +614,9 @@ impl StratumHandler {
             warn!("AI request {}: inference is busy", request.task_id);
             return;
         }
+        // Marks the inference as running (status bar, stall watchdog). Mining is not paused here:
+        // the serving card pauses itself inside load_and_run_inference, the rest keep hashing.
         let guard = InferenceGuard::new(miner.opoi_challenge_flag(), self.challenge_in_flight.clone());
-        if let Err(error) = miner.process_block(None).await {
-            warn!("Could not pause mining for AI request: {}", error);
-            return;
-        }
         let sender = self.send_channel.clone();
         let worker = self.miner_address.clone();
         let pending = self.ai_response.clone();

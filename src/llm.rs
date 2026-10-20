@@ -848,6 +848,11 @@ pub fn load_and_run_inference(model_id: &[u8; 32], prompt: &str, max_tokens: usi
     // GPU pauses PoW and the walk shares the resident weights (zero-dup). Falls back to device 0
     // (single-GPU / unassigned model).
     let dev_id = crate::pom_gpu::device_for_model(model_id).unwrap_or(0);
+    // Pause PoM on the serving card only, for the whole request (load included); every other card
+    // keeps mining. Raised before the load below evicts this card's miner, so its walk can neither
+    // run nor rebuild over weights llama is about to free. Requests, challenges and probes all
+    // come through here, so each of them holds the card.
+    let _paused = crate::pom_gpu::pause_for_inference(dev_id);
     let gguf = gguf_path_for(spec).to_string_lossy().into_owned();
 
     if !crate::llama_engine::active_for(&gguf, dev_id as usize) {

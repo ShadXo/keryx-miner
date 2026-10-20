@@ -407,9 +407,11 @@ impl MinerManager {
                     // over the resident weights instead of kHeavyHash. On a winning nonce we build
                     // the proof (host) and submit; the legacy plugin path below is skipped.
                     if matches!(state.as_ref(), Some(s) if s.daa_score >= keryx_miner::pom::pom_activation_daa()) {
-                        // The inference gate is raised before inference is spawned. A worker that has
-                        // not consumed the watch::None pause yet must not start another PoM op.
-                        if keryx_miner::pom_gpu::inference_paused() {
+                        // Only the card serving an inference stands still (its pause is raised before
+                        // its miner is evicted); the others keep mining. It keeps taking new templates
+                        // meanwhile, so it resumes on a fresh one. Slept rather than spun: a request
+                        // can last tens of seconds, and a spin would hold a CPU core for all of it.
+                        if keryx_miner::pom_gpu::inference_paused_for(worker_device_id) {
                             if let Some(cmd) = block_channel.get_changed()? {
                                 state = match cmd {
                                     Some(WorkerCommand::Job(ns)) => Some(ns),
@@ -417,7 +419,7 @@ impl MinerManager {
                                     None => None,
                                 };
                             }
-                            std::thread::yield_now();
+                            std::thread::sleep(std::time::Duration::from_millis(10));
                             continue;
                         }
                         let (pph, time, target_le, daa) = {

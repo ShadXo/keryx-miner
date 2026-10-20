@@ -12,7 +12,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::ffi::{c_void, CString};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Once, OnceLock};
 
 use anyhow::{anyhow, Result};
@@ -1670,7 +1670,7 @@ impl PomGpuMiner {
             self.v4_release_sidecar(default.backend);
             return (default, true);
         }
-        if inference_paused() {
+        if inference_paused_for(device_id) {
             return (default, false);
         }
 
@@ -1752,7 +1752,7 @@ impl PomGpuMiner {
             kinds[0]
         } else {
             let cands: Vec<V4Tune> = kinds.iter().map(|&backend| V4Tune { backend, batch: base }).collect();
-            let Some(mhs) = self.v4_bench_all(&cands, h10)? else {
+            let Some(mhs) = self.v4_bench_all(device_id, &cands, h10)? else {
                 return Ok(None);
             };
             let rates: Vec<(V4Backend, f64)> = kinds.iter().copied().zip(mhs).collect();
@@ -1770,7 +1770,7 @@ impl PomGpuMiner {
         batches.dedup();
         batches.retain(|&b| b == base || Self::v4_batch_fits(kind, b, free_mib));
         let cands: Vec<V4Tune> = batches.iter().map(|&batch| V4Tune { backend: kind, batch }).collect();
-        let Some(mhs) = self.v4_bench_all(&cands, h10)? else {
+        let Some(mhs) = self.v4_bench_all(device_id, &cands, h10)? else {
             return Ok(None);
         };
         let rates: Vec<(u64, f64)> = batches.iter().copied().zip(mhs).collect();
@@ -1784,11 +1784,11 @@ impl PomGpuMiner {
 
     /// Median Mh/s of each candidate over interleaved rounds, so slow drift (clocks ramping, a
     /// neighbour's load) hits every candidate alike. None if an inference started meanwhile.
-    fn v4_bench_all(&self, cands: &[V4Tune], h10: bool) -> Result<Option<Vec<f64>>> {
+    fn v4_bench_all(&self, device_id: u32, cands: &[V4Tune], h10: bool) -> Result<Option<Vec<f64>>> {
         let mut samples: Vec<Vec<f64>> = vec![Vec::with_capacity(POM_V4_TUNE_ROUNDS); cands.len()];
         for _ in 0..POM_V4_TUNE_ROUNDS {
             for (c, s) in cands.iter().zip(samples.iter_mut()) {
-                if inference_paused() {
+                if inference_paused_for(device_id) {
                     return Ok(None);
                 }
                 s.push(self.v4_bench(*c, h10)?);
@@ -1910,6 +1910,69 @@ pub fn inference_paused() -> bool {
     INFERENCE_PAUSED.load(Ordering::Acquire)
 }
 
+/// Per-GPU inference pause: bit `n` is set while GPU `n` serves an inference. Only that card's
+/// walk stands still; every other card keeps mining fresh templates (approach of the ocminer
+/// (suprnova) fork). Devices past 63 are tracked in `inference_pause_counts` alone.
+static INFERENCE_PAUSED_MASK: AtomicU64 = AtomicU64::new(0);
+
+/// Nesting count per paused device, so overlapping requests on one card (a request and a probe)
+/// keep it paused until the last one ends.
+fn inference_pause_counts() -> &'static Mutex<HashMap<u32, usize>> {
+    static COUNTS: OnceLock<Mutex<HashMap<u32, usize>>> = OnceLock::new();
+    COUNTS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn set_inference_paused_on(device_id: u32, paused: bool) {
+    let mut counts = inference_pause_counts().lock().unwrap_or_else(|p| p.into_inner());
+    let count = counts.entry(device_id).or_insert(0);
+    *count = if paused { count.saturating_add(1) } else { count.saturating_sub(1) };
+    let now_paused = *count > 0;
+    if !now_paused {
+        counts.remove(&device_id);
+    }
+    if device_id < 64 {
+        let bit = 1u64 << device_id;
+        if now_paused {
+            INFERENCE_PAUSED_MASK.fetch_or(bit, Ordering::AcqRel);
+        } else {
+            INFERENCE_PAUSED_MASK.fetch_and(!bit, Ordering::AcqRel);
+        }
+    }
+}
+
+/// Whether `device_id` must hold off every PoM operation now: the global pause, or its own.
+///
+/// A crash guard as much as a throughput one: on an inference card the walk can gather zero-dup
+/// over llama's resident weights, so a walk that runs or rebuilds while llama frees or reloads
+/// them reads freed VRAM — a sticky CUDA_ERROR_ILLEGAL_ADDRESS that poisons the context.
+pub fn inference_paused_for(device_id: u32) -> bool {
+    if inference_paused() {
+        return true;
+    }
+    if device_id < 64 {
+        INFERENCE_PAUSED_MASK.load(Ordering::Acquire) & (1u64 << device_id) != 0
+    } else {
+        inference_pause_counts().lock().map_or(false, |c| c.contains_key(&device_id))
+    }
+}
+
+/// Holds `device_id` paused for inference until dropped.
+pub struct InferencePause(u32);
+
+impl Drop for InferencePause {
+    fn drop(&mut self) {
+        set_inference_paused_on(self.0, false);
+    }
+}
+
+/// Pauses PoM on `device_id` alone for the life of the returned guard. Raise it BEFORE the
+/// device's miner is evicted for an inference load: PAUSE -> DRAIN (`uninstall`'s barrier) ->
+/// SWAP -> GENERATE -> RESUME, with the walk unable to restart or rebuild in between.
+pub fn pause_for_inference(device_id: u32) -> InferencePause {
+    set_inference_paused_on(device_id, true);
+    InferencePause(device_id)
+}
+
 /// Set once a CUDA fault that outlives the context is seen; the process must restart to recover.
 static FATAL_GPU_FAULT: AtomicBool = AtomicBool::new(false);
 
@@ -1935,7 +1998,7 @@ pub fn is_loading() -> bool {
 /// Convenience: search a nonce batch via the installed miner for a specific device.
 #[allow(clippy::too_many_arguments)]
 pub fn mine(device_id: u32, pre_pow_hash: &[u8; 32], timestamp: u64, target_le: &[u8; 32], start: u64, batch: u64, h3: bool, walk_v2: bool, h5_1: bool, h5_2: bool, v3: bool, v4: bool, seed_h10: bool, seed_h14: bool) -> Option<u64> {
-    if inference_paused() {
+    if inference_paused_for(device_id) {
         return None;
     }
     let miner = {
@@ -1958,7 +2021,7 @@ pub fn mine(device_id: u32, pre_pow_hash: &[u8; 32], timestamp: u64, target_le: 
 
 /// Convenience: v3 dump for the winning nonce via the installed miner for a specific device.
 pub fn dump_v3(device_id: u32, pre_pow_hash: &[u8; 32], timestamp: u64, nonce: u64, h3: bool, h5_1: bool, h5_2: bool) -> Option<(Vec<u8>, Vec<u8>, u64)> {
-    if inference_paused() {
+    if inference_paused_for(device_id) {
         return None;
     }
     let miner = {
@@ -2015,6 +2078,11 @@ pub fn advance_mining_tier_if_due(daa: u64) {
     };
     let mut swapped = false;
     for &(dev, tier) in &devices {
+        // A card serving an inference keeps its model until the request ends; it crosses over on a
+        // later tick. Swapping now would free the weights the generation is reading.
+        if inference_paused_for(dev) {
+            continue;
+        }
         // No model for this tier in the era being entered: nothing to swap to, the device simply
         // has nothing valid to mine until its own gate.
         let Some(spec) = crate::models::pom_model_for_tier(daa, tier) else { continue };
@@ -2188,7 +2256,7 @@ pub fn load_llama_for_inference(gguf: &str, target_dev: u32) -> Result<u64, crat
 /// inference has priority, so mining reloads its model when it next gets the GPU. Returns true if
 /// the miner is ready to mine.
 pub fn ensure_installed(device_id: u32, daa: u64) -> bool {
-    if inference_paused() {
+    if inference_paused_for(device_id) {
         return false;
     }
     if mining_model_id(device_id).is_some_and(|m| crate::llm::model_is_unavailable(&m)) {
@@ -2357,7 +2425,7 @@ fn is_sticky_gpu_runtime_fault(err: &str) -> bool {
 fn ensure_installed_inner(device_id: u32, daa: u64) -> bool {
     // Re-check under the per-device lifecycle lock: a worker that queued on the lock before the
     // pause was raised must not reload the mining model while inference is still generating.
-    if inference_paused() {
+    if inference_paused_for(device_id) {
         return false;
     }
     let (model_id, gguf) = match mining_tiers().lock().ok().and_then(|g| g.get(&device_id).cloned()) {
@@ -2782,6 +2850,33 @@ mod v3_kernel_tests {
         let proof = pom_v3::build_proof_v3(0, &PPH, found, seed, &states, &snippets, &index).unwrap();
         assert_eq!(pom_v3::fold64(&proof.roots[pom_v3::POM_V3_K]), final_state);
         assert!(pom_v3::verify_proof_v3(&PPH, found, seed, &proof, &index.r_t, index.n_chunks));
+    }
+}
+
+#[cfg(test)]
+mod inference_pause_tests {
+    use super::*;
+
+    // Device ids no other test uses: the pause state is process-global.
+    #[test]
+    fn inference_pause_holds_only_the_serving_card_and_nests() {
+        let (serving, other, far) = (40u32, 41u32, 100u32);
+        assert!(!inference_paused_for(serving) && !inference_paused_for(other));
+
+        let request = pause_for_inference(serving);
+        assert!(inference_paused_for(serving));
+        assert!(!inference_paused_for(other), "every other card keeps mining");
+
+        let probe = pause_for_inference(serving);
+        drop(request);
+        assert!(inference_paused_for(serving), "an overlapping request keeps the card paused");
+        drop(probe);
+        assert!(!inference_paused_for(serving));
+
+        let beyond_mask = pause_for_inference(far);
+        assert!(inference_paused_for(far));
+        drop(beyond_mask);
+        assert!(!inference_paused_for(far));
     }
 }
 

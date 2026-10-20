@@ -745,8 +745,16 @@ impl KeryxdHandler {
     /// stale. Also suppresses the GPU stall warnings, which a deliberate pause would trip.
     fn set_opoi_pause(&self, paused: bool) {
         keryx_miner::pom_gpu::set_inference_paused(paused);
+        self.set_inference_busy(paused);
+    }
+
+    /// Marks an inference as running without pausing any mining: the card serving it pauses
+    /// itself (`pom_gpu::pause_for_inference`, raised in `llm::load_and_run_inference`) while every
+    /// other card keeps hashing. Drives the status bar's AI state and keeps the stall watchdog quiet
+    /// on a single-GPU rig, whose only card is the one standing still.
+    fn set_inference_busy(&self, busy: bool) {
         if let Some(flag) = &self.opoi_challenge_active {
-            flag.store(paused, Ordering::Relaxed);
+            flag.store(busy, Ordering::Relaxed);
         }
     }
 
@@ -1086,15 +1094,15 @@ impl KeryxdHandler {
                     if !block.transactions.is_empty() {
                         // Full block — scan directly.
                         self.scan_txs_for_ai_requests(&block.transactions, block.header.as_ref().map_or(0, |h| h.daa_score));
-                        // Pause and drain mining BEFORE spawning inference, so no PoM op can
-                        // race the model swap: PAUSE -> DRAIN -> SWAP -> GENERATE -> RESUME.
+                        // The serving card pauses and drains itself before its model swap
+                        // (PAUSE -> DRAIN -> SWAP -> GENERATE -> RESUME, in the inference task);
+                        // the other cards keep mining.
                         if self.inference_rx.is_none()
                             && self.challenge_inference_rx.is_none()
                             && !self.ai_request_queue.is_empty()
                         {
-                            self.set_opoi_pause(true);
-                            miner.process_block(None).await?;
                             self.try_start_inference();
+                            self.set_inference_busy(self.inference_rx.is_some());
                         }
                         // Escrow: check for new escrow UTXOs and mature claims.
                         let claim_tx = self.escrow_watcher.as_mut().and_then(|w| w.handle_block(&block));
@@ -1205,19 +1213,14 @@ impl KeryxdHandler {
                     && self.challenge_inference_rx.is_none()
                     && !self.ai_request_queue.is_empty()
                 {
-                    self.set_opoi_pause(true);
-                    miner.process_block(None).await?;
                     self.try_start_inference();
                 }
-                // Pause GPU mining while any inference is in flight (GPU is occupied by the model).
-                // This covers both regular AiRequest inference and node-issued challenge inference.
-                if self.inference_rx.is_some() || self.challenge_inference_rx.is_some() {
-                    self.set_opoi_pause(true);
-                    miner.process_block(None).await?;
-                    return Ok(());
-                }
-                // Past this point any pause comes from the node, not from us.
+                // An inference in flight no longer holds the template back: only the card serving
+                // it is paused, and every other card keeps mining this fresh template.
+                let inference_busy = self.inference_rx.is_some() || self.challenge_inference_rx.is_some();
+                // Past this point any global pause comes from the node, not from us.
                 self.set_opoi_pause(false);
+                self.set_inference_busy(inference_busy);
                 match (template.block, template.is_synced, template.error) {
                     (Some(b), true, None) => miner.process_block(Some(FullBlock {
                         block: Box::new(b),
@@ -1274,9 +1277,8 @@ impl KeryxdHandler {
                             && self.challenge_inference_rx.is_none()
                             && !self.ai_request_queue.is_empty()
                         {
-                            self.set_opoi_pause(true);
-                            miner.process_block(None).await?;
                             self.try_start_inference();
+                            self.set_inference_busy(self.inference_rx.is_some());
                         }
                         let claim_tx = self.escrow_watcher.as_mut().and_then(|w| w.handle_block(&block));
                         if let Some(w) = self.escrow_watcher.as_ref() {
