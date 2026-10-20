@@ -50,6 +50,12 @@ impl LoadError {
         self.attempt
     }
 
+    /// The card's PoM walk had not let go of the weights this load would free, so nothing was
+    /// loaded. Retryable: the card idles until the walk releases them.
+    pub fn walk_still_running(gpu: usize) -> Self {
+        Self::new(next_attempt(), "drain", format!("PoM walk on GPU {} still running — model not swapped", gpu), false)
+    }
+
     /// The card could not fit the model — retrying the same tier on this GPU is pointless.
     pub fn is_oom(&self) -> bool {
         let detail = self.detail.to_ascii_lowercase();

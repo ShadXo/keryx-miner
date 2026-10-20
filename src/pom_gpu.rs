@@ -1875,7 +1875,13 @@ fn wait_for_sole_owner<T>(item: &Arc<T>, timeout: std::time::Duration) -> bool {
 /// model swap — needlessly forcing GPU1+ rigs to fully reload their GGUF from disk and rebuild
 /// the gather index (`ensure_installed_inner`'s own doc comment calls this reload "Heavy") even
 /// though nothing about them changed.
-pub fn uninstall(device_id: u32) {
+///
+/// Returns whether the device is drained, i.e. safe for the caller to free or replace the weights
+/// its walk gathered over. On `false` NOTHING on that device may be freed: the caller defers.
+pub fn uninstall(device_id: u32) -> bool {
+    if still_draining(device_id) {
+        return false;
+    }
     let removed = match miners().lock() {
         Ok(mut g) => remove_device_entry(&mut g, device_id),
         Err(_) => None,
@@ -1887,9 +1893,43 @@ pub fn uninstall(device_id: u32) {
     // the device's context for every user of it, inference included.
     if let Some(miner) = removed {
         if !wait_for_sole_owner(&miner, std::time::Duration::from_secs(30)) {
-            log::error!("PoM[gpu{}]: a walk still holds the miner after 30s — releasing anyway", device_id);
+            // Never free under the live walk (it used to be "released anyway" here). Quarantine
+            // the miner instead: it keeps its own buffers alive, and the card stays idle until the
+            // walk lets go, which `still_draining` notices on the next check.
+            log::error!(
+                "PoM[gpu{}]: a walk still holds the miner after 30s — keeping its weights and idling the card until it lets go",
+                device_id
+            );
+            if let Ok(mut g) = draining().lock() {
+                g.insert(device_id, miner);
+            }
+            return false;
         }
     }
+    true
+}
+
+/// Miners whose walk was still running when they were uninstalled, held until it lets go. While
+/// one is held, nothing on that device may be freed, replaced or rebuilt.
+fn draining() -> &'static Mutex<HashMap<u32, Arc<PomGpuMiner>>> {
+    static DRAINING: OnceLock<Mutex<HashMap<u32, Arc<PomGpuMiner>>>> = OnceLock::new();
+    DRAINING.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Whether `device_id` still has a walk draining from an earlier uninstall; releases the held
+/// miner once that walk has let go.
+fn still_draining(device_id: u32) -> bool {
+    let Ok(mut g) = draining().lock() else { return true };
+    let held = match g.get(&device_id) {
+        Some(miner) => Arc::strong_count(miner) > 1,
+        None => return false,
+    };
+    if held {
+        return true;
+    }
+    g.remove(&device_id);
+    info!("PoM[gpu{}]: the stuck walk let go — the card can rebuild.", device_id);
+    false
 }
 
 /// Whether the GPU miner is currently installed for `device_id`.
@@ -2090,6 +2130,22 @@ pub fn advance_mining_tier_if_due(daa: u64) {
         if current == Some(spec.model_id) {
             continue;
         }
+        // Under the card's lifecycle lock: a worker can neither rebuild the old model between the
+        // drain and the reassignment, nor an inference load slip in. Re-read under the lock, since
+        // every worker runs this check and another one may have just swapped the card.
+        let lock = device_lifecycle(dev);
+        let _guard = lock.lock().unwrap_or_else(|p| p.into_inner());
+        let current = mining_tiers().lock().ok().and_then(|g| g.get(&dev).map(|(id, _)| *id));
+        if current == Some(spec.model_id) || inference_paused_for(dev) {
+            continue;
+        }
+        // Drain the old walk FIRST: while it still holds the old table, nothing on this card may be
+        // freed or reassigned (it may gather zero-dup over the llama engine's weights). A walk that
+        // does not let go leaves the card on its old model, idle, and the swap is retried on a
+        // later tick once `still_draining` sees it released.
+        if !uninstall(dev) {
+            continue;
+        }
         swapped = true;
         let gguf = crate::llm::gguf_path_for(spec).to_string_lossy().into_owned();
         info!("PoM[gpu{}]: era crossing at DAA {} — mining model → {}.", dev, daa, spec.name);
@@ -2102,8 +2158,6 @@ pub fn advance_mining_tier_if_due(daa: u64) {
         // Same staleness for the in-process llama engine: `ensure_loaded` is load-once, so after the
         // crossing it would keep hosting the previous era's model. Unload it when it lives on this
         // GPU with a different GGUF so the next `ensure_installed` brings up the new model.
-        // Drain this device's walk BEFORE freeing the tensors it may be gathering over.
-        uninstall(dev); // force a resident reload of the new model on the next ensure_installed
         if !crate::llama_engine::active_for(&gguf, dev as usize) {
             crate::llama_engine::unload(dev as usize);
         }
@@ -2247,7 +2301,11 @@ pub fn load_llama_for_inference(gguf: &str, target_dev: u32) -> Result<u64, crat
     let _swap_guard = LLAMA_MODEL_SWAP.lock().unwrap_or_else(|p| p.into_inner());
     let lock = device_lifecycle(target_dev);
     let _guard = lock.lock().unwrap_or_else(|p| p.into_inner());
-    uninstall(target_dev);
+    // `ensure_loaded` frees the model this card's engine hosts when it loads another, and the
+    // walk may gather zero-dup over exactly those weights: refuse the load while it still runs.
+    if !uninstall(target_dev) {
+        return Err(crate::llama_engine::LoadError::walk_still_running(target_dev as usize));
+    }
     crate::llama_engine::ensure_loaded(gguf, target_dev as usize)
 }
 
@@ -2426,6 +2484,11 @@ fn ensure_installed_inner(device_id: u32, daa: u64) -> bool {
     // Re-check under the per-device lifecycle lock: a worker that queued on the lock before the
     // pause was raised must not reload the mining model while inference is still generating.
     if inference_paused_for(device_id) {
+        return false;
+    }
+    // A walk that never let go of the previous miner still reads this card's weights: no rebuild
+    // (which may load a different model into the engine) until it is released.
+    if still_draining(device_id) {
         return false;
     }
     let (model_id, gguf) = match mining_tiers().lock().ok().and_then(|g| g.get(&device_id).cloned()) {
