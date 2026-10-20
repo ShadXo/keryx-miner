@@ -48,6 +48,18 @@ const AI_RESPONSE_RETRY_SECS: u64 = 3;
 /// Submission attempts before giving up on an AiResponse.
 const AI_RESPONSE_MAX_ATTEMPTS: u32 = 100;
 
+/// Template answers kept for the node round-trip average and p95 (~10 s at 10 BPS).
+const NODE_RTT_WINDOW: usize = 100;
+
+/// Interval between node round-trip updates published to the stats and status bar.
+const NODE_RTT_PUBLISH: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Minimum gap between repeated warnings while the round trip stays above the threshold.
+const NODE_RTT_WARN_REPEAT: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// Outstanding template requests tracked for the round trip; older ones are dropped.
+const NODE_RTT_MAX_OUTSTANDING: usize = 1024;
+
 use async_trait::async_trait;
 use futures_util::StreamExt;
 use log::{error, info, warn};
@@ -146,7 +158,17 @@ pub struct KeryxdHandler {
 
     /// Tracks pending submit-block requests so rejections can be attributed to the worker
     /// that originated the submission even though the submit response carries no device id.
-    pending_block_submissions: Arc<Mutex<VecDeque<(String, String)>>>,
+    /// Each entry: (block hash, device id, time handed to the node connection).
+    pending_block_submissions: Arc<Mutex<VecDeque<(String, String, std::time::Instant)>>>,
+
+    /// Send times of the GetBlockTemplate requests not answered yet, oldest first. The node
+    /// answers them in order on this stream, so the front pairs with the next answer.
+    template_sent_at: VecDeque<std::time::Instant>,
+    /// Recent template round trips (ms), newest last, at most NODE_RTT_WINDOW.
+    rtt_samples: VecDeque<u64>,
+    rtt_last_publish: std::time::Instant,
+    /// When the high round-trip warning last fired; None while the round trip is fine.
+    rtt_warned_at: Option<std::time::Instant>,
 
     /// Last DAA score seen in a block template — used to compute challenge_window_end.
     last_known_daa: u64,
@@ -195,6 +217,10 @@ impl Client for KeryxdHandler {
     async fn listen(&mut self, miner: &mut MinerManager) -> Result<(), Error> {
         self.opoi_challenge_active = Some(miner.opoi_challenge_flag());
         self.stats = Some(miner.stats_handle());
+        // A new connection measures afresh: never show the previous connection's round trip.
+        if let Some(stats) = &self.stats {
+            stats.set_node_rtt(None);
+        }
         // Harvest in-flight inference on a timer, independently of node notifications.
         // On a sole-producer node, pausing mining for inference stops block production,
         // so the node stops sending NewBlockTemplate notifications — without this timer
@@ -213,6 +239,7 @@ impl Client for KeryxdHandler {
                 },
                 Some(None) => break, // stream closed by node
                 None => {
+                    self.publish_node_rtt();
                     // Timer tick: if a regular inference just finished, get a fresh template.
                     if (self.inference_rx.is_some() || self.publish_rx.is_some()) && self.poll_inference().await {
                         self.client_get_block_template().await?;
@@ -285,7 +312,12 @@ impl KeryxdHandler {
             }
         };
 
-        let mut client = RpcClient::connect(address).await?;
+        // Endpoint conversion is what RpcClient::connect does internally; done here so the
+        // connect-time line can name the node.
+        let connect_started = std::time::Instant::now();
+        let endpoint: tonic::transport::Endpoint = address.try_into().map_err(|e| -> Error { e.into() })?;
+        let node = endpoint.uri().authority().map_or_else(|| endpoint.uri().to_string(), |a| a.to_string());
+        let mut client = RpcClient::new(endpoint.connect().await?);
         // Outbound message channel to the node. ALL client->node messages share this:
         // mining (submit_block, GetBlockTemplate) AND inference traffic (per-block GetBlock,
         // escrow submit_transaction). With a capacity of 2 the inference traffic could fill the
@@ -294,6 +326,12 @@ impl KeryxdHandler {
         let (send_channel, recv) = mpsc::channel(1024);
         send_channel.send(GetInfoRequestMessage {}.into()).await?;
         let stream = client.message_stream(ReceiverStream::new(recv)).await?.into_inner();
+        // TCP + HTTP/2 setup + opening the stream: about three network round trips.
+        info!(
+            "Connected to node {} in {}",
+            node,
+            crate::stats::format_rtt(connect_started.elapsed().as_millis() as u64)
+        );
         let pending_block_submissions = Arc::new(Mutex::new(VecDeque::new()));
         let (block_channel, block_handle) = Self::create_block_channel(send_channel.clone(), Arc::clone(&pending_block_submissions));
         Ok(Box::new(Self {
@@ -319,6 +357,10 @@ impl KeryxdHandler {
             challenge_inference_rx: None,
             opoi_challenge_active: None,
             pending_block_submissions,
+            template_sent_at: VecDeque::new(),
+            rtt_samples: VecDeque::new(),
+            rtt_last_publish: std::time::Instant::now(),
+            rtt_warned_at: None,
             last_known_daa: chain_daa.unwrap_or(0),
             ipfs_url,
             escrow_pubkey,
@@ -334,7 +376,7 @@ impl KeryxdHandler {
 
     fn create_block_channel(
         send_channel: Sender<KaspadMessage>,
-        pending_block_submissions: Arc<Mutex<VecDeque<(String, String)>>>,
+        pending_block_submissions: Arc<Mutex<VecDeque<(String, String, std::time::Instant)>>>,
     ) -> (Sender<BlockSeed>, BlockHandle) {
         // KaspadMessage::submit_block(block)
         let (send, recv) = mpsc::channel::<BlockSeed>(1);
@@ -346,7 +388,7 @@ impl KeryxdHandler {
                         FullBlock { block, device_id } => {
                             let block_hash = block.block_hash().map(|hash| format!("{:x}", hash)).unwrap_or_default();
                             let mut pending = pending_block_submissions.lock().unwrap();
-                            pending.push_back((block_hash, device_id));
+                            pending.push_back((block_hash, device_id, std::time::Instant::now()));
                             KaspadMessage::submit_block(*block)
                         }
                         PartialBlock { .. } => unreachable!("All blocks sent here should have arrived from here"),
@@ -358,11 +400,51 @@ impl KeryxdHandler {
         )
     }
 
+    /// Publishes the template round trip (average, p95) to the stats every NODE_RTT_PUBLISH and
+    /// warns while the p95 is above `NODE_RTT_WARN_MS`. The oldest unanswered request counts
+    /// with its current age, so a stalled node shows a climbing round trip, not a stale one.
+    fn publish_node_rtt(&mut self) {
+        if self.rtt_last_publish.elapsed() < NODE_RTT_PUBLISH {
+            return;
+        }
+        self.rtt_last_publish = std::time::Instant::now();
+        let mut samples: Vec<u64> = self.rtt_samples.iter().copied().collect();
+        if let Some(oldest) = self.template_sent_at.front() {
+            samples.push(oldest.elapsed().as_millis() as u64);
+        }
+        if samples.is_empty() {
+            return;
+        }
+        let avg = samples.iter().sum::<u64>() / samples.len() as u64;
+        samples.sort_unstable();
+        let p95 = samples[(samples.len() * 95).div_ceil(100) - 1];
+        if let Some(stats) = &self.stats {
+            stats.set_node_rtt(Some((avg, p95)));
+        }
+        let fmt = crate::stats::format_rtt;
+        if p95 > crate::stats::NODE_RTT_WARN_MS {
+            if self.rtt_warned_at.map_or(true, |t| t.elapsed() >= NODE_RTT_WARN_REPEAT) {
+                self.rtt_warned_at = Some(std::time::Instant::now());
+                warn!(
+                    "Node round trip is {} (p95) — above {}, most blocks will arrive stale at 10 BPS. Use a node closer to this rig.",
+                    fmt(p95),
+                    fmt(crate::stats::NODE_RTT_WARN_MS)
+                );
+            }
+        } else if self.rtt_warned_at.take().is_some() {
+            info!("Node round trip back to {} (p95)", fmt(p95));
+        }
+    }
+
     async fn client_send(&self, msg: impl Into<KaspadMessage>) -> Result<(), SendError<KaspadMessage>> {
         self.send_channel.send(msg.into()).await
     }
 
     async fn client_get_block_template(&mut self) -> Result<(), SendError<KaspadMessage>> {
+        self.template_sent_at.push_back(std::time::Instant::now());
+        if self.template_sent_at.len() > NODE_RTT_MAX_OUTSTANDING {
+            self.template_sent_at.pop_front();
+        }
         let pay_address = self.miner_address.clone();
         // Append a per-request random nonce so that parallel blocks at the same blue_score
         // get distinct coinbase payloads → distinct tx_ids (avoids DAG coinbase collisions).
@@ -1046,6 +1128,12 @@ impl KeryxdHandler {
                 None => self.report_service_strikes(&resp),
             },
             Payload::GetBlockTemplateResponse(template) => {
+                if let Some(sent) = self.template_sent_at.pop_front() {
+                    self.rtt_samples.push_back(sent.elapsed().as_millis() as u64);
+                    if self.rtt_samples.len() > NODE_RTT_WINDOW {
+                        self.rtt_samples.pop_front();
+                    }
+                }
                 // Track DAA score for challenge_window_end computation.
                 if let Some(daa) = template.block.as_ref()
                     .and_then(|b| b.header.as_ref())
@@ -1209,23 +1297,28 @@ impl KeryxdHandler {
                 }
             }
             Payload::SubmitBlockResponse(res) => {
-                let attributed_device = self
+                let (attributed_device, round_trip) = self
                     .pending_block_submissions
                     .lock()
                     .unwrap()
                     .pop_front()
-                    .map(|(_, device_id)| device_id)
-                    .unwrap_or_else(|| "CPU".to_string());
+                    .map(|(_, device_id, sent)| (device_id, Some(sent.elapsed())))
+                    .unwrap_or_else(|| ("CPU".to_string(), None));
+                // From hand-off to the node connection until this answer: the gap between
+                // "Found a block" and "submitted" that decides whether the block was still timely.
+                let round_trip = round_trip
+                    .map(|d| format!(" (round trip {})", crate::stats::format_rtt(d.as_millis() as u64)))
+                    .unwrap_or_default();
                 match res.error {
                     None => {
                         miner.record_block_accepted();
                         miner.record_block_accepted_for_device(&attributed_device);
-                        info!("Block submitted successfully!");
+                        info!("Block submitted successfully!{}", round_trip);
                     }
                     Some(e) => {
                         miner.record_block_rejected();
                         miner.record_block_rejected_for_device(&attributed_device);
-                        warn!("Failed submitting block: {:?}", e);
+                        warn!("Failed submitting block{}: {:?}", round_trip, e);
                     }
                 }
             }

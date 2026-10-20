@@ -668,9 +668,24 @@ fn draw_frame(
         (format!("{}  ", hashrate_value), palette().ok),
         ("| Node ".to_string(), palette().muted),
         (
-            format!("{}  ", if snapshot.synced { "Synced" } else { "Not Synced" }),
+            (if snapshot.synced { "Synced" } else { "Not Synced" }).to_string(),
             if snapshot.synced { palette().ok } else { palette().warn },
         ),
+        // Solo node round trip (p95). Coloured on its own: a far node can be "Synced" and still
+        // deliver every template and block reply too late to win at 10 BPS.
+        match snapshot.node_rtt_p95_ms {
+            Some(p95) => (
+                format!(" · {}  ", crate::stats::format_rtt(p95)),
+                if p95 > crate::stats::NODE_RTT_WARN_MS {
+                    palette().err
+                } else if p95 >= crate::stats::NODE_RTT_CAUTION_MS {
+                    palette().warn
+                } else {
+                    palette().ok
+                },
+            ),
+            None => ("  ".to_string(), palette().muted),
+        },
         ("| AI ".to_string(), palette().muted),
         (
             format!("{}  ", opoi_pause_value),

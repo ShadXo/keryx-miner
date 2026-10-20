@@ -757,7 +757,16 @@ impl MinerManager {
                 // Mining normally: report aggregate + per-device rates.
                 zero_streak = 0;
                 let (rate, suffix) = Self::hash_suffix(total as f64 / duration);
-                info!("Current hashrate is {:.2} {}", rate, suffix);
+                match stats.node_rtt() {
+                    Some((avg, p95)) => info!(
+                        "Current hashrate is {:.2} {} (node round trip {}, p95 {})",
+                        rate,
+                        suffix,
+                        crate::stats::format_rtt(avg),
+                        crate::stats::format_rtt(p95)
+                    ),
+                    None => info!("Current hashrate is {:.2} {}", rate, suffix),
+                }
                 let mut per_device_hs = HashMap::new();
                 for (device, counter) in &*hashes_by_worker.lock().unwrap() {
                     let h = counter.swap(0, Ordering::AcqRel);

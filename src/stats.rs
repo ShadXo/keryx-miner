@@ -63,6 +63,24 @@ pub struct MinerStats {
     gpu_telemetry: Mutex<HashMap<u32, GpuTelemetry>>,
     gpu_memory_temp_supported: Mutex<HashMap<u32, bool>>,
     hiveos: AtomicBool,
+    /// Solo node round trip as (average, p95) in ms; None until measured, or when pool mining.
+    node_rtt_ms: Mutex<Option<(u64, u64)>>,
+}
+
+/// Node round trip (p95, ms) above which blocks routinely arrive stale: one block lasts 100 ms
+/// at 10 BPS. Drives the status-bar colour and the warning.
+pub const NODE_RTT_WARN_MS: u64 = 150;
+
+/// Node round trip (p95, ms) from which the status bar turns from green to yellow.
+pub const NODE_RTT_CAUTION_MS: u64 = 100;
+
+/// "33 ms" below a second, "2.9 s" from there on.
+pub fn format_rtt(ms: u64) -> String {
+    if ms < 1000 {
+        format!("{} ms", ms)
+    } else {
+        format!("{:.1} s", ms as f64 / 1000.0)
+    }
 }
 
 #[derive(Default, Clone, Copy)]
@@ -103,6 +121,10 @@ pub struct MinerStatsSnapshot {
     pub escrow_pending_outputs: u64,
     pub escrow_pending_sompi: u64,
     pub last_update_epoch_s: u64,
+    /// Average round trip to the solo node over the recent window; None when not measured.
+    pub node_rtt_ms: Option<u64>,
+    /// 95th-percentile round trip to the solo node over the same window.
+    pub node_rtt_p95_ms: Option<u64>,
     pub devices: Vec<DeviceRate>,
 }
 
@@ -131,7 +153,20 @@ impl MinerStats {
             gpu_telemetry: Mutex::new(HashMap::new()),
             gpu_memory_temp_supported: Mutex::new(HashMap::new()),
             hiveos: AtomicBool::new(hiveos),
+            node_rtt_ms: Mutex::new(None),
         }
+    }
+
+    /// Records the solo node round trip as (average, p95) in ms; None clears it (reconnect).
+    pub fn set_node_rtt(&self, rtt: Option<(u64, u64)>) {
+        if let Ok(mut slot) = self.node_rtt_ms.lock() {
+            *slot = rtt;
+        }
+    }
+
+    /// The solo node round trip as (average, p95) in ms, if measured.
+    pub fn node_rtt(&self) -> Option<(u64, u64)> {
+        self.node_rtt_ms.lock().ok().and_then(|slot| *slot)
     }
 
     pub fn set_api_port(&self, port: u16) {
@@ -421,6 +456,8 @@ impl MinerStats {
             escrow_pending_outputs: self.escrow_pending_outputs.load(Ordering::Acquire),
             escrow_pending_sompi: self.escrow_pending_sompi.load(Ordering::Acquire),
             last_update_epoch_s: self.last_update_epoch_s.load(Ordering::Acquire),
+            node_rtt_ms: self.node_rtt().map(|(avg, _)| avg),
+            node_rtt_p95_ms: self.node_rtt().map(|(_, p95)| p95),
             devices,
         }
     }
@@ -444,6 +481,27 @@ mod tests {
         let device = snapshot.devices.iter().find(|device| device.id == "GPU0").unwrap();
         assert_eq!(device.blocks_accepted, 1);
         assert_eq!(device.blocks_rejected, 1);
+    }
+
+    #[test]
+    fn node_round_trip_reaches_the_snapshot_and_clears_on_reconnect() {
+        let stats = MinerStats::new(false);
+        assert_eq!(stats.snapshot().node_rtt_p95_ms, None);
+
+        stats.set_node_rtt(Some((33, 58)));
+        let snapshot = stats.snapshot();
+        assert_eq!((snapshot.node_rtt_ms, snapshot.node_rtt_p95_ms), (Some(33), Some(58)));
+
+        stats.set_node_rtt(None);
+        assert_eq!(stats.snapshot().node_rtt_ms, None);
+    }
+
+    #[test]
+    fn round_trip_switches_to_seconds_at_one_second() {
+        assert_eq!(format_rtt(0), "0 ms");
+        assert_eq!(format_rtt(999), "999 ms");
+        assert_eq!(format_rtt(1000), "1.0 s");
+        assert_eq!(format_rtt(2940), "2.9 s");
     }
 }
 
