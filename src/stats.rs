@@ -67,12 +67,13 @@ pub struct MinerStats {
     node_rtt_ms: Mutex<Option<(u64, u64)>>,
 }
 
-/// Node round trip (p95, ms) above which blocks routinely arrive stale: one block lasts 100 ms
-/// at 10 BPS. Drives the status-bar colour and the warning.
-pub const NODE_RTT_WARN_MS: u64 = 150;
+/// Node round trip (p95, ms) above which blocks risk ending up red (no reward): each second of
+/// delay puts ~10 blocks beside a block at 10 BPS, and past K (124) blue ones it turns red, so
+/// ~12 s is the edge. Drives the status-bar colour and the warning.
+pub const NODE_RTT_WARN_MS: u64 = 5_000;
 
 /// Node round trip (p95, ms) from which the status bar turns from green to yellow.
-pub const NODE_RTT_CAUTION_MS: u64 = 100;
+pub const NODE_RTT_CAUTION_MS: u64 = 3_000;
 
 /// "33 ms" below a second, "2.9 s" from there on.
 pub fn format_rtt(ms: u64) -> String {
