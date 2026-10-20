@@ -21,7 +21,9 @@ env:
 jobs:
   test:
     name: Check + unit tests
-    runs-on: ubuntu-latest
+    # Pinned, not ubuntu-latest: that moved to 26.04, whose NVIDIA repo has no CUDA 12.8
+    # packages, so the toolkit install below fails before anything compiles.
+    runs-on: ubuntu-24.04
     timeout-minutes: 45
 
     steps:
