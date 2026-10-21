@@ -42,6 +42,26 @@ const AI_BACKFILL_WINDOW_DAA: u64 = 6_000;
 /// Backfill GetBlock requests kept in flight.
 const AI_BACKFILL_INFLIGHT: usize = 32;
 
+/// After a finished backfill, a reconnect re-walks from this many DAA below the last block
+/// scanned live, so blocks arriving while the connection was down are not missed.
+const AI_BACKFILL_GAP_MARGIN_DAA: u64 = 100;
+
+/// Startup-backfill progress carried across reconnects of this process, so a slow link that keeps
+/// losing the connection resumes the walk instead of restarting all of it every time.
+#[derive(Default)]
+struct BackfillProgress {
+    cutoff_daa: Option<u64>,
+    /// Blocks still to fetch; requests that were never answered come back first.
+    queue: VecDeque<String>,
+    visited: std::collections::HashSet<String>,
+    /// A full walk finished in this process: a reconnect only walks the gap since `live_daa`.
+    done: bool,
+    /// Highest DAA seen in live block notifications.
+    live_daa: u64,
+}
+
+static BACKFILL_PROGRESS: Mutex<Option<BackfillProgress>> = Mutex::new(None);
+
 /// Seconds between AiResponse resubmissions while the mempool has not accepted it.
 const AI_RESPONSE_RETRY_SECS: u64 = 3;
 
@@ -139,6 +159,15 @@ pub struct KeryxdHandler {
     backfill_queue: VecDeque<String>,
     backfill_pending: std::collections::HashSet<String>,
     backfill_visited: std::collections::HashSet<String>,
+    /// A full backfill already finished in this process (carried across reconnects).
+    backfill_done: bool,
+    /// The walk was seeded on this connection (a resumed walk still needs the new tip's gap).
+    backfill_seeded: bool,
+    /// Highest DAA seen in live block notifications; bounds the gap walk after a reconnect.
+    live_scanned_daa: u64,
+    /// Bulk startup traffic (escrow validation, backfill) has been released. Held back until the
+    /// first block template arrives, so mining never waits behind thousands of block requests.
+    bulk_started: bool,
 
     /// In-flight LLM inference task: (request_raw_bytes, result_receiver).
     /// None result means inference failed (model not ready or empty output) — skip IPFS upload.
@@ -334,6 +363,8 @@ impl KeryxdHandler {
         );
         let pending_block_submissions = Arc::new(Mutex::new(VecDeque::new()));
         let (block_channel, block_handle) = Self::create_block_channel(send_channel.clone(), Arc::clone(&pending_block_submissions));
+        // Pick up where the previous connection's backfill stopped (saved when it was dropped).
+        let backfill = BACKFILL_PROGRESS.lock().ok().and_then(|mut g| g.take()).unwrap_or_default();
         Ok(Box::new(Self {
             client,
             stream,
@@ -348,10 +379,14 @@ impl KeryxdHandler {
             ai_answered_by_me: std::collections::HashSet::new(),
             ai_request_txids: std::collections::HashMap::new(),
             ai_response_inflight: std::collections::HashMap::new(),
-            backfill_cutoff_daa: None,
-            backfill_queue: VecDeque::new(),
+            backfill_cutoff_daa: backfill.cutoff_daa,
+            backfill_queue: backfill.queue,
             backfill_pending: std::collections::HashSet::new(),
-            backfill_visited: std::collections::HashSet::new(),
+            backfill_visited: backfill.visited,
+            backfill_done: backfill.done,
+            backfill_seeded: false,
+            live_scanned_daa: backfill.live_daa,
+            bulk_started: false,
             inference_rx: None,
             publish_rx: None,
             challenge_inference_rx: None,
@@ -794,11 +829,23 @@ impl KeryxdHandler {
 
     /// Seeds the startup backfill from the first block notification.
     fn backfill_seed(&mut self, header: Option<&crate::proto::RpcBlockHeader>) {
-        if self.backfill_cutoff_daa.is_some() {
+        if self.backfill_seeded {
             return;
         }
         let Some(header) = header else { return };
-        let cutoff = header.daa_score.saturating_sub(AI_BACKFILL_WINDOW_DAA);
+        self.backfill_seeded = true;
+        let window_cutoff = header.daa_score.saturating_sub(AI_BACKFILL_WINDOW_DAA);
+        let (cutoff, what) = match self.backfill_cutoff_daa {
+            // A full walk already finished in this process: only the reconnect gap is new.
+            _ if self.backfill_done => (
+                window_cutoff.max(self.live_scanned_daa.saturating_sub(AI_BACKFILL_GAP_MARGIN_DAA)),
+                "backfilling the blocks missed while reconnecting",
+            ),
+            // An unfinished walk resumes: its restored queue covers the older part, and seeding
+            // from the new tip (down to already-visited blocks) covers the gap.
+            Some(cutoff) => (cutoff, "resuming the startup backfill after a reconnect"),
+            None => (window_cutoff, "backfilling recent blocks for in-window AiRequests"),
+        };
         self.backfill_cutoff_daa = Some(cutoff);
         if let Some(level0) = header.parents.first() {
             for hash in &level0.parent_hashes {
@@ -807,12 +854,24 @@ impl KeryxdHandler {
                 }
             }
         }
-        info!("Inference: backfilling recent blocks for in-window AiRequests (cutoff daa {})", cutoff);
+        info!("Inference: {} (cutoff daa {}, {} queued)", what, cutoff, self.backfill_queue.len());
+    }
+
+    /// Releases the startup bulk traffic once the first block template has arrived: the first
+    /// slice of escrow validation, then the backfill. Both stay self-paced from there.
+    async fn start_bulk(&mut self) -> Result<(), Error> {
+        self.bulk_started = true;
+        for _ in 0..VALIDATION_WINDOW {
+            if let Some(hash) = self.validation_queue.pop_front() {
+                self.client_send(GetBlockRequestMessage { hash, include_transactions: false }).await?;
+            }
+        }
+        self.backfill_pump().await
     }
 
     /// Keeps up to AI_BACKFILL_INFLIGHT backfill block requests in flight.
     async fn backfill_pump(&mut self) -> Result<(), Error> {
-        if self.backfill_cutoff_daa.is_none() {
+        if !self.bulk_started || self.backfill_cutoff_daa.is_none() {
             return Ok(());
         }
         while self.backfill_pending.len() < AI_BACKFILL_INFLIGHT {
@@ -844,6 +903,7 @@ impl KeryxdHandler {
             info!("Inference: startup backfill complete ({} blocks scanned)", self.backfill_visited.len());
             self.backfill_visited.clear();
             self.backfill_visited.shrink_to_fit();
+            self.backfill_done = true;
         }
     }
 
@@ -1089,6 +1149,17 @@ impl KeryxdHandler {
             // Do NOT trigger a new block template here — NewBlockTemplate handles that.
             Payload::BlockAddedNotification(notif) => {
                 if let Some(block) = notif.block {
+                    if let Some(header) = block.header.as_ref() {
+                        self.live_scanned_daa = self.live_scanned_daa.max(header.daa_score);
+                    }
+                    // While the walk is unfinished, a live block counts as visited: after a
+                    // reconnect the resumed walk descends from the new tip and must stop at the
+                    // blocks this connection already scanned live, not fetch them all again.
+                    if !self.backfill_done {
+                        if let Some(hash) = block.verbose_data.as_ref().map(|v| v.hash.clone()) {
+                            self.backfill_visited.insert(hash);
+                        }
+                    }
                     self.backfill_seed(block.header.as_ref());
                     self.backfill_pump().await?;
                     if !block.transactions.is_empty() {
@@ -1141,6 +1212,10 @@ impl KeryxdHandler {
                     if self.rtt_samples.len() > NODE_RTT_WINDOW {
                         self.rtt_samples.pop_front();
                     }
+                }
+                // Mining has its first template: only now release the startup bulk traffic.
+                if !self.bulk_started {
+                    self.start_bulk().await?;
                 }
                 // Track DAA score for challenge_window_end computation.
                 if let Some(daa) = template.block.as_ref()
@@ -1384,14 +1459,12 @@ impl KeryxdHandler {
                 self.client_send(NotifyVirtualSelectedParentChainChangedRequestMessage {}).await?;
                 // Boot-time escrow-state validation: check every referenced block against
                 // the node so ghost entries (orphaned-chain coinbases) are purged before
-                // any claim ships. Send an initial slice; each answer sends the next.
+                // any claim ships. Queued only: the first slice goes out with the first block
+                // template (`start_bulk`), so mining starts before this traffic; each answer then
+                // sends the next. Re-done on every connection: chain changes during a disconnect
+                // are not seen, so earlier answers cannot be trusted across one.
                 if let Some(hashes) = self.escrow_watcher.as_mut().map(|w| w.start_state_validation()) {
                     self.validation_queue = hashes.into();
-                    for _ in 0..VALIDATION_WINDOW {
-                        if let Some(hash) = self.validation_queue.pop_front() {
-                            self.client_send(GetBlockRequestMessage { hash, include_transactions: false }).await?;
-                        }
-                    }
                 }
                 self.client_get_block_template().await?;
             }
@@ -1428,6 +1501,22 @@ impl KeryxdHandler {
 impl Drop for KeryxdHandler {
     fn drop(&mut self) {
         self.block_handle.abort();
+        // Hand the backfill to the next connection. Requests sent on this one and never answered
+        // go back to the front of the queue.
+        let mut queue = std::mem::take(&mut self.backfill_queue);
+        for hash in self.backfill_pending.drain() {
+            queue.push_front(hash);
+        }
+        let progress = BackfillProgress {
+            cutoff_daa: self.backfill_cutoff_daa,
+            queue,
+            visited: std::mem::take(&mut self.backfill_visited),
+            done: self.backfill_done,
+            live_daa: self.live_scanned_daa,
+        };
+        if let Ok(mut slot) = BACKFILL_PROGRESS.lock() {
+            *slot = Some(progress);
+        }
     }
 }
 
