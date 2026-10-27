@@ -27,7 +27,7 @@ use crate::pow::BlockSeed::PartialBlock;
 use crate::{miner::MinerManager, Error, Uint256};
 use async_trait::async_trait;
 use futures_util::TryStreamExt;
-use log::{error, info, warn};
+use log::{debug, error, info, warn};
 use statum_codec::NewLineJsonCodec;
 use std::sync::OnceLock;
 use tokio::sync::mpsc::{self, Sender};
@@ -64,13 +64,12 @@ struct CurrentTask {
     task: AiTask,
 }
 
-/// Shared inference result cache — persists across block changes so that if the
-/// same AiRequest is included in multiple consecutive job templates the miner can
-/// immediately submit with a CID once inference completed for the first occurrence.
-
 /// Max cached inference results — evict when full to prevent unbounded growth.
 const MAX_INFERENCE_CACHE_SIZE: usize = 1_000;
 
+/// Shared inference result cache — persists across block changes so that if the
+/// same AiRequest is included in multiple consecutive job templates the miner can
+/// immediately submit with a CID once inference completed for the first occurrence.
 struct InferenceCacheInner {
     /// stable_id → base58 CIDv0 string returned by IPFS after upload.
     results: HashMap<String, String>,
@@ -189,7 +188,7 @@ impl Client for StratumHandler {
 
         // Declare loaded LLM models so the bridge can challenge with the right model.
         let model_ids: Vec<String> =
-            keryx_miner::llm::loaded_model_ids().into_iter().map(|id| hex::encode(id)).collect();
+            keryx_miner::llm::loaded_model_ids().into_iter().map(hex::encode).collect();
         if !model_ids.is_empty() {
             info!("Inference: declaring {} model(s) to pool bridge", model_ids.len());
             self.send_channel
@@ -303,8 +302,8 @@ impl StratumHandler {
         let handle = tokio::spawn(async move {
             let mut recv_stream = ReceiverStream::new(recv);
             while let Some(seed) = recv_stream.next().await {
-                let (nonce, job_id, pom_proof) = match seed {
-                    BlockSeed::PartialBlock { nonce, id, pom_proof, .. } => (nonce, id, pom_proof),
+                let (nonce, job_id, pom_proof, task_root) = match seed {
+                    BlockSeed::PartialBlock { nonce, id, pom_proof, task_root, .. } => (nonce, id, pom_proof, task_root),
                     BlockSeed::FullBlock { .. } => unreachable!(),
                 };
                 let msg_id = last_stratum_id.fetch_add(1, Ordering::SeqCst);
@@ -327,7 +326,24 @@ impl StratumHandler {
                     }
                 };
 
-                let line = if !pom_proof.is_empty() {
+                let line = if let (false, Some(root)) = (pom_proof.is_empty(), task_root) {
+                    StratumLine {
+                        id: Some(msg_id),
+                        payload: StratumLinePayload::StratumCommand(StratumCommand::MiningSubmit(
+                            MiningSubmit::MiningSubmitWithPomTask((
+                                miner_address.clone(),
+                                job_id,
+                                nonce_hex,
+                                opoi_tag,
+                                cid_opt.unwrap_or_default(),
+                                hex::encode(pom_proof),
+                                hex::encode(root),
+                            )),
+                        )),
+                        jsonrpc: None,
+                        error: None,
+                    }
+                } else if !pom_proof.is_empty() {
                     StratumLine {
                         id: Some(msg_id),
                         payload: StratumLinePayload::StratumCommand(StratumCommand::MiningSubmit(
@@ -415,8 +431,7 @@ impl StratumHandler {
                                     self.shares_stats.accepted.fetch_add(1, Ordering::SeqCst);
                                     info!("Share accepted");
                                 } else {
-                                    info!("{:?} (Last: {})", msg.clone(), self.last_stratum_id.load(Ordering::SeqCst));
-                                    warn!("Ignoring result for now");
+                                    debug!("Stratum result for a non-share request: {:?}", msg);
                                 }
                                 Ok(())
                             }
@@ -460,6 +475,19 @@ impl StratumHandler {
                             } else {
                                 *self.current_task_slot.lock().await = None;
                             }
+                            if keryx_miner::block_task::active(job.daa_score) {
+                                let window = keryx_verifiable_inference::block_task::window(job.daa_score);
+                                let parents = job.header.as_ref().and_then(|h| h.parents.first()).map(|p| keryx_miner::block_task::parents_key(&p.parent_hashes));
+                                match (window, parents, job.window_seed) {
+                                    (Some(w), Some(p), Some(seed)) => keryx_miner::block_task::set_seed(w, &p, seed),
+                                    _ => {
+                                        keryx_miner::pom_gpu::log_throttled(u32::MAX, "pool-no-task", || {
+                                            warn!("Block task: the pool sends jobs without a block task (header and window seed) — no block can be valid, job skipped")
+                                        });
+                                        return miner.process_block(None).await;
+                                    }
+                                }
+                            }
                             miner
                                 .process_block(Some(PartialBlock {
                                     id: job.id,
@@ -472,6 +500,8 @@ impl StratumHandler {
                                     nonce_fixed: self.nonce_fixed,
                                     hash: None,
                                     pom_proof: Vec::new(),
+                                    header: job.header.map(Box::new),
+                                    task_root: None,
                                 }))
                                 .await
                         }

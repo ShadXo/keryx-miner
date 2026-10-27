@@ -108,6 +108,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // llama.cpp is PINNED to b10015 — the SAME pin as hiveos/build-keryx-llama.sh and the
     // byte-identity proof in tools/llama_zerodup_spike. Bump all together, then re-verify.
     println!("cargo:rerun-if-changed=tools/keryx-llama/keryx_llama.cpp");
+    println!("cargo:rerun-if-changed=tools/keryx-llama/patches");
     println!("cargo:rerun-if-env-changed=KERYX_LLAMA_SKIP");
     println!("cargo:rerun-if-env-changed=KERYX_LLAMA_SRC");
     println!("cargo:rerun-if-env-changed=KERYX_LLAMA_ARCHS");
@@ -147,6 +148,8 @@ fn build_keryx_llama(nvcc: &str) -> Result<(), Box<dyn std::error::Error>> {
         )?;
     }
 
+    apply_llama_patches(&src)?;
+
     let build_dir = target_root.join(format!("llama-build-{LLAMA_TAG}"));
     // Native kernels for every supported GPU generation (Volta to Blackwell); needs nvcc >= 12.8.
     // Override with a shorter list for a faster development build.
@@ -171,6 +174,8 @@ fn build_keryx_llama(nvcc: &str) -> Result<(), Box<dyn std::error::Error>> {
             "-DGGML_F16C=OFF",
             "-DGGML_BMI2=OFF",
             "-DGGML_CUDA_NCCL=OFF",
+            // Traces are captured in the quantized kernels: no cuBLAS fallback on any architecture.
+            "-DGGML_CUDA_FORCE_MMQ=ON",
             "-DCMAKE_BUILD_TYPE=Release",
             &format!("-DCMAKE_CUDA_COMPILER={nvcc}"),
         ]);
@@ -285,6 +290,43 @@ fn cuda_home_from_nvcc(nvcc: &str) -> Result<std::path::PathBuf, Box<dyn std::er
         return Ok(default.to_path_buf());
     }
     Err(format!("cannot locate the CUDA toolkit root (needed to link libkeryx-llama.so); set CUDA_HOME, or {LLAMA_ESCAPE_HINT}").into())
+}
+
+/// Applies `tools/keryx-llama/patches/*.patch` to the llama.cpp checkout, in name order, from a
+/// pristine tree whenever the patch set changes.
+fn apply_llama_patches(src: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
+    // Absolute without canonicalize: the `\\?\` form it yields on Windows is not a path git can open.
+    let dir = std::path::PathBuf::from(env::var("CARGO_MANIFEST_DIR")?).join("tools/keryx-llama/patches");
+    let mut patches: Vec<_> = std::fs::read_dir(&dir)?
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().map(|x| x == "patch").unwrap_or(false))
+        .collect();
+    patches.sort();
+    let mut stamp = String::new();
+    for patch in &patches {
+        let hash = std::fs::read(patch)?.iter().fold(0xcbf29ce484222325u64, |h, b| (h ^ *b as u64).wrapping_mul(0x100000001b3));
+        stamp.push_str(&format!("{} {hash:016x}\n", patch.file_name().unwrap_or_default().to_string_lossy()));
+    }
+    let stamp_path = src.join(".keryx-patches");
+    if std::fs::read_to_string(&stamp_path).ok().as_deref() == Some(stamp.as_str()) {
+        return Ok(());
+    }
+    run(
+        "git checkout of the pristine llama.cpp tree",
+        std::process::Command::new("git").current_dir(src).args(["checkout", "--", "."]),
+    )?;
+    run(
+        "git clean of the llama.cpp tree",
+        std::process::Command::new("git").current_dir(src).args(["clean", "-fdq", "--", "ggml/src/ggml-cuda"]),
+    )?;
+    for patch in &patches {
+        run(
+            &format!("git apply of {}", patch.display()),
+            std::process::Command::new("git").current_dir(src).arg("apply").arg(patch),
+        )?;
+    }
+    std::fs::write(&stamp_path, stamp)?;
+    Ok(())
 }
 
 fn run(desc: &str, cmd: &mut std::process::Command) -> Result<(), Box<dyn std::error::Error>> {

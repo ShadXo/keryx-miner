@@ -341,6 +341,34 @@ extern "C" fn plugin_log_sink(level: u8, msg_ptr: *const u8, msg_len: usize) {
     log::log!(lvl, "{}", msg);
 }
 
+/// Minimum NVIDIA driver major version accepted for mining. Older drivers break verifiable
+/// inference (traces from a 550 driver on a 3060 12GB failed verification; 595+ verifies).
+const MIN_NVIDIA_DRIVER_MAJOR: u32 = 595;
+
+/// Installed NVIDIA driver version string (e.g. "595.71.05"), from NVML or the kernel module.
+fn nvidia_driver_version() -> Option<String> {
+    if let Ok(nvml) = nvml_wrapper::Nvml::init() {
+        if let Ok(v) = nvml.sys_driver_version() {
+            return Some(v);
+        }
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let text = std::fs::read_to_string("/proc/driver/nvidia/version").ok()?;
+        return text
+            .split_whitespace()
+            .find(|w| w.split('.').count() >= 2 && w.split('.').all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit())))
+            .map(str::to_string);
+    }
+    #[allow(unreachable_code)]
+    None
+}
+
+/// Major component of an NVIDIA driver version string.
+fn nvidia_driver_major(version: &str) -> Option<u32> {
+    version.split('.').next()?.trim().parse().ok()
+}
+
 /// Warn when a card is power-limited far enough to risk Xid 32 under a large GEMM.
 ///
 /// Power thresholds empirically derived: Xid 32 observed at ≤300W on RTX 3090 with 32B GGUF.
@@ -496,7 +524,7 @@ fn assign_pom_tiers(
     }
     let mut out = Vec::with_capacity(devices.len());
     for (id, vram_mb) in devices {
-        match forced.get(id as usize).copied() {
+        match forced.get(id).copied() {
             Some(Some(t)) => {
                 let spec = keryx_miner::models::spec_for_tier(t);
                 log::info!(
@@ -773,6 +801,12 @@ fn tokio_blocking_threads() -> Option<usize> {
 }
 
 fn main() -> Result<(), Error> {
+    // The canonical trace cannot be replayed under CUDA graphs on every model.
+    if std::env::var_os("GGML_CUDA_DISABLE_GRAPHS").is_none() {
+        std::env::set_var("GGML_CUDA_DISABLE_GRAPHS", "1");
+    }
+    // Attention openings expect unrotated key and value cache rows.
+    std::env::set_var("LLAMA_ATTN_ROT_DISABLE", "1");
     // Hidden child mode of the startup engine check (see llama_engine::probe_device).
     let argv: Vec<String> = std::env::args().collect();
     if let Some(i) = argv.iter().position(|a| a == "--probe-engine-device") {
@@ -1071,9 +1105,8 @@ async fn run() -> Result<(), Error> {
                         info!("Payout address is this miner's escrow key — delegation signed locally, nothing to set up.");
                         Ok(cert)
                     }
-                    None => escrow::load_cert(&opt.escrow_cert_file, address, &escrow_pubkey_hex).map(|cert| {
+                    None => escrow::load_cert(&opt.escrow_cert_file, address, &escrow_pubkey_hex).inspect(|_cert| {
                         info!("Escrow delegation cert loaded from '{}'.", opt.escrow_cert_file);
-                        cert
                     }),
                 },
             };
@@ -1276,6 +1309,22 @@ async fn run() -> Result<(), Error> {
             error!("GPU probe task panicked: {}", e);
             return Err(e.into());
         }
+    }
+    match nvidia_driver_version() {
+        Some(version) => match nvidia_driver_major(&version) {
+            Some(major) if major >= MIN_NVIDIA_DRIVER_MAJOR => info!("NVIDIA driver {}.", version),
+            Some(_) => {
+                error!(
+                    "NVIDIA driver {} is not supported: mining requires driver {} or newer.",
+                    version, MIN_NVIDIA_DRIVER_MAJOR
+                );
+                error!("HiveOS: run `nvidia-driver-update {}` then reboot.", MIN_NVIDIA_DRIVER_MAJOR);
+                error!("Other systems: install NVIDIA driver {} or newer, then restart the miner.", MIN_NVIDIA_DRIVER_MAJOR);
+                return Err("NVIDIA driver too old — cannot start mining".into());
+            }
+            None => warn!("NVIDIA driver version '{}' could not be parsed.", version),
+        },
+        None => warn!("NVIDIA driver version could not be read."),
     }
     // A library without kernels for a mining GPU passes the load probe and aborts the process on
     // the first request; check every mining GPU up front (in a child process) instead.

@@ -367,7 +367,8 @@ pub fn spawn_ui(
         let mut last_size: Option<(u16, u16)> = None;
         let mut pending_resize: Option<(u16, u16)> = None;
         let mut first_frame = true;
-        let mut last_draw_key: Option<(u16, u16, bool, bool, u64, usize, u64, u64, u64, bool, bool)> = None;
+        type DrawKey = (u16, u16, bool, bool, u64, usize, u64, u64, u64, bool, bool);
+        let mut last_draw_key: Option<DrawKey> = None;
         let mut last_drawn_at = Instant::now();
         #[cfg(feature = "block-celebration")]
         let mut last_block_coin_frame = None;
@@ -1296,9 +1297,11 @@ fn color_for_log_line(line: &str) -> Color {
         palette().bright
     } else if lower.contains("inference") {
         palette().mid
-    } else if lower.contains("escrowwatcher") && lower.contains("claim accepted") {
-        palette().bright
-    } else if lower.contains("found a block") || lower.contains("found a share") || lower.contains("block submitted successfully") {
+    } else if (lower.contains("escrowwatcher") && lower.contains("claim accepted"))
+        || lower.contains("found a block")
+        || lower.contains("found a share")
+        || lower.contains("block submitted successfully")
+    {
         palette().bright
     } else {
         palette().text

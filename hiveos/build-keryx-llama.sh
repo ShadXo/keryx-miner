@@ -36,6 +36,11 @@ SRC=/tmp/llama-src-$TAG
 if [ ! -d "$SRC" ]; then
   git clone --quiet --depth 1 --branch "$TAG" https://github.com/ggml-org/llama.cpp "$SRC"
 fi
+git -C "$SRC" checkout --quiet -- .
+git -C "$SRC" clean -fdq
+for p in "$REPO"/tools/keryx-llama/patches/*.patch; do
+  git -C "$SRC" apply "$p"
+done
 
 docker run --rm --network host \
   -v "$SRC":/llama -v "$REPO":/repo:ro -v "$OUT":/out "${CUDAMOUNT[@]}" \
@@ -50,7 +55,7 @@ docker run --rm --network host \
     /tmp/cmk/bin/cmake -S /llama -B $B -DGGML_CUDA=ON \
       -DCMAKE_CUDA_ARCHITECTURES="$ARCHS" -DBUILD_SHARED_LIBS=OFF \
       -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
-      -DLLAMA_CURL=OFF -DGGML_NATIVE=OFF $CPUFLAGS -DGGML_CUDA_NCCL=OFF -DCMAKE_BUILD_TYPE=Release \
+      -DLLAMA_CURL=OFF -DGGML_NATIVE=OFF $CPUFLAGS -DGGML_CUDA_NCCL=OFF -DGGML_CUDA_FORCE_MMQ=ON -DCMAKE_BUILD_TYPE=Release \
       -DCMAKE_CUDA_COMPILER=$KCUDA/bin/nvcc
     /tmp/cmk/bin/cmake --build $B --target llama -j "$JOBS"
     g++ -O2 -std=c++17 $WRAPFLAGS -shared -fPIC -fopenmp /repo/tools/keryx-llama/keryx_llama.cpp \

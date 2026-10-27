@@ -13,6 +13,11 @@ pub mod pom;
 pub mod pom_gpu;
 pub mod pom_v3;
 pub mod pom_v4;
+pub mod pom_v5;
+pub mod block_task;
+pub mod trace;
+pub mod trace_seq;
+pub mod trace_store;
 pub mod llm;
 pub mod xoshiro256starstar;
 use libloading::{Library, Symbol};
@@ -57,6 +62,7 @@ impl PluginManager {
         std::mem::take(&mut self.startup_warnings)
     }
 
+    #[allow(clippy::result_large_err)]
     pub(crate) unsafe fn load_single_plugin<'help>(
         &mut self,
         app: clap::App<'help>,
