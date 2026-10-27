@@ -55,9 +55,11 @@ jobs:
     timeout-minutes: 350
 
     steps:
-      - uses: actions/checkout@v4
-        # build.rs shells out to git for llama.cpp; keep CRLF out of the sources
+      # Before the checkout: the llama.cpp patches (tools/keryx-llama/patches) are applied with
+      # git apply onto an LF llama.cpp clone, so neither they nor that clone may get CRLF. Set
+      # after the checkout, the patches were already CRLF and did not apply.
       - run: git config --global core.autocrlf false
+      - uses: actions/checkout@v4
 
       - uses: ilammy/msvc-dev-cmd@v1   # puts cl.exe on PATH for nvcc
 

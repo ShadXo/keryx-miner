@@ -1,0 +1,3 @@
+# llama.cpp patches are applied byte-for-byte at build time (build.rs, git apply): never convert
+# their line endings, whatever the checkout's autocrlf setting.
+tools/keryx-llama/patches/*.patch -text
