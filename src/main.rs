@@ -1313,6 +1313,17 @@ async fn run() -> Result<(), Error> {
     match nvidia_driver_version() {
         Some(version) => match nvidia_driver_major(&version) {
             Some(major) if major >= MIN_NVIDIA_DRIVER_MAJOR => info!("NVIDIA driver {}.", version),
+            // Test mode: the floor is where verification is known to work, not where it is known
+            // to fail. Below it the miner still guards itself: a traced tier must pass its
+            // self-check before it serves (a failure stops the miner), and every block-task
+            // opening is checked with the node's verifier before a block is submitted.
+            Some(_) if opt.allow_old_driver => {
+                warn!(
+                    "NVIDIA driver {} is below the supported {} — running anyway (--allow-old-driver).",
+                    version, MIN_NVIDIA_DRIVER_MAJOR
+                );
+                warn!("Watch for 'self-check passed' (driver OK) or 'fails its self-check' (driver not usable: update it).");
+            }
             Some(_) => {
                 error!(
                     "NVIDIA driver {} is not supported: mining requires driver {} or newer.",
@@ -1320,6 +1331,7 @@ async fn run() -> Result<(), Error> {
                 );
                 error!("HiveOS: run `nvidia-driver-update {}` then reboot.", MIN_NVIDIA_DRIVER_MAJOR);
                 error!("Other systems: install NVIDIA driver {} or newer, then restart the miner.", MIN_NVIDIA_DRIVER_MAJOR);
+                error!("To test this driver anyway (its trace self-checks then decide): --allow-old-driver");
                 return Err("NVIDIA driver too old — cannot start mining".into());
             }
             None => warn!("NVIDIA driver version '{}' could not be parsed.", version),

@@ -125,6 +125,13 @@ pub struct Opt {
     pub skip_engine_probe: bool,
 
     #[clap(
+        long = "allow-old-driver",
+        help = "Start on an NVIDIA driver below the supported minimum (595), to test it: the trace self-checks then decide whether this card's inference and block openings verify",
+        help_heading = "Inference"
+    )]
+    pub allow_old_driver: bool,
+
+    #[clap(
         long = "exit-on-disconnect",
         help = "Exit instead of reconnecting when the node or pool connection drops while GPU workers are active (for supervised setups such as HiveOS)"
     )]
