@@ -815,9 +815,11 @@ pub struct V4BatchTuner {
     device_id: u32,
     walk: &'static str,
     candidates: Vec<u64>,
-    /// Per candidate, the median launch rate (nonces/s) of each finished slot.
+    /// Per candidate, the rate (nonces/s) of each finished slot.
     rates: Vec<Vec<f64>>,
-    slot: Vec<f64>,
+    slot_launches: usize,
+    slot_nonces: u64,
+    slot_secs: f64,
     idx: usize,
     round: usize,
     chosen: Option<u64>,
@@ -835,7 +837,7 @@ impl V4BatchTuner {
         candidates.sort_unstable();
         candidates.dedup();
         let n = candidates.len();
-        Self { device_id, walk, candidates, rates: vec![Vec::new(); n], slot: Vec::new(), idx: 0, round: 0, chosen: None, recheck_at: None, rechecked: false }
+        Self { device_id, walk, candidates, rates: vec![Vec::new(); n], slot_launches: 0, slot_nonces: 0, slot_secs: 0.0, idx: 0, round: 0, chosen: None, recheck_at: None, rechecked: false }
     }
 
     /// The batch for the next launch.
@@ -855,25 +857,36 @@ impl V4BatchTuner {
 
     fn restart(&mut self) {
         self.rates.iter_mut().for_each(Vec::clear);
-        self.slot.clear();
+        self.clear_slot();
         self.idx = 0;
         self.round = 0;
         self.chosen = None;
     }
 
-    /// Reports one launch of `batch` nonces that took `secs`. Callers leave out launches that
-    /// found a nonce or ran while the card was paused: those end early.
+    fn clear_slot(&mut self) {
+        self.slot_launches = 0;
+        self.slot_nonces = 0;
+        self.slot_secs = 0.0;
+    }
+
+    /// Reports one launch of `batch` nonces, with `secs` from its start to the start of the next
+    /// one: the work between launches costs a small batch more, so it has to count. Callers leave
+    /// out launches that found a nonce or met a pause. A slot's rate is its total nonces over its
+    /// total time; a stall in one slot is left out by the median over the rounds.
     pub fn record(&mut self, batch: u64, secs: f64) {
         if self.chosen.is_some() || batch != self.candidates[self.idx] || secs <= 0.0 {
             return;
         }
-        self.slot.push(batch as f64 / secs);
-        if self.slot.len() < TUNE_SLOT_LAUNCHES {
+        self.slot_launches += 1;
+        if self.slot_launches > 1 {
+            self.slot_nonces += batch;
+            self.slot_secs += secs;
+        }
+        if self.slot_launches < TUNE_SLOT_LAUNCHES {
             return;
         }
-        let rate = median(&mut self.slot[1..]);
-        self.rates[self.idx].push(rate);
-        self.slot.clear();
+        self.rates[self.idx].push(self.slot_nonces as f64 / self.slot_secs);
+        self.clear_slot();
         self.idx += 1;
         if self.idx == self.candidates.len() {
             self.idx = 0;
@@ -2686,16 +2699,16 @@ mod v4_batch_tests {
     }
 
     #[test]
-    fn tune_interleaves_the_candidates_and_ignores_outliers() {
+    fn tune_interleaves_the_candidates_and_ignores_a_stalled_slot() {
         let mut t = V4BatchTuner::new(0, "v5", 32_768, u64::MAX);
         assert_eq!(t.candidates, vec![16_384, 32_768, 65_536]);
-        // True rates 9, 10 and 9.9 MH/s; each slot has one far-off launch (a 1 ms "launch").
+        // True rates 9, 10 and 9.9 MH/s; each candidate has one slot that runs 10x slower.
         let rate = |b: u64| match b { 16_384 => 9.0e6, 32_768 => 10.0e6, _ => 9.9e6 };
         let mut launches = 0;
         while t.tuning() {
             let b = t.batch();
-            let secs = if launches % TUNE_SLOT_LAUNCHES == 4 { 0.001 } else { b as f64 / rate(b) };
-            t.record(b, secs);
+            let stalled = (launches / TUNE_SLOT_LAUNCHES) % 4 == 0;
+            t.record(b, b as f64 / rate(b) * if stalled { 10.0 } else { 1.0 });
             launches += 1;
         }
         assert_eq!(launches, TUNE_ROUNDS * 3 * TUNE_SLOT_LAUNCHES);
@@ -2703,7 +2716,21 @@ mod v4_batch_tests {
         // A launch of another batch is not counted.
         let mut t = V4BatchTuner::new(0, "v4", 32_768, u64::MAX);
         t.record(65_536, 0.01);
-        assert!(t.slot.is_empty());
+        assert_eq!(t.slot_launches, 0);
+    }
+
+    #[test]
+    fn tune_slot_rate_is_nonces_over_time_without_the_warmup_launch() {
+        let mut t = V4BatchTuner::new(0, "v5", 32_768, u64::MAX);
+        // A slow first launch (buffer growth), then launches that alternate 2 and 4 ms: the rate
+        // is the total, not the rate of a typical launch.
+        t.record(16_384, 1.0);
+        for i in 1..TUNE_SLOT_LAUNCHES {
+            t.record(16_384, if i % 2 == 0 { 0.004 } else { 0.002 });
+        }
+        let expected = (16_384 * 8) as f64 / (4.0 * 0.006);
+        assert!((t.rates[0][0] - expected).abs() < 1.0);
+        assert_eq!(t.batch(), 32_768, "the next slot moves to the next candidate");
     }
 
     #[test]

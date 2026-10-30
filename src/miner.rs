@@ -405,6 +405,8 @@ impl MinerManager {
                 // KERYX_POM_V4_BATCH is used as given.
                 let pom_tune = pom_v4_batch.is_none() && !keryx_miner::pom_gpu::tune_disabled();
                 let mut tuner: Option<(bool, keryx_miner::pom_gpu::V4BatchTuner)> = None;
+                // The batch and start of the last launch the tuner may count.
+                let mut last_launch: Option<(u64, Instant)> = None;
                 let pom_proof_overlap = std::env::var("KERYX_POM_PROOF_OVERLAP").ok().as_deref() != Some("0");
                 let inflight_proofs = Arc::new(AtomicUsize::new(0));
                 type TaskState = (usize, [u8; 32], Box<pow::State>, Arc<keryx_miner::block_task::DeviceTask>);
@@ -434,6 +436,7 @@ impl MinerManager {
                         // meanwhile, so it resumes on a fresh one. Slept rather than spun: a request
                         // can last tens of seconds, and a spin would hold a CPU core for all of it.
                         if keryx_miner::pom_gpu::inference_paused_for(worker_device_id) {
+                            last_launch = None;
                             if let Some(cmd) = block_channel.get_changed()? {
                                 state = match cmd {
                                     Some(WorkerCommand::Job(ns)) => Some(ns),
@@ -548,6 +551,12 @@ impl MinerManager {
                             let walk = if v5 { "v5" } else { "v4" };
                             let start = pom_v4_batch.unwrap_or(POM_V4_BATCH_UNSIZED);
                             tuner = Some((v5, keryx_miner::pom_gpu::v4_batch_tuner(worker_device_id, walk, start)));
+                            last_launch = None;
+                        }
+                        // Launch start to launch start, so the work between launches counts too.
+                        let cycle_start = Instant::now();
+                        if let (Some((_, t)), Some((b, started))) = (tuner.as_mut(), last_launch.take()) {
+                            t.record(b, cycle_start.duration_since(started).as_secs_f64());
                         }
                         let batch = if v4 {
                             if tuned {
@@ -577,15 +586,14 @@ impl MinerManager {
                             std::thread::sleep(std::time::Duration::from_millis(200));
                             continue;
                         }
-                        let launched = std::time::Instant::now();
                         let found = keryx_miner::pom_gpu::mine(worker_device_id, &pph, time, &target_le, pom_nonce, batch, h3, walk_v2, h5_1, h5_2, v3, v4, h10, h14, pad);
-                        // A launch that found a nonce or met a pause ended early, so it says nothing
-                        // about the batch's speed.
-                        if let Some((_, t)) = tuner.as_mut().filter(|(_, t)| tuned && t.tuning()) {
-                            if found.is_none() && !keryx_miner::pom_gpu::inference_paused_for(worker_device_id) {
-                                t.record(batch, launched.elapsed().as_secs_f64());
-                            }
-                        }
+                        // A launch that found a nonce (proof build) or met a pause says nothing about
+                        // the batch's speed.
+                        let counts = tuned
+                            && tuner.as_ref().is_some_and(|(_, t)| t.tuning())
+                            && found.is_none()
+                            && !keryx_miner::pom_gpu::inference_paused_for(worker_device_id);
+                        last_launch = counts.then_some((batch, cycle_start));
                         if keryx_miner::pom_gpu::fatal_gpu_fault() {
                             mark_fatal_gpu_fault(&device_id, "sticky CUDA runtime fault while mining");
                             return Err("fatal CUDA fault during PoM mining".into());
