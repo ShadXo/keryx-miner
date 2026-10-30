@@ -768,12 +768,7 @@ const POM_V4_DOUBLE_BATCH_MIN_FREE_MIB: u64 = 1536;
 pub fn v4_batch_for_device(device_id: u32) -> Option<u64> {
     let miner = miners().lock().ok()?.get(&device_id)?.clone();
     let base = gpu_sm_count(device_id).map_or(POM_V4_BATCH_FALLBACK, v4_batch_for_sm_count);
-    let free_mib = miner
-        .ctx
-        .bind_to_thread()
-        .ok()
-        .and_then(|()| result::mem_get_info().ok())
-        .map(|(free, _)| free as u64 / (1024 * 1024));
+    let free_mib = miner_free_mib(&miner);
     let batch = match free_mib {
         Some(free) if free >= POM_V4_DOUBLE_BATCH_MIN_FREE_MIB => base.saturating_mul(2),
         _ => base,
@@ -785,6 +780,149 @@ pub fn v4_batch_for_device(device_id: u32) -> Option<u64> {
         free_mib.map_or_else(|| "unknown".to_string(), |f| f.to_string())
     );
     Some(batch)
+}
+
+fn miner_free_mib(miner: &PomGpuMiner) -> Option<u64> {
+    miner.ctx.bind_to_thread().ok().and_then(|()| result::mem_get_info().ok()).map(|(free, _)| free as u64 / (1024 * 1024))
+}
+
+// ── LIVE BATCH TUNE ──────────────────────────────────────────────────────────────────────────────
+// Each card times its own mining launches at half, one and twice its starting batch, in
+// interleaved rounds, and keeps the largest batch within 2% of the fastest. It measures the walk
+// that actually runs (v4, or v5 after H15), so a walk change starts a fresh tune, and it tunes once
+// more after the card has warmed up. KERYX_POM_V4_AUTOTUNE=0 disables it; KERYX_POM_V4_BATCH fixes
+// the batch instead.
+
+/// Launches per measurement slot. The first one warms the candidate's buffers and is not counted.
+const TUNE_SLOT_LAUNCHES: usize = 9;
+const TUNE_ROUNDS: usize = 3;
+/// The largest batch within this fraction of the fastest one wins: fewer, longer launches.
+const TUNE_NEAR_PEAK: f64 = 0.98;
+/// A longer launch reacts too late to a new template at 10 BPS; only the smallest candidate may exceed it.
+const TUNE_MAX_LAUNCH_SECS: f64 = 0.050;
+/// The first tune runs on a cold card that boosts higher than it will at its power limit.
+const TUNE_RECHECK_AFTER: std::time::Duration = std::time::Duration::from_secs(600);
+/// Device memory per nonce in a launch: the seed slot plus the chase+tc offsets (K u32s).
+const TUNE_BYTES_PER_NONCE: u64 = 8 + 4 * crate::pom_v4::POM_V4_K as u64;
+
+pub fn tune_disabled() -> bool {
+    std::env::var("KERYX_POM_V4_AUTOTUNE").is_ok_and(|v| v.trim() == "0")
+}
+
+/// The live batch tuner of one card for one walk. `miner.rs` asks it for each launch's batch and
+/// reports how long the launch took.
+pub struct V4BatchTuner {
+    device_id: u32,
+    walk: &'static str,
+    candidates: Vec<u64>,
+    /// Per candidate, the median launch rate (nonces/s) of each finished slot.
+    rates: Vec<Vec<f64>>,
+    slot: Vec<f64>,
+    idx: usize,
+    round: usize,
+    chosen: Option<u64>,
+    recheck_at: Option<std::time::Instant>,
+    rechecked: bool,
+}
+
+impl V4BatchTuner {
+    /// Candidates are half, one and twice `start`; the doubled one only when it stays under `max`.
+    pub fn new(device_id: u32, walk: &'static str, start: u64, max: u64) -> Self {
+        let mut candidates = vec![(start / 2).max(POM_V4_BATCH_MIN), start];
+        if start.saturating_mul(2) <= max {
+            candidates.push(start * 2);
+        }
+        candidates.sort_unstable();
+        candidates.dedup();
+        let n = candidates.len();
+        Self { device_id, walk, candidates, rates: vec![Vec::new(); n], slot: Vec::new(), idx: 0, round: 0, chosen: None, recheck_at: None, rechecked: false }
+    }
+
+    /// The batch for the next launch.
+    pub fn batch(&mut self) -> u64 {
+        if self.recheck_at.is_some_and(|t| std::time::Instant::now() >= t) {
+            self.recheck_at = None;
+            self.rechecked = true;
+            self.restart();
+            info!("PoM[gpu{}]: re-tuning the {} batch on the warm card", self.device_id, self.walk);
+        }
+        self.chosen.unwrap_or(self.candidates[self.idx])
+    }
+
+    pub fn tuning(&self) -> bool {
+        self.chosen.is_none()
+    }
+
+    fn restart(&mut self) {
+        self.rates.iter_mut().for_each(Vec::clear);
+        self.slot.clear();
+        self.idx = 0;
+        self.round = 0;
+        self.chosen = None;
+    }
+
+    /// Reports one launch of `batch` nonces that took `secs`. Callers leave out launches that
+    /// found a nonce or ran while the card was paused: those end early.
+    pub fn record(&mut self, batch: u64, secs: f64) {
+        if self.chosen.is_some() || batch != self.candidates[self.idx] || secs <= 0.0 {
+            return;
+        }
+        self.slot.push(batch as f64 / secs);
+        if self.slot.len() < TUNE_SLOT_LAUNCHES {
+            return;
+        }
+        let rate = median(&mut self.slot[1..]);
+        self.rates[self.idx].push(rate);
+        self.slot.clear();
+        self.idx += 1;
+        if self.idx == self.candidates.len() {
+            self.idx = 0;
+            self.round += 1;
+            if self.round == TUNE_ROUNDS {
+                self.finish();
+            }
+        }
+    }
+
+    fn finish(&mut self) {
+        let rates: Vec<(u64, f64)> = self.candidates.iter().zip(self.rates.iter_mut()).map(|(&b, r)| (b, median(r))).collect();
+        let chosen = pick_tuned_batch(&rates);
+        let list = rates.iter().map(|(b, r)| format!("{} → {:.3} MH/s", b, r / 1e6)).collect::<Vec<_>>().join(", ");
+        info!("PoM[gpu{}]: {} batch tuned to {} nonces ({})", self.device_id, self.walk, chosen, list);
+        self.chosen = Some(chosen);
+        if !self.rechecked {
+            self.recheck_at = Some(std::time::Instant::now() + TUNE_RECHECK_AFTER);
+        }
+    }
+}
+
+/// Median of a non-empty slice (reorders it).
+fn median(v: &mut [f64]) -> f64 {
+    v.sort_unstable_by(|a, b| a.total_cmp(b));
+    let m = v.len() / 2;
+    if v.len() % 2 == 0 { (v[m - 1] + v[m]) / 2.0 } else { v[m] }
+}
+
+/// The largest batch within `TUNE_NEAR_PEAK` of the fastest, among those whose launch stays under
+/// `TUNE_MAX_LAUNCH_SECS` (the smallest always qualifies). `rates` is sorted by batch.
+fn pick_tuned_batch(rates: &[(u64, f64)]) -> u64 {
+    let fits: Vec<(u64, f64)> =
+        rates.iter().enumerate().filter(|(i, (b, r))| *i == 0 || *b as f64 / r <= TUNE_MAX_LAUNCH_SECS).map(|(_, x)| *x).collect();
+    let peak = fits.iter().map(|(_, r)| *r).fold(0.0, f64::max);
+    fits.iter().rev().find(|(_, r)| *r >= peak * TUNE_NEAR_PEAK).map_or(rates[0].0, |(b, _)| *b)
+}
+
+/// A tuner for `device_id` around `start`, with the doubled candidate allowed only while the card
+/// keeps the free VRAM the doubled default needs plus the larger launch buffers.
+pub fn v4_batch_tuner(device_id: u32, walk: &'static str, start: u64) -> V4BatchTuner {
+    let free_mib = miners().lock().ok().and_then(|g| g.get(&device_id).cloned()).and_then(|m| miner_free_mib(&m));
+    let max = free_mib.map_or(start, |free| {
+        let spare = free.saturating_sub(POM_V4_DOUBLE_BATCH_MIN_FREE_MIB) * 1024 * 1024;
+        start + spare / TUNE_BYTES_PER_NONCE
+    });
+    let tuner = V4BatchTuner::new(device_id, walk, start, max);
+    info!("PoM[gpu{}]: tuning the {} batch live: {:?} nonces", device_id, walk, tuner.candidates);
+    tuner
 }
 
 /// Whether an accelerated v4 solver is armed for this device in the current walk era. The large v4
@@ -2533,5 +2671,46 @@ mod v4_batch_tests {
         assert_eq!(v4_batch_for_sm_count(128), 49_152);
         assert_eq!(v4_batch_for_sm_count(16), POM_V4_BATCH_MIN);
         assert!(v4_batch_for_sm_count(1) >= POM_V4_BATCH_MIN);
+    }
+
+    #[test]
+    fn tune_picks_the_largest_batch_near_the_peak_within_the_launch_cap() {
+        // 1% slower at twice the batch: the larger one wins.
+        assert_eq!(pick_tuned_batch(&[(16_384, 9.0e6), (32_768, 10.0e6), (65_536, 9.9e6)]), 65_536);
+        // 5% slower: it does not.
+        assert_eq!(pick_tuned_batch(&[(16_384, 9.0e6), (32_768, 10.0e6), (65_536, 9.5e6)]), 32_768);
+        // 65,536 nonces at 1 MH/s is a 65 ms launch, over the cap.
+        assert_eq!(pick_tuned_batch(&[(16_384, 0.9e6), (32_768, 0.95e6), (65_536, 1.0e6)]), 32_768);
+        // Even the smallest is over the cap: it is still the one used.
+        assert_eq!(pick_tuned_batch(&[(16_384, 0.1e6), (32_768, 0.1e6)]), 16_384);
+    }
+
+    #[test]
+    fn tune_interleaves_the_candidates_and_ignores_outliers() {
+        let mut t = V4BatchTuner::new(0, "v5", 32_768, u64::MAX);
+        assert_eq!(t.candidates, vec![16_384, 32_768, 65_536]);
+        // True rates 9, 10 and 9.9 MH/s; each slot has one far-off launch (a 1 ms "launch").
+        let rate = |b: u64| match b { 16_384 => 9.0e6, 32_768 => 10.0e6, _ => 9.9e6 };
+        let mut launches = 0;
+        while t.tuning() {
+            let b = t.batch();
+            let secs = if launches % TUNE_SLOT_LAUNCHES == 4 { 0.001 } else { b as f64 / rate(b) };
+            t.record(b, secs);
+            launches += 1;
+        }
+        assert_eq!(launches, TUNE_ROUNDS * 3 * TUNE_SLOT_LAUNCHES);
+        assert_eq!(t.batch(), 65_536);
+        // A launch of another batch is not counted.
+        let mut t = V4BatchTuner::new(0, "v4", 32_768, u64::MAX);
+        t.record(65_536, 0.01);
+        assert!(t.slot.is_empty());
+    }
+
+    #[test]
+    fn tune_skips_the_doubled_batch_without_room_and_keeps_the_floor() {
+        let t = V4BatchTuner::new(0, "v4", 32_768, 40_000);
+        assert_eq!(t.candidates, vec![16_384, 32_768]);
+        let t = V4BatchTuner::new(0, "v4", POM_V4_BATCH_MIN, u64::MAX);
+        assert_eq!(t.candidates, vec![POM_V4_BATCH_MIN, 2 * POM_V4_BATCH_MIN]);
     }
 }

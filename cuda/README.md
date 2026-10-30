@@ -130,26 +130,22 @@ At startup, look for PoM logs that show per-GPU selection, for example:
 
 If fatbins are not available/compatible on a card, runtime falls back to the PoM PTX ladder.
 
-## v4 Walk Kernels and Autotune
+## v4/v5 Walk Kernels and Batch Tune
 
-Each card picks its v4 walk and batch on the first v4 launch and caches the result in
-`~/.keryx/v4tune.json` (`%USERPROFILE%\.keryx\v4tune.json` on Windows), keyed by GPU, model
-layout, seed era, override policy and miner version. Candidates: `chase+tensor-core`,
-`chaseless`, and on sm_80–sm_11x the two sidecar walks (`sidecar-chase+tensor-core`,
-`sidecar-chase+addr-tensor-core`), which need `pom_build_v4_snippet_folds`,
-`pom_build_v4_tile_addrs`, `pom_mine_v4_chase_sidecar` and `pom_mine_v4_tc_addr` in the loaded
-image. Fatbins built before those kernels lack them, so the sidecar walks stay off until both
-fatbins are regenerated. Every candidate must match the classic walk on a startup probe before
-it may mine; a sidecar must also beat the best established walk by 2%.
+The walk follows a fixed rule: chaseless on GDDR cards and chase+tensor-core on HBM (CC 8.0/9.0)
+for v4, and chaseless for v5 (H15) on every card that has it, else the classic walk. The
+chaseless walk must pass a one-nonce probe before it may mine.
+
+The batch is tuned live, per card and per walk, while the card mines. Each card times its own
+launches at half, one and twice its starting batch (the SM-derived batch, doubled with >= 1.5 GiB
+free VRAM), in 3 interleaved rounds of 8 counted launches each, and keeps the largest batch within
+2% of the fastest whose launch stays under 50 ms. It logs `v4 batch tuned to ...` (or `v5 ...`),
+tunes again once after 10 minutes on the warm card, and starts over when the walk changes at H15.
+Nothing is cached on disk.
 
 | Variable | Effect |
 |---|---|
-| `KERYX_POM_V4_AUTOTUNE=0` | No tuning: chaseless (GDDR) or chase+tc (HBM), SM-derived batch |
-| `KERYX_POM_V4_AUTOTUNE=force` | Ignore the disk cache and re-measure |
+| `KERYX_POM_V4_AUTOTUNE=0` | No tuning: the starting batch is used as is |
 | `KERYX_POM_V4_BATCH=<n>` | Fixed batch, no tuning |
 | `KERYX_POM_V4_TC=0` | Classic walk only |
-| `KERYX_POM_V4_NCF=0` / `=1` | Exclude / force the chaseless walk |
-| `KERYX_POM_V4_SIDECAR=0` / `=1` | Exclude the sidecar walks / allow them on sm_12x+ too |
-
-The probe and the walks can be checked on a card with
-`cargo test --release -- --ignored v4_backend`.
+| `KERYX_POM_V4_NCF=0` / `=1` | Exclude / force the chaseless walk (=1 includes HBM for v4) |
