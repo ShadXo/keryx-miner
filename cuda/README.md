@@ -150,3 +150,4 @@ Nothing is cached on disk.
 | `KERYX_POM_V4_BATCH=<n>` | Fixed batch, no tuning |
 | `KERYX_POM_V4_TC=0` | Classic walk only |
 | `KERYX_POM_V4_NCF=0` / `=1` | Exclude / force the chaseless walk (=1 includes HBM for v4) |
+| `KERYX_POM_V5_FOLDS=0` | No snippet fold table: the v5 walk folds each tile in the kernel |

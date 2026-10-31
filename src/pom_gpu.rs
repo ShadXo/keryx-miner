@@ -38,6 +38,9 @@ const POM_V4_SHARED_BYTES: u32 = 2048;
 const POM_V4_CHASE_KERNEL_NAME: &str = "pom_mine_v4_chase";
 const POM_SEED_H10_KERNEL_NAME: &str = "pom_seed_h10_batch";
 const POM_V5_PAD_FILL_KERNEL_NAME: &str = "pom_v5_pad_fill";
+const POM_SNIPPET_FOLDS_KERNEL_NAME: &str = "pom_build_v4_snippet_folds";
+/// VRAM to leave free after the snippet fold table.
+const POM_V5_FOLDS_MARGIN_MIB: u64 = 32;
 /// Pad entries filled per launch.
 const POM_V5_FILL_SLICE: u64 = 1 << 20;
 const POM_V4_TC_KERNEL_NAME: &str = "pom_mine_v4_tc";
@@ -227,6 +230,8 @@ struct LoadedPomKernel {
     function_seed_h10: Option<sys::CUfunction>,
     /// v5 context pad fill; required once the v5 walk is active.
     function_v5_pad_fill: Option<sys::CUfunction>,
+    /// Builds the per-tile snippet fold table of the chaseless v5 walk; optional.
+    function_snippet_folds: Option<sys::CUfunction>,
 }
 
 impl Drop for LoadedPomKernel {
@@ -263,7 +268,9 @@ impl LoadedPomKernel {
             unsafe { result::module::get_function(module, CString::new(POM_SEED_H10_KERNEL_NAME).unwrap()) }.ok();
         let function_v5_pad_fill =
             unsafe { result::module::get_function(module, CString::new(POM_V5_PAD_FILL_KERNEL_NAME).unwrap()) }.ok();
-        Ok(Self { module, function, function_v3, function_v3_dump, function_v4, function_v4_chase, function_v4_tc, tc_enabled: false, function_v4_ncf, ncf_enabled: false, ncf_v5: false, function_seed_h10, function_v5_pad_fill })
+        let function_snippet_folds =
+            unsafe { result::module::get_function(module, CString::new(POM_SNIPPET_FOLDS_KERNEL_NAME).unwrap()) }.ok();
+        Ok(Self { module, function, function_v3, function_v3_dump, function_v4, function_v4_chase, function_v4_tc, tc_enabled: false, function_v4_ncf, ncf_enabled: false, ncf_v5: false, function_seed_h10, function_v5_pad_fill, function_snippet_folds })
     }
 
     fn from_ptx(_label: &'static str, ptx: &'static str) -> Result<Self> {
@@ -282,7 +289,9 @@ impl LoadedPomKernel {
             unsafe { result::module::get_function(module, CString::new(POM_SEED_H10_KERNEL_NAME).unwrap()) }.ok();
         let function_v5_pad_fill =
             unsafe { result::module::get_function(module, CString::new(POM_V5_PAD_FILL_KERNEL_NAME).unwrap()) }.ok();
-        Ok(Self { module, function, function_v3, function_v3_dump, function_v4, function_v4_chase, function_v4_tc, tc_enabled: false, function_v4_ncf, ncf_enabled: false, ncf_v5: false, function_seed_h10, function_v5_pad_fill })
+        let function_snippet_folds =
+            unsafe { result::module::get_function(module, CString::new(POM_SNIPPET_FOLDS_KERNEL_NAME).unwrap()) }.ok();
+        Ok(Self { module, function, function_v3, function_v3_dump, function_v4, function_v4_chase, function_v4_tc, tc_enabled: false, function_v4_ncf, ncf_enabled: false, ncf_v5: false, function_seed_h10, function_v5_pad_fill, function_snippet_folds })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -481,7 +490,8 @@ impl LoadedPomKernel {
             block_dim: ((V4_NCF_WARPS * 32) as u32, 1, 1),
             shared_mem_bytes: (V4_NCF_WARPS as u32) * POM_V4_NCF_SHARED_PER_WARP,
         };
-        let mut params: [*mut c_void; 29] = [
+        let no_folds = 0u64;
+        let mut params: [*mut c_void; 30] = [
             (&bases_ptr as *const _ as *mut c_void), (&prefix_ptr as *const _ as *mut c_void),
             (&t_count as *const _ as *mut c_void), (&n_tiles as *const _ as *mut c_void), (&k as *const _ as *mut c_void),
             (&p_words[0] as *const _ as *mut c_void), (&p_words[1] as *const _ as *mut c_void),
@@ -497,6 +507,7 @@ impl LoadedPomKernel {
             (&winner_ptr as *const _ as *mut c_void),
             (&v5_ptr as *const _ as *mut c_void), (&seed_h10 as *const _ as *mut c_void),
             (&n_pad as *const _ as *mut c_void), (&inv_p as *const _ as *mut c_void), (&k_pad as *const _ as *mut c_void),
+            (&no_folds as *const _ as *mut c_void),
         ];
         unsafe { result::launch_kernel(walk, cfg.grid_dim, cfg.block_dim, cfg.shared_mem_bytes, stream.cu_stream(), &mut params) }?;
         stream.synchronize()?;
@@ -507,7 +518,7 @@ impl LoadedPomKernel {
     /// v4 (re-walk) grind: one block of 32 threads per nonce over `[start, start + batch)`.
     /// `n_pad > 0` runs the v5 walk; the chase+tc path is v4 only.
     #[allow(clippy::too_many_arguments)]
-    fn launch_v4(&self, stream: &Arc<CudaStream>, bases_dev: &CudaSlice<u64>, prefix_dev: &CudaSlice<u64>, t_count: u32, n_tiles: u64, n_pad: u64, k_pad: u32, p_words: &[u64; 4], s_words: &[u64; 4], timestamp: u64, target_le: &[u8; 32], start: u64, batch: u64, h10_state: Option<&[u64; 25]>) -> Result<Option<u64>> {
+    fn launch_v4(&self, stream: &Arc<CudaStream>, bases_dev: &CudaSlice<u64>, prefix_dev: &CudaSlice<u64>, t_count: u32, n_tiles: u64, n_pad: u64, k_pad: u32, p_words: &[u64; 4], s_words: &[u64; 4], timestamp: u64, target_le: &[u8; 32], start: u64, batch: u64, h10_state: Option<&[u64; 25]>, snippet_folds: Option<&CudaSlice<u64>>) -> Result<Option<u64>> {
         let t = words4(target_le);
         let k = crate::pom_v4::POM_V4_K as u32;
         let scratch = v4_scratch(stream, batch as usize)?;
@@ -548,12 +559,13 @@ impl LoadedPomKernel {
             let inv_n = u64::MAX / n_tiles;
             let inv_p = u64::MAX.checked_div(n_pad).unwrap_or(0);
             let (lut_ptr, _lg) = lut.device_ptr(stream);
+            let folds_ptr: u64 = snippet_folds.map_or(0, |f| f.device_ptr(stream).0);
             let cfg = LaunchConfig {
                 grid_dim: (batch.div_ceil(V4_NCF_WARPS) as u32, 1, 1),
                 block_dim: ((V4_NCF_WARPS * 32) as u32, 1, 1),
                 shared_mem_bytes: (V4_NCF_WARPS as u32) * POM_V4_NCF_SHARED_PER_WARP,
             };
-            let mut params: [*mut c_void; 29] = [
+            let mut params: [*mut c_void; 30] = [
                 (&bases_ptr as *const _ as *mut c_void), (&prefix_ptr as *const _ as *mut c_void),
                 (&t_count as *const _ as *mut c_void), (&n_tiles as *const _ as *mut c_void), (&k as *const _ as *mut c_void),
                 (&p_words[0] as *const _ as *mut c_void), (&p_words[1] as *const _ as *mut c_void),
@@ -569,6 +581,7 @@ impl LoadedPomKernel {
                 (&winner_ptr as *const _ as *mut c_void),
                 (&v5_ptr as *const _ as *mut c_void), (&seed_h10 as *const _ as *mut c_void),
                 (&n_pad as *const _ as *mut c_void), (&inv_p as *const _ as *mut c_void), (&k_pad as *const _ as *mut c_void),
+                (&folds_ptr as *const _ as *mut c_void),
             ];
             unsafe { result::launch_kernel(walk, cfg.grid_dim, cfg.block_dim, cfg.shared_mem_bytes, stream.cu_stream(), &mut params) }?;
             stream.synchronize()?;
@@ -1114,6 +1127,8 @@ struct PadSegment {
     prefix: CudaSlice<u64>,
     t_count: u32,
     weight_tiles: u64,
+    /// Snippet fold per tile, weights then pad, for the chaseless walk; None folds in the kernel.
+    snippet_folds: Option<CudaSlice<u64>>,
 }
 
 pub struct PomGpuMiner {
@@ -1330,15 +1345,63 @@ impl PomGpuMiner {
         let pad_base = buf.device_ptr(&self.stream).0;
         v5_bases.push(pad_base);
         v5_prefix.push(cap + tiles * crate::pom_v4::POM_V4_TILE_CHUNKS);
-        Ok(PadSegment {
-            seed: *pad_seed,
-            tiles,
-            bases: self.stream.clone_htod(v5_bases.as_slice())?,
-            prefix: self.stream.clone_htod(v5_prefix.as_slice())?,
-            t_count: v5_bases.len() as u32,
-            weight_tiles,
-            _buf: buf,
-        })
+        let bases = self.stream.clone_htod(v5_bases.as_slice())?;
+        let prefix = self.stream.clone_htod(v5_prefix.as_slice())?;
+        let t_count = v5_bases.len() as u32;
+        let snippet_folds = self.snippet_fold_table(pad_seed, &bases, &prefix, t_count, weight_tiles, tiles);
+        Ok(PadSegment { seed: *pad_seed, tiles, bases, prefix, t_count, weight_tiles, snippet_folds, _buf: buf })
+    }
+
+    /// The snippet fold of every weight and pad tile, when the chaseless walk runs and the table
+    /// fits. Any failure only costs the speedup: the kernel then folds each tile itself.
+    fn snippet_fold_table(&self, pad_seed: &[u8; 32], bases: &CudaSlice<u64>, prefix: &CudaSlice<u64>, t_count: u32, weight_tiles: u64, pad_tiles: u64) -> Option<CudaSlice<u64>> {
+        if std::env::var("KERYX_POM_V5_FOLDS").is_ok_and(|v| v.trim() == "0") || !self.kernel.ncf_v5 {
+            return None;
+        }
+        let build = self.kernel.function_snippet_folds?;
+        let n = weight_tiles + pad_tiles;
+        let need_mib = (n * 8) >> 20;
+        let free_mib = result::mem_get_info().map_or(0, |(free, _)| free as u64 >> 20);
+        if free_mib < need_mib + POM_V5_FOLDS_MARGIN_MIB {
+            info!("PoM v5: no snippet fold table: needs {} MiB, {} MiB free", need_mib, free_mib);
+            return None;
+        }
+        let t0 = std::time::Instant::now();
+        let built = (|| -> Result<CudaSlice<u64>> {
+            let table = self.stream.alloc_zeros::<u64>(n as usize)?;
+            {
+                let (bases_ptr, _bg) = bases.device_ptr(&self.stream);
+                let (prefix_ptr, _pg) = prefix.device_ptr(&self.stream);
+                let (table_ptr, _tg) = table.device_ptr(&self.stream);
+                let cfg = LaunchConfig { grid_dim: (n.div_ceil(256) as u32, 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 };
+                let mut params: [*mut c_void; 5] = [
+                    (&bases_ptr as *const _ as *mut c_void), (&prefix_ptr as *const _ as *mut c_void),
+                    (&t_count as *const _ as *mut c_void), (&n as *const _ as *mut c_void), (&table_ptr as *const _ as *mut c_void),
+                ];
+                unsafe { result::launch_kernel(build, cfg.grid_dim, cfg.block_dim, cfg.shared_mem_bytes, self.stream.cu_stream(), &mut params) }?;
+                self.stream.synchronize()?;
+            }
+            // A wrong table would cost every proof, so check it against the host's fold.
+            let read: Vec<u64> = self.stream.clone_dtoh(&table)?;
+            for tile in [0, pad_tiles / 2, pad_tiles - 1] {
+                let entry = crate::pom_v5::v5_pad_entry(pad_seed, tile * crate::pom_v5::POM_V5_TILE_ENTRIES);
+                let fold = crate::pom_v3::snippet_fold(&entry);
+                if read[(weight_tiles + tile) as usize] != fold {
+                    return Err(anyhow!("pad tile {} folds differently on the host", tile));
+                }
+            }
+            Ok(table)
+        })();
+        match built {
+            Ok(table) => {
+                info!("PoM v5: snippet fold table of {} entries ({} MiB) built in {:.1} s", n, need_mib, t0.elapsed().as_secs_f64());
+                Some(table)
+            }
+            Err(e) => {
+                warn!("PoM v5: no snippet fold table ({e})");
+                None
+            }
+        }
     }
 
     /// Allocates the v5 context pad of `n` entries seeded by `pad_seed` and fills it on the device.
@@ -1395,7 +1458,7 @@ impl PomGpuMiner {
             let seed_pph = if seed_h14 { crate::pom::seed_h14_pph(pre_pow_hash) } else { *pre_pow_hash };
             let h10_state = seed_h10.then(|| crate::pom::pom_seed_h10_state(&seed_pph, timestamp));
             let Some((seed, tiles)) = pad else {
-                return self.kernel.launch_v4(&self.stream, &self.bases_dev, &self.prefix_dev, self.t_count, n_tiles, 0, 0, &p_words, &s_words, timestamp, target_le, start, batch, h10_state.as_ref());
+                return self.kernel.launch_v4(&self.stream, &self.bases_dev, &self.prefix_dev, self.t_count, n_tiles, 0, 0, &p_words, &s_words, timestamp, target_le, start, batch, h10_state.as_ref(), None);
             };
             if tiles == 0 {
                 return Err(anyhow!("PoM GPU: empty context pad"));
@@ -1407,7 +1470,7 @@ impl PomGpuMiner {
             }
             let g = guard.as_ref().unwrap();
             let k_pad = crate::pom_v5::v5_pad_steps(g.weight_tiles, g.tiles) as u32;
-            return self.kernel.launch_v4(&self.stream, &g.bases, &g.prefix, g.t_count, g.weight_tiles, g.tiles, k_pad, &p_words, &s_words, timestamp, target_le, start, batch, h10_state.as_ref());
+            return self.kernel.launch_v4(&self.stream, &g.bases, &g.prefix, g.t_count, g.weight_tiles, g.tiles, k_pad, &p_words, &s_words, timestamp, target_le, start, batch, h10_state.as_ref(), g.snippet_folds.as_ref());
         }
         let p_words = crate::pom::pph_words_for_era(pre_pow_hash, h3);
         let s_words = crate::pom::seed_pph_words_for_era(pre_pow_hash, h3, h5_1, h5_2);

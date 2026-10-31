@@ -803,7 +803,8 @@ extern "C" __global__ void pom_mine_v4_ncf(
     const unsigned short* lut, unsigned int lut_sh, unsigned long long inv_n,
     unsigned long long* winner,
     const unsigned long long* h10_seeds, unsigned int seed_h10,
-    unsigned long long n_pad, unsigned long long inv_p, unsigned int k_pad) {
+    unsigned long long n_pad, unsigned long long inv_p, unsigned int k_pad,
+    const unsigned long long* snippet_folds) {
     extern __shared__ unsigned int s_shared[];
     const unsigned int w = threadIdx.x >> 5;
     const unsigned int x = threadIdx.x & 31u;
@@ -822,7 +823,7 @@ extern "C" __global__ void pom_mine_v4_ncf(
 
     // The pad is the last segment, one contiguous block starting at tile n_tiles.
     const ulonglong2* pad = k_pad != 0u ? (const ulonglong2*)bases[T - 1u] : nullptr;
-    const unsigned long long off = v4_barrett_mod(mix64(seed ^ V4_OFFSET_FIRST_SALT), n_tiles, inv_n);
+    unsigned long long off = v4_barrett_mod(mix64(seed ^ V4_OFFSET_FIRST_SALT), n_tiles, inv_n);
     {
         const ulonglong2* q = v4_chunk_addr_lut(bases, prefix, T, lut, lut_sh, off, x);
         ulonglong2* dst = (ulonglong2*)(s_tiles + 256u + x * 8);   // tile 1 -> buffer (1&1)=1
@@ -839,14 +840,26 @@ extern "C" __global__ void pom_mine_v4_ncf(
         asm volatile("cp.async.wait_group 0;");
         __syncwarp();
         if (step < K) {
+            // The optional table holds this fold per tile, weights and pad, so one load replaces
+            // the 8 mixes. `off` is the tile just loaded.
             unsigned long long sf = 0;
-            #pragma unroll
-            for (int wd = 0; wd < 8; wd++) sf = mix64(sf ^ (unsigned long long)cur[wd]);
+            if (snippet_folds) {
+                sf = __ldg(&snippet_folds[off]);
+            } else {
+                #pragma unroll
+                for (int wd = 0; wd < 8; wd++) sf = mix64(sf ^ (unsigned long long)cur[wd]);
+            }
             const unsigned long long hs = k_pad != 0u ? v5_state_fold(s_state[x * 8u], s_state[x * 8u + 1u], x) : 0ULL;
             const unsigned long long raw = mix64(seed ^ (unsigned long long)(step + 1) * V4_OFFSET_STEP_SALT ^ sf ^ hs);
-            const ulonglong2* q = v5_is_pad_step(step + 1u, k_pad)
-                ? pad + (v4_barrett_mod(raw, n_pad, inv_p) * (unsigned long long)V4_TILE_CHUNKS + x) * 2ULL
-                : v4_chunk_addr_lut(bases, prefix, T, lut, lut_sh, v4_barrett_mod(raw, n_tiles, inv_n), x);
+            const ulonglong2* q;
+            if (v5_is_pad_step(step + 1u, k_pad)) {
+                const unsigned long long p = v4_barrett_mod(raw, n_pad, inv_p);
+                off = n_tiles + p;
+                q = pad + (p * (unsigned long long)V4_TILE_CHUNKS + x) * 2ULL;
+            } else {
+                off = v4_barrett_mod(raw, n_tiles, inv_n);
+                q = v4_chunk_addr_lut(bases, prefix, T, lut, lut_sh, off, x);
+            }
             ulonglong2* dst = (ulonglong2*)(s_tiles + ((step + 1u) & 1u) * 256u + x * 8);
             v4_cp_async16(dst, q); v4_cp_async16(dst + 1, q + 1);
         }
@@ -888,7 +901,8 @@ extern "C" __global__ void pom_mine_v4_ncf(
     unsigned long long, unsigned long long,
     const unsigned short*, unsigned int, unsigned long long,
     unsigned long long*,
-    const unsigned long long*, unsigned int, unsigned long long, unsigned long long, unsigned int) {}
+    const unsigned long long*, unsigned int, unsigned long long, unsigned long long, unsigned int,
+    const unsigned long long*) {}
 #endif
 
 // ============================================================================
