@@ -820,7 +820,9 @@ pub struct V4BatchTuner {
     slot_launches: usize,
     slot_nonces: u64,
     slot_secs: f64,
+    /// The candidate of the running slot, and that slot's place in its round.
     idx: usize,
+    pos: usize,
     round: usize,
     chosen: Option<u64>,
     recheck_at: Option<std::time::Instant>,
@@ -837,7 +839,7 @@ impl V4BatchTuner {
         candidates.sort_unstable();
         candidates.dedup();
         let n = candidates.len();
-        Self { device_id, walk, candidates, rates: vec![Vec::new(); n], slot_launches: 0, slot_nonces: 0, slot_secs: 0.0, idx: 0, round: 0, chosen: None, recheck_at: None, rechecked: false }
+        Self { device_id, walk, candidates, rates: vec![Vec::new(); n], slot_launches: 0, slot_nonces: 0, slot_secs: 0.0, idx: 0, pos: 0, round: 0, chosen: None, recheck_at: None, rechecked: false }
     }
 
     /// The batch for the next launch.
@@ -859,6 +861,7 @@ impl V4BatchTuner {
         self.rates.iter_mut().for_each(Vec::clear);
         self.clear_slot();
         self.idx = 0;
+        self.pos = 0;
         self.round = 0;
         self.chosen = None;
     }
@@ -887,14 +890,18 @@ impl V4BatchTuner {
         }
         self.rates[self.idx].push(self.slot_nonces as f64 / self.slot_secs);
         self.clear_slot();
-        self.idx += 1;
-        if self.idx == self.candidates.len() {
-            self.idx = 0;
+        let n = self.candidates.len();
+        self.pos += 1;
+        if self.pos == n {
+            self.pos = 0;
             self.round += 1;
             if self.round == TUNE_ROUNDS {
                 self.finish();
             }
         }
+        // Each round starts one candidate later: the card warms during a tune, so a fixed order
+        // would always measure the same candidate coolest.
+        self.idx = (self.pos + self.round) % n;
     }
 
     fn finish(&mut self) {
@@ -2717,6 +2724,21 @@ mod v4_batch_tests {
         let mut t = V4BatchTuner::new(0, "v4", 32_768, u64::MAX);
         t.record(65_536, 0.01);
         assert_eq!(t.slot_launches, 0);
+    }
+
+    #[test]
+    fn tune_rotates_which_candidate_each_round_measures_first() {
+        let mut t = V4BatchTuner::new(0, "v5", 32_768, u64::MAX);
+        let mut order = Vec::new();
+        while t.tuning() {
+            let b = t.batch();
+            if order.last() != Some(&b) {
+                order.push(b);
+            }
+            t.record(b, 0.01);
+        }
+        let (a, b, c) = (16_384, 32_768, 65_536);
+        assert_eq!(order, vec![a, b, c, b, c, a, c, a, b]);
     }
 
     #[test]

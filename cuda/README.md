@@ -138,8 +138,8 @@ chaseless walk must pass a one-nonce probe before it may mine.
 
 The batch is tuned live, per card and per walk, while the card mines. Each card times its own
 launches, from one launch start to the next, at half, one and twice its starting batch (the
-SM-derived batch, doubled with >= 1.5 GiB free VRAM), in 3 interleaved rounds of 8 counted
-launches each, and keeps the largest batch within
+SM-derived batch, doubled with >= 1.5 GiB free VRAM), in 3 rounds of 8 counted launches per batch,
+each round starting one batch later, and keeps the largest batch within
 2% of the fastest whose launch stays under 50 ms. It logs `v4 batch tuned to ...` (or `v5 ...`),
 tunes again once after 10 minutes on the warm card, and starts over when the walk changes at H15.
 Nothing is cached on disk.
