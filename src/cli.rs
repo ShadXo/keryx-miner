@@ -126,7 +126,7 @@ pub struct Opt {
 
     #[clap(
         long = "allow-old-driver",
-        help = "Start on an NVIDIA driver below the supported minimum (595), to test it: the trace self-checks then decide whether this card's inference and block openings verify",
+        help = "Start on an NVIDIA driver below the supported minimum (570), to test it: the trace self-checks then decide whether this card's inference and block openings verify",
         help_heading = "Inference"
     )]
     pub allow_old_driver: bool,

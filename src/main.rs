@@ -341,9 +341,12 @@ extern "C" fn plugin_log_sink(level: u8, msg_ptr: *const u8, msg_len: usize) {
     log::log!(lvl, "{}", msg);
 }
 
-/// Minimum NVIDIA driver major version accepted for mining. Older drivers break verifiable
-/// inference (traces from a 550 driver on a 3060 12GB failed verification; 595+ verifies).
-const MIN_NVIDIA_DRIVER_MAJOR: u32 = 595;
+/// Minimum NVIDIA driver major version accepted for mining: what this fork's CUDA 12.8 builds need
+/// (r570). This fork deliberately stays below upstream's 595. Verifiable inference is what can fail
+/// on an older driver (traces from a 550 driver on a 3060 12GB failed verification; 595+ verifies),
+/// and the trace self-checks catch that: a traced tier that fails its self-check stops the miner
+/// instead of serving.
+const MIN_NVIDIA_DRIVER_MAJOR: u32 = 570;
 
 /// Installed NVIDIA driver version string (e.g. "595.71.05"), from NVML or the kernel module.
 fn nvidia_driver_version() -> Option<String> {

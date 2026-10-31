@@ -16,7 +16,7 @@ Download the latest release from the [Releases page](https://github.com/Keryx-La
 | `keryx-miner-<version>_hiveos.tar.gz` | HiveOS rigs (install as a custom miner from the archive URL) |
 | `keryx-miner-<version>-win64-amd64.zip` | Windows 10/11 |
 
-Every package carries native CUDA kernels for **every GPU from Volta to Blackwell** (sm_70 to sm_120: GTX 16xx, RTX 20/30/40/50, V100, A100, H100, B200) and the CUDA runtime libraries it needs, next to the binary. The only host requirement is an NVIDIA driver **595 or newer**: the miner refuses to start on older ones, because verifiable inference traces from older drivers fail verification (HiveOS: `nvidia-driver-update 595`). Pascal (GTX 10xx) cannot hold the smallest model and is not supported.
+Every package carries native CUDA kernels for **every GPU from Volta to Blackwell** (sm_70 to sm_120: GTX 16xx, RTX 20/30/40/50, V100, A100, H100, B200) and the CUDA runtime libraries it needs, next to the binary. The only host requirement is an NVIDIA driver **570 or newer**. Verifiable inference traces are known to verify on 595+ and failed on a 550 driver; 570–594 is untested, so on those drivers the miner's trace self-checks decide, and a failed self-check stops the miner (update the driver then; HiveOS: `nvidia-driver-update 595`). Pascal (GTX 10xx) cannot hold the smallest model and is not supported.
 
 ---
 
