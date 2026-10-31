@@ -803,13 +803,29 @@ fn tokio_blocking_threads() -> Option<usize> {
     std::env::var("KERYX_BLOCKING_THREADS").ok().and_then(|s| s.parse::<usize>().ok()).map(|n| n.clamp(2, 64))
 }
 
+/// Sets a variable read by llama.cpp through the C runtime's `getenv`.
+fn set_llama_env(name: &str, value: &str) {
+    std::env::set_var(name, value);
+    // On Windows `set_var` only updates the OS block; the C runtime keeps its own copy.
+    #[cfg(windows)]
+    {
+        extern "C" {
+            fn _putenv_s(name: *const std::os::raw::c_char, value: *const std::os::raw::c_char) -> std::os::raw::c_int;
+        }
+        let (Ok(n), Ok(v)) = (std::ffi::CString::new(name), std::ffi::CString::new(value)) else { return };
+        unsafe {
+            _putenv_s(n.as_ptr(), v.as_ptr());
+        }
+    }
+}
+
 fn main() -> Result<(), Error> {
     // The canonical trace cannot be replayed under CUDA graphs on every model.
     if std::env::var_os("GGML_CUDA_DISABLE_GRAPHS").is_none() {
-        std::env::set_var("GGML_CUDA_DISABLE_GRAPHS", "1");
+        set_llama_env("GGML_CUDA_DISABLE_GRAPHS", "1");
     }
     // Attention openings expect unrotated key and value cache rows.
-    std::env::set_var("LLAMA_ATTN_ROT_DISABLE", "1");
+    set_llama_env("LLAMA_ATTN_ROT_DISABLE", "1");
     // Hidden child mode of the startup engine check (see llama_engine::probe_device).
     let argv: Vec<String> = std::env::args().collect();
     if let Some(i) = argv.iter().position(|a| a == "--probe-engine-device") {
@@ -893,15 +909,21 @@ async fn run() -> Result<(), Error> {
         });
     }
     let ui_state = if is_tty { Some(Arc::new(UiState::new())) } else { None };
-    let plain_log_path = opt.plain_log_file.clone().or_else(|| std::env::var("KERYX_PLAIN_LOG_FILE").ok());
-    let plain_log_file =
-        plain_log_path.and_then(|path| match OpenOptions::new().create(true).append(true).open(&path) {
+    // An empty path turns the plain log file off.
+    let plain_log_path = opt
+        .plain_log_file
+        .clone()
+        .or_else(|| std::env::var("KERYX_PLAIN_LOG_FILE").ok())
+        .unwrap_or_else(|| logging::DEFAULT_PLAIN_LOG_FILE.to_string());
+    let plain_log_file = Some(plain_log_path).filter(|path| !path.is_empty()).and_then(|path| {
+        match logging::PlainLogFile::open(&path) {
             Ok(file) => Some(file),
             Err(e) => {
                 eprintln!("Failed to open plain log file '{}': {}", path, e);
                 None
             }
-        });
+        }
+    });
     init_logging(opt.log_level(), ui_state.clone(), !is_tty, plain_log_file)?;
 
     opt.process()?;
