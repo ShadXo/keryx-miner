@@ -151,6 +151,22 @@ fn build_keryx_llama(nvcc: &str) -> Result<(), Box<dyn std::error::Error>> {
     apply_llama_patches(&src)?;
 
     let build_dir = target_root.join(format!("llama-build-{LLAMA_TAG}"));
+    // Reconfigure from scratch when the cache was written at another path (raw or canonical).
+    let cache = build_dir.join("CMakeCache.txt");
+    if let Ok(content) = fs::read_to_string(&cache) {
+        let canon = |p: &std::path::Path| fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+        let mismatch = |cached: &str, dir: &std::path::Path| {
+            cached != dir.to_string_lossy() && cached != canon(dir).to_string_lossy()
+        };
+        let entry = |key: &str| content.lines().find_map(|l| l.strip_prefix(key));
+        let stale = entry("CMAKE_HOME_DIRECTORY:INTERNAL=").is_some_and(|p| mismatch(p, &src))
+            || entry("CMAKE_CACHEFILE_DIR:INTERNAL=").is_some_and(|p| mismatch(p, &build_dir));
+        if stale {
+            eprintln!("llama build cache was created at another path — wiping {} to reconfigure", build_dir.display());
+            fs::remove_dir_all(&build_dir)
+                .map_err(|e| format!("cannot wipe the stale llama build dir {}: {e} — remove it manually", build_dir.display()))?;
+        }
+    }
     // Native kernels for every supported GPU generation (Volta to Blackwell); needs nvcc >= 12.8.
     // Override with a shorter list for a faster development build.
     let archs = env::var("KERYX_LLAMA_ARCHS")
