@@ -1772,9 +1772,11 @@ pub fn release_pad(device_id: u32) {
     }
 }
 
-/// Convenience: search a nonce batch via the installed miner for a specific device.
+/// Convenience: search a nonce batch via the installed miner for a specific device. `None` when
+/// the batch was not searched (inference pause, no miner, or a failed launch, logged here), so the
+/// caller does not count it as hashed; otherwise the lowest winning nonce, if any.
 #[allow(clippy::too_many_arguments)]
-pub fn mine(device_id: u32, pre_pow_hash: &[u8; 32], timestamp: u64, target_le: &[u8; 32], start: u64, batch: u64, h3: bool, walk_v2: bool, h5_1: bool, h5_2: bool, v3: bool, v4: bool, seed_h10: bool, seed_h14: bool, pad: Option<([u8; 32], u64)>) -> Option<u64> {
+pub fn mine(device_id: u32, pre_pow_hash: &[u8; 32], timestamp: u64, target_le: &[u8; 32], start: u64, batch: u64, h3: bool, walk_v2: bool, h5_1: bool, h5_2: bool, v3: bool, v4: bool, seed_h10: bool, seed_h14: bool, pad: Option<([u8; 32], u64)>) -> Option<Option<u64>> {
     if inference_paused_for(device_id) {
         log_throttled(device_id, "paused", || info!("PoM[gpu{}]: mining paused while an inference runs", device_id));
         return None;
@@ -1787,7 +1789,7 @@ pub fn mine(device_id: u32, pre_pow_hash: &[u8; 32], timestamp: u64, target_le: 
         crate::llama_engine::use_task_context(device_id as usize);
     }
     match miner.mine(pre_pow_hash, timestamp, target_le, start, batch, h3, walk_v2, h5_1, h5_2, v3, v4, seed_h10, seed_h14, pad) {
-        Ok(found) => found,
+        Ok(found) => Some(found),
         Err(e) => {
             let message = e.to_string();
             if is_sticky_gpu_runtime_fault(&message) {

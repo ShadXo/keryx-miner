@@ -585,7 +585,17 @@ impl MinerManager {
                             std::thread::sleep(std::time::Duration::from_millis(200));
                             continue;
                         }
-                        let found = keryx_miner::pom_gpu::mine(worker_device_id, &pph, time, &target_le, pom_nonce, batch, h3, walk_v2, h5_1, h5_2, v3, v4, h10, h14, pad);
+                        let searched = keryx_miner::pom_gpu::mine(worker_device_id, &pph, time, &target_le, pom_nonce, batch, h3, walk_v2, h5_1, h5_2, v3, v4, h10, h14, pad);
+                        if keryx_miner::pom_gpu::fatal_gpu_fault() {
+                            mark_fatal_gpu_fault(&device_id, "sticky CUDA runtime fault while mining");
+                            return Err("fatal CUDA fault during PoM mining".into());
+                        }
+                        // An unsearched batch (a pause, or a launch that failed, e.g. a context pad
+                        // that does not fit) is not hashrate: a card that cannot mine shows 0.
+                        let Some(found) = searched else {
+                            std::thread::sleep(std::time::Duration::from_millis(200));
+                            continue;
+                        };
                         // A launch that found a nonce (proof build) or met a pause says nothing about
                         // the batch's speed.
                         let counts = tuned
@@ -593,10 +603,6 @@ impl MinerManager {
                             && found.is_none()
                             && !keryx_miner::pom_gpu::inference_paused_for(worker_device_id);
                         last_launch = counts.then_some((batch, cycle_start));
-                        if keryx_miner::pom_gpu::fatal_gpu_fault() {
-                            mark_fatal_gpu_fault(&device_id, "sticky CUDA runtime fault while mining");
-                            return Err("fatal CUDA fault during PoM mining".into());
-                        }
                         pom_nonce = pom_nonce.wrapping_add(batch);
                         hashes_tried.fetch_add(batch, Ordering::AcqRel);
                         worker_hashes_tried.fetch_add(batch, Ordering::AcqRel);
