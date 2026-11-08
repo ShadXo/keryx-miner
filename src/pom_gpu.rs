@@ -1624,6 +1624,10 @@ impl PomGpuMiner {
         if std::env::var("KERYX_POM_V5_FOLDS").is_ok_and(|v| v.trim() == "0") || !self.kernel.ncf_v5 {
             return None;
         }
+        // The lock-step walk folds each tile itself: a card that runs it needs no table.
+        if self.lockstep.get().is_some_and(|&nl| nl != 0) {
+            return None;
+        }
         let build = self.kernel.function_snippet_folds?;
         let n = weight_tiles + pad_tiles;
         let need_mib = (n * 8) >> 20;
@@ -1740,6 +1744,10 @@ impl PomGpuMiner {
                 let w = LockstepWalk { wbase, n_tiles: g.weight_tiles, pbase: g._buf.device_ptr(&self.stream).0, n_pad: g.tiles, k_pad };
                 let nl = *self.lockstep.get_or_init(|| self.choose_lockstep(&w, g, &p_words, &s_words, timestamp, st, batch));
                 if nl != 0 {
+                    // Built before the walk was chosen; the lock-step walk never reads it.
+                    if let Some(table) = guard.as_mut().and_then(|seg| seg.snippet_folds.take()) {
+                        info!("PoM v5[gpu{}]: snippet fold table freed ({} MiB), the lock-step walk does not use it", self.stream.context().ordinal(), (table.len() * 8) >> 20);
+                    }
                     return self.kernel.mine_v5_lockstep(&self.stream, nl, &w, &p_words, target_le, st, start, batch);
                 }
             }
