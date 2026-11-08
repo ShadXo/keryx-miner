@@ -183,6 +183,9 @@ enum StrikeCause {
     DroppedHere,
     /// This instance saw the request but had no ready model to serve it.
     ModelUnreadyHere,
+    /// This instance queued the request behind another rig of its address, and the node closed it
+    /// while this one waited its turn.
+    HeldBack,
     /// The request never reached this instance.
     Elsewhere,
 }
@@ -192,6 +195,7 @@ fn attribute_strike(
     served_requests: &std::collections::HashMap<String, String>,
     seen_prefixes: &std::collections::HashSet<String>,
     skipped_unready: &std::collections::HashSet<String>,
+    skipped_held_back: &std::collections::HashSet<String>,
     request_hash: &str,
 ) -> Option<StrikeCause> {
     let hash = request_hash.to_ascii_lowercase();
@@ -202,6 +206,10 @@ fn attribute_strike(
         return Some(StrikeCause::AnsweredHere(txid.clone()));
     }
     let sid: String = hash.chars().take(16).collect();
+    // Every rig of an address queues each request; one waiting its turn did not drop it.
+    if skipped_held_back.contains(&sid) {
+        return Some(StrikeCause::HeldBack);
+    }
     if seen_prefixes.contains(&sid) {
         return Some(StrikeCause::DroppedHere);
     }
@@ -808,6 +816,8 @@ pub struct KeryxdHandler {
 
     /// Stable IDs of requests skipped because no ready model could serve them.
     ai_skipped_unready: std::collections::HashSet<String>,
+    /// Stable IDs of requests the node closed while this rig waited behind another rig.
+    ai_skipped_held_back: std::collections::HashSet<String>,
 }
 
 #[async_trait(?Send)]
@@ -1068,6 +1078,7 @@ impl KeryxdHandler {
             served_requests_order,
             strike_burns_reported: std::collections::HashSet::new(),
             ai_skipped_unready: std::collections::HashSet::new(),
+            ai_skipped_held_back: std::collections::HashSet::new(),
         });
         handler.restore_parked();
         Ok(handler)
@@ -1636,17 +1647,24 @@ impl KeryxdHandler {
 
     /// Drops the queued requests the node no longer awaits from this rig's identity.
     fn drop_unawaited_requests(&mut self) {
-        let dropped: std::collections::HashSet<String> = self
-            .ai_request_queue
-            .iter()
-            .filter(|(sid, ..)| self.request_closed(sid))
-            .map(|(sid, ..)| sid.clone())
+        // Rank 0 was first in line: a request it lets close is its own miss.
+        let ranked: Vec<(String, bool)> = (0..self.ai_request_queue.len())
+            .filter(|&i| self.request_closed(&self.ai_request_queue[i].0))
+            .map(|i| (self.ai_request_queue[i].0.clone(), self.request_rank(i) > 0))
             .collect();
+        let dropped: std::collections::HashSet<String> = ranked.iter().map(|(sid, _)| sid.clone()).collect();
         if !dropped.is_empty() {
             self.ai_request_queue.retain(|(sid, ..)| !dropped.contains(sid));
         }
-        for sid in dropped {
+        for (sid, held_back) in ranked {
             info!("Inference: request id={} no longer awaited from this address — skipped", sid);
+            if held_back {
+                self.ai_skipped_held_back.insert(sid);
+                if self.ai_skipped_held_back.len() > MAX_AI_SEEN_IDS {
+                    self.ai_skipped_held_back.clear();
+                    self.ai_skipped_held_back.shrink_to_fit();
+                }
+            }
         }
         let queued: std::collections::HashSet<&String> = self.ai_request_queue.iter().map(|(sid, ..)| sid).collect();
         self.request_checks.retain(|sid, _| queued.contains(sid));
@@ -3170,8 +3188,8 @@ impl KeryxdHandler {
         // Attribute each pending burn to this rig or another one; each burn is logged once.
         let mut local_cause = false;
         for burn in &burns {
-            let Some(cause) = attribute_strike(&self.served_requests, &self.ai_seen_prefixes, &self.ai_skipped_unready, &burn.request_hash) else { continue };
-            local_cause |= !matches!(cause, StrikeCause::Elsewhere);
+            let Some(cause) = attribute_strike(&self.served_requests, &self.ai_seen_prefixes, &self.ai_skipped_unready, &self.ai_skipped_held_back, &burn.request_hash) else { continue };
+            local_cause |= !matches!(cause, StrikeCause::Elsewhere | StrikeCause::HeldBack);
             if self.strike_burns_reported.len() >= STRIKE_BURNS_REPORTED_KEPT {
                 self.strike_burns_reported.clear();
             }
@@ -3190,6 +3208,10 @@ impl KeryxdHandler {
                 ),
                 StrikeCause::ModelUnreadyHere => warn!(
                     "service-bond: miss #{} on request {}… — THIS rig saw the request but had no model ready to serve it; check the model files — this rig caused the strike",
+                    burn.consecutive_misses, request
+                ),
+                StrikeCause::HeldBack => warn!(
+                    "service-bond: miss #{} on request {}… — this rig waited its turn behind another rig of this address and the node closed the request; the rig first in line (the one that answered it, or should have) caused the strike",
                     burn.consecutive_misses, request
                 ),
                 StrikeCause::Elsewhere => warn!(
@@ -3983,18 +4005,23 @@ mod tests {
         seen.insert(hex::encode([2u8; 8]));
         let mut unready = std::collections::HashSet::new();
         unready.insert(hex::encode([4u8; 8]));
+        // Queued (so also seen) behind another rig, then closed by the node.
+        seen.insert(hex::encode([5u8; 8]));
+        let mut held = std::collections::HashSet::new();
+        held.insert(hex::encode([5u8; 8]));
 
         assert_eq!(
-            attribute_strike(&served, &seen, &unready, &hex::encode([1u8; 32])),
+            attribute_strike(&served, &seen, &unready, &held, &hex::encode([1u8; 32])),
             Some(StrikeCause::AnsweredHere("txid-answered".to_string()))
         );
-        assert_eq!(attribute_strike(&served, &seen, &unready, &hex::encode([2u8; 32])), Some(StrikeCause::DroppedHere));
-        assert_eq!(attribute_strike(&served, &seen, &unready, &hex::encode([4u8; 32])), Some(StrikeCause::ModelUnreadyHere));
-        assert_eq!(attribute_strike(&served, &seen, &unready, &hex::encode([3u8; 32])), Some(StrikeCause::Elsewhere));
-        assert_eq!(attribute_strike(&served, &seen, &unready, ""), None);
+        assert_eq!(attribute_strike(&served, &seen, &unready, &held, &hex::encode([2u8; 32])), Some(StrikeCause::DroppedHere));
+        assert_eq!(attribute_strike(&served, &seen, &unready, &held, &hex::encode([4u8; 32])), Some(StrikeCause::ModelUnreadyHere));
+        assert_eq!(attribute_strike(&served, &seen, &unready, &held, &hex::encode([5u8; 32])), Some(StrikeCause::HeldBack));
+        assert_eq!(attribute_strike(&served, &seen, &unready, &held, &hex::encode([3u8; 32])), Some(StrikeCause::Elsewhere));
+        assert_eq!(attribute_strike(&served, &seen, &unready, &held, ""), None);
         // Node hashes are hex regardless of case; use a hash with letters so the check is real.
         assert_eq!(
-            attribute_strike(&served, &seen, &unready, &hex::encode([0xABu8; 32]).to_uppercase()),
+            attribute_strike(&served, &seen, &unready, &held, &hex::encode([0xABu8; 32]).to_uppercase()),
             Some(StrikeCause::AnsweredHere("txid-letters".to_string()))
         );
     }
