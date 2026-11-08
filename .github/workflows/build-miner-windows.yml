@@ -50,7 +50,25 @@ env:
   CUDA_VERSION: "12.8.1"
 
 jobs:
+  # The PoM nextgen fatbin is built on Linux, like the Linux build's: its sm_103 image needs the
+  # 12.9 toolkit, every other image the 12.8 one (see .github/scripts/pom-nextgen-fatbin.sh). A
+  # fatbin holds GPU code only, so the same file serves Windows.
+  pom-fatbin:
+    if: inputs.nextgen_kernel == 'native'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compile nextgen fatbin
+        run: bash .github/scripts/pom-nextgen-fatbin.sh nvidia/cuda:12.8.2-devel-ubuntu20.04 nvidia/cuda:12.9.1-devel-ubuntu20.04
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pom-nextgen-fatbin-win
+          path: pom_mine_nextgen.fatbin
+          retention-days: 1
+
   build:
+    needs: [pom-fatbin]
+    if: always() && needs.pom-fatbin.result != 'failure'
     runs-on: windows-2022
     timeout-minutes: 350
 
@@ -80,20 +98,12 @@ jobs:
       # Without this the PoM nextgen fatbin is empty and cc 12.0 falls through the
       # PTX ladder to sm_90 PTX (POM_SM_LIST tops out at 90 — there is no sm_120
       # PoM PTX), so a 50-series card JITs instead of running native SASS.
-      # nvcc needs cl.exe, which msvc-dev-cmd put on PATH above.
-      - name: Compile nextgen fatbin
+      - name: Fetch nextgen fatbin
         if: inputs.nextgen_kernel == 'native'
-        shell: pwsh
-        run: |
-          & "$env:CUDA_PATH\bin\nvcc.exe" -fatbin -O3 `
-            -gencode arch=compute_89,code=sm_89 `
-            -gencode arch=compute_90,code=sm_90 `
-            -gencode arch=compute_100,code=sm_100 `
-            -gencode arch=compute_120,code=sm_120 `
-            -gencode arch=compute_120,code=compute_120 `
-            cuda\pom_mine.cu -o pom_mine_nextgen.fatbin
-          if ($LASTEXITCODE -ne 0) { throw "nvcc -fatbin failed" }
-          Get-Item pom_mine_nextgen.fatbin | Select-Object Name,Length
+        uses: actions/download-artifact@v4
+        with:
+          name: pom-nextgen-fatbin-win
+          path: .
 
       # Legacy image, for the same reason — see the note in build-miner.yml. Every cc < 8.9 card
       # loads it and it must export `pom_mine_v3`, or that card cannot mine past the H6 gate.

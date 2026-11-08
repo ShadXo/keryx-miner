@@ -59,15 +59,13 @@ env:
   # in the miner log). A fatbin from a newer toolkit fails with "device kernel
   # image is invalid". 12.8 toolkit -> needs driver r570+.
   FATBIN_IMAGE: nvidia/cuda:12.8.2-devel-ubuntu20.04
+  # Only for the sm_103 (B300 class) SASS of the PoM nextgen fatbin, which 12.8 cannot emit.
+  # Every other image stays on FATBIN_IMAGE — see .github/scripts/pom-nextgen-fatbin.sh.
+  FATBIN_SM103_IMAGE: nvidia/cuda:12.9.1-devel-ubuntu20.04
 
 jobs:
   # Only runs for nextgen_kernel=native. The shipped cuda/pom_mine_nextgen.fatbin
   # is stale (predates the ILP x2 commit); this rebuilds it from current source.
-  #
-  # The gencode set must cover every cc that pom_gpu.rs::is_nextgen_device routes
-  # here (major > 8, or 8.9) — that includes sm_90. compute_120 PTX cannot JIT
-  # *down* to Hopper, so omitting sm_90 makes the nextgen load fail there and the
-  # card silently drops to the legacy fatbin's sm_86 PTX at reduced throughput.
   fatbin:
     if: inputs.nextgen_kernel == 'native'
     runs-on: ubuntu-latest
@@ -75,17 +73,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Compile nextgen fatbin
-        run: |
-          docker run --rm -v "$PWD":/src -w /src "$FATBIN_IMAGE" \
-            nvcc -fatbin -O3 -Xptxas -v \
-              -gencode arch=compute_89,code=sm_89 \
-              -gencode arch=compute_90,code=sm_90 \
-              -gencode arch=compute_100,code=sm_100 \
-              -gencode arch=compute_120,code=sm_120 \
-              -gencode arch=compute_120,code=compute_120 \
-              cuda/pom_mine.cu -o pom_mine_nextgen.fatbin
-          sudo chown "$(id -u):$(id -g)" pom_mine_nextgen.fatbin
-          ls -la pom_mine_nextgen.fatbin
+        run: bash .github/scripts/pom-nextgen-fatbin.sh "$FATBIN_IMAGE" "$FATBIN_SM103_IMAGE"
 
       # The LEGACY image needs rebuilding for the same reason as nextgen: every cc < 8.9 card
       # loads this one, and it must export `pom_mine_v3` or that card cannot mine past the H6
