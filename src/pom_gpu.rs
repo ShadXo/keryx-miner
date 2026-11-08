@@ -1335,13 +1335,6 @@ fn lockstep_batches() -> &'static Mutex<HashMap<u32, u64>> {
     B.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// Opt-in on this fork: `KERYX_POM_V5_LOCKSTEP=1` tries the lock-step v5 walk (and loads llama's
-/// weights in the canonical layout it needs). Unset, mining and llama loads stay as before.
-pub fn lockstep_enabled() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var("KERYX_POM_V5_LOCKSTEP").is_ok_and(|v| v.trim() == "1"))
-}
-
 /// The grind batch sized for `device_id`'s lock-step walk, once chosen.
 pub fn lockstep_batch_for(device_id: u32) -> Option<u64> {
     lockstep_batches().lock().ok()?.get(&device_id).copied()
@@ -1799,7 +1792,7 @@ impl PomGpuMiner {
         }
         let env_batch = std::env::var("KERYX_POM_V4_BATCH").ok().and_then(|s| s.trim().parse::<u64>().ok()).is_some_and(|b| b > 0);
         let batch = if env_batch { batch } else { gpu_sm_count(ord).map_or(POM_V4_BATCH_FALLBACK, v4_batch_for_sm_count) };
-        if !lockstep_enabled()
+        if std::env::var("KERYX_POM_V5_LOCKSTEP").as_deref() == Ok("0")
             || !matches!(gpu_compute_capability(ord as usize), Some((major, _)) if major >= 8)
         {
             return 0;

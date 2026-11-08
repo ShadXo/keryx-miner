@@ -972,11 +972,8 @@ fn resident_engine(spec: &ModelSpec) -> Option<(String, u32)> {
         // request also holds it for its whole generation (`run_inference`); a block task or an
         // opening on an already-resident model frees nothing and runs beside the walk.
         let _loading = crate::pom_gpu::pause_for_inference(dev_id);
-        // Canonical weight layout only for the model this card mines, and only with the opt-in
-        // lock-step walk: otherwise llama keeps its own layout, exactly as before.
-        let canonical = crate::pom_gpu::lockstep_enabled()
-            && crate::pom_gpu::mining_model_id(dev_id) == Some(spec.model_id);
-        if let Err(e) = crate::pom_gpu::load_llama_for_inference(&gguf, dev_id, canonical) {
+        let mined_here = crate::pom_gpu::mining_model_id(dev_id) == Some(spec.model_id);
+        if let Err(e) = crate::pom_gpu::load_llama_for_inference(&gguf, dev_id, mined_here) {
             log::error!("LlmEngine: cannot load '{}' — {}; response dropped", spec.name, e);
             mark_model_unavailable(&spec.model_id, if e.is_oom() { "llama_load_oom" } else { "llama_load_failed" });
             return None;

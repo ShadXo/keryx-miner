@@ -454,8 +454,7 @@ pub fn probe_device(gpu: usize) -> DeviceProbe {
 /// different model already on `gpu` is freed first: the caller must have drained that GPU's
 /// walk. Returns the attempt id of the resident load, or why it failed.
 pub fn ensure_loaded(gguf: &str, gpu: usize) -> Result<u64, LoadError> {
-    // The canonical layout serves only the opt-in lock-step walk; without it llama keeps its own.
-    ensure_loaded_with(gguf, gpu, crate::pom_gpu::lockstep_enabled())
+    ensure_loaded_with(gguf, gpu, true)
 }
 
 /// [`ensure_loaded`]; `canonical` false keeps llama's own weight layout for a fresh load.
