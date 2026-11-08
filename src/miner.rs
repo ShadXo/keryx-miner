@@ -406,9 +406,10 @@ impl MinerManager {
                 // Sized at the first v4 launch, once the model is resident and free VRAM is real.
                 let mut pom_v4_batch = std::env::var("KERYX_POM_V4_BATCH").ok()
                     .and_then(|s| s.trim().parse::<u64>().ok()).filter(|&b| b > 0);
+                let pom_v4_batch_env = pom_v4_batch.is_some();
                 // Live batch tune around that default, per walk (v4, then v5 from H15); a fixed
                 // KERYX_POM_V4_BATCH is used as given.
-                let pom_tune = pom_v4_batch.is_none() && !keryx_miner::pom_gpu::tune_disabled();
+                let pom_tune = !pom_v4_batch_env && !keryx_miner::pom_gpu::tune_disabled();
                 let mut tuner: Option<(bool, keryx_miner::pom_gpu::V4BatchTuner)> = None;
                 // The batch and start of the last launch the tuner may count.
                 let mut last_launch: Option<(u64, Instant)> = None;
@@ -545,12 +546,19 @@ impl MinerManager {
                         if v4 && pom_v4_batch.is_none() {
                             pom_v4_batch = keryx_miner::pom_gpu::v4_batch_for_device(worker_device_id);
                         }
+                        // The opt-in lock-step walk sizes its own batch (~50 ms per launch) once it is
+                        // chosen; the live tuner is for the established walk.
+                        let lockstep_batch = if v4 && !pom_v4_batch_env {
+                            keryx_miner::pom_gpu::lockstep_batch_for(worker_device_id)
+                        } else {
+                            None
+                        };
                         let v5 = v4 && daa >= keryx_miner::pom::pom_v5_activation_daa();
                         // The large v4 batch is sized for the accelerated solvers. The classic walk is
                         // several times heavier per nonce, so on a card that falls back to it the same
                         // batch would overrun the ~100 ms block time and cost more in stale templates
                         // than it saves.
-                        let tuned = v4 && pom_tune && keryx_miner::pom_gpu::v4_tc_active(worker_device_id, v5);
+                        let tuned = v4 && pom_tune && lockstep_batch.is_none() && keryx_miner::pom_gpu::v4_tc_active(worker_device_id, v5);
                         if tuned && tuner.as_ref().is_none_or(|(w, _)| *w != v5) {
                             let walk = if v5 { "v5" } else { "v4" };
                             let start = pom_v4_batch.unwrap_or(POM_V4_BATCH_UNSIZED);
@@ -563,7 +571,9 @@ impl MinerManager {
                             t.record(b, cycle_start.duration_since(started).as_secs_f64());
                         }
                         let batch = if v4 {
-                            if tuned {
+                            if let Some(b) = lockstep_batch {
+                                b
+                            } else if tuned {
                                 tuner.as_mut().map_or(POM_V4_BATCH_UNSIZED, |(_, t)| t.batch())
                             } else if keryx_miner::pom_gpu::v4_tc_active(worker_device_id, v5) {
                                 pom_v4_batch.unwrap_or(POM_V4_BATCH_UNSIZED)

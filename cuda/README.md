@@ -152,3 +152,22 @@ Nothing is cached on disk.
 | `KERYX_POM_V4_TC=0` | Classic walk only |
 | `KERYX_POM_V4_NCF=0` / `=1` | Exclude / force the chaseless walk (=1 includes HBM for v4) |
 | `KERYX_POM_V5_FOLDS=0` | No snippet fold table: the v5 walk folds each tile in the kernel |
+| `KERYX_POM_V5_LOCKSTEP=1` | Try upstream's lock-step v5 walk (off by default on this fork, see below) |
+| `KERYX_POM_V5_LOCKSTEP_NL=2` / `=4` | With lock-step on: only try 2 / 4 nonces per warp |
+
+### Lock-step v5 walk (opt-in)
+
+Upstream's port of ocminer's lock-step walk runs several nonces per warp over weights that lie in
+one contiguous range, so a tile is read at base + t KiB with no segment lookup. It is off unless
+`KERYX_POM_V5_LOCKSTEP=1`; then, on each CC >= 8.0 card, the first v5 launch checks the 4- and
+2-nonce variants against the reference kernel, times them, and keeps the faster one
+(`lock-step walk active (N nonces per warp)` in the log). It sizes its own batch to ~50 ms per
+launch, so the live tune above does not run for it. A card whose variants all fail the check stays
+on the walk above.
+
+The weights are contiguous when the miner uploads its own copy. On a card where llama hosts the
+mined model, the switch also makes llama load its weights in the walk's canonical layout (patch
+0007); without the switch llama keeps its own layout, exactly as before.
+
+To compare on one card, run with and without the switch and compare the PoM hashrate after the
+first few minutes.
