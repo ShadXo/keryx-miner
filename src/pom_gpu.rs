@@ -456,7 +456,7 @@ impl LoadedPomKernel {
                 true
             }
             Ok(false) => {
-                warn!("PoM v4: chaseless solver probe found nothing for an always-win target on GPU {} (stub image?) — falling back to chase+tc / plain kernel", ord);
+                warn!("PoM v4: chaseless solver failed its startup check on GPU {} — falling back to chase+tc / plain kernel", ord);
                 false
             }
             Err(e) => {
@@ -512,7 +512,83 @@ impl LoadedPomKernel {
         unsafe { result::launch_kernel(walk, cfg.grid_dim, cfg.block_dim, cfg.shared_mem_bytes, stream.cu_stream(), &mut params) }?;
         stream.synchronize()?;
         let w = stream.clone_dtoh(&winner)?[0];
-        Ok(w != u64::MAX)
+        if w == u64::MAX {
+            return Ok(false);
+        }
+        self.v4_ncf_agrees(stream, bases_dev, prefix_dev, t_count, n_tiles, n_pad, k_pad, p_words, s_words, timestamp)
+    }
+
+    /// Runs the chaseless solver and the reference kernel over the same nonces with a loose
+    /// target; true when both find the same lowest winner.
+    #[allow(clippy::too_many_arguments)]
+    fn v4_ncf_agrees(&self, stream: &Arc<CudaStream>, bases_dev: &CudaSlice<u64>, prefix_dev: &CudaSlice<u64>, t_count: u32, n_tiles: u64, n_pad: u64, k_pad: u32, p_words: &[u64; 4], s_words: &[u64; 4], timestamp: u64) -> Result<bool> {
+        let Some(reference) = self.function_v4 else { return Ok(true) };
+        let walk = self.function_v4_ncf.ok_or_else(|| anyhow!("PoM GPU: no pom_mine_v4_ncf entry"))?;
+        let (start, batch) = (0x5EED_0000_0000u64, 4096u64);
+        let t = [u64::MAX, u64::MAX, u64::MAX, u64::MAX >> 4];
+        let k = crate::pom_v4::POM_V4_K as u32;
+        let seed_h10: u32 = 0;
+        let seeds = stream.clone_htod(&[0u64; 25])?;
+        let ncf_winner = stream.clone_htod(&[u64::MAX])?;
+        let ref_winner = stream.clone_htod(&[u64::MAX])?;
+        let (lut, lut_sh) = v4_ncf_lut(stream, prefix_dev, t_count, n_tiles + n_pad)?;
+        let inv_n = u64::MAX / n_tiles;
+        let inv_p = u64::MAX.checked_div(n_pad).unwrap_or(0);
+        let (bases_ptr, _bg) = bases_dev.device_ptr(stream);
+        let (prefix_ptr, _pg) = prefix_dev.device_ptr(stream);
+        let (lut_ptr, _lg) = lut.device_ptr(stream);
+        let (seeds_ptr, _sg) = seeds.device_ptr(stream);
+        let (ncf_ptr, _ng) = ncf_winner.device_ptr(stream);
+        let (ref_ptr, _rg) = ref_winner.device_ptr(stream);
+        let cfg = LaunchConfig {
+            grid_dim: (batch.div_ceil(V4_NCF_WARPS) as u32, 1, 1),
+            block_dim: ((V4_NCF_WARPS * 32) as u32, 1, 1),
+            shared_mem_bytes: (V4_NCF_WARPS as u32) * POM_V4_NCF_SHARED_PER_WARP,
+        };
+        // No fold table: the solver folds each tile itself, as without one at mining time.
+        let no_folds = 0u64;
+        let mut params: [*mut c_void; 30] = [
+            (&bases_ptr as *const _ as *mut c_void), (&prefix_ptr as *const _ as *mut c_void),
+            (&t_count as *const _ as *mut c_void), (&n_tiles as *const _ as *mut c_void), (&k as *const _ as *mut c_void),
+            (&p_words[0] as *const _ as *mut c_void), (&p_words[1] as *const _ as *mut c_void),
+            (&p_words[2] as *const _ as *mut c_void), (&p_words[3] as *const _ as *mut c_void),
+            (&s_words[0] as *const _ as *mut c_void), (&s_words[1] as *const _ as *mut c_void),
+            (&s_words[2] as *const _ as *mut c_void), (&s_words[3] as *const _ as *mut c_void),
+            (&timestamp as *const _ as *mut c_void),
+            (&t[0] as *const _ as *mut c_void), (&t[1] as *const _ as *mut c_void),
+            (&t[2] as *const _ as *mut c_void), (&t[3] as *const _ as *mut c_void),
+            (&start as *const _ as *mut c_void), (&batch as *const _ as *mut c_void),
+            (&lut_ptr as *const _ as *mut c_void), (&lut_sh as *const _ as *mut c_void),
+            (&inv_n as *const _ as *mut c_void),
+            (&ncf_ptr as *const _ as *mut c_void),
+            (&seeds_ptr as *const _ as *mut c_void), (&seed_h10 as *const _ as *mut c_void),
+            (&n_pad as *const _ as *mut c_void), (&inv_p as *const _ as *mut c_void), (&k_pad as *const _ as *mut c_void),
+            (&no_folds as *const _ as *mut c_void),
+        ];
+        unsafe { result::launch_kernel(walk, cfg.grid_dim, cfg.block_dim, cfg.shared_mem_bytes, stream.cu_stream(), &mut params) }?;
+        let ref_cfg = LaunchConfig { grid_dim: (batch as u32, 1, 1), block_dim: (crate::pom_v4::POM_V4_D as u32, 1, 1), shared_mem_bytes: POM_V4_SHARED_BYTES };
+        let mut ref_params: [*mut c_void; 25] = [
+            (&bases_ptr as *const _ as *mut c_void), (&prefix_ptr as *const _ as *mut c_void),
+            (&t_count as *const _ as *mut c_void), (&n_tiles as *const _ as *mut c_void), (&k as *const _ as *mut c_void),
+            (&p_words[0] as *const _ as *mut c_void), (&p_words[1] as *const _ as *mut c_void), (&p_words[2] as *const _ as *mut c_void), (&p_words[3] as *const _ as *mut c_void),
+            (&s_words[0] as *const _ as *mut c_void), (&s_words[1] as *const _ as *mut c_void), (&s_words[2] as *const _ as *mut c_void), (&s_words[3] as *const _ as *mut c_void),
+            (&timestamp as *const _ as *mut c_void),
+            (&t[0] as *const _ as *mut c_void), (&t[1] as *const _ as *mut c_void), (&t[2] as *const _ as *mut c_void), (&t[3] as *const _ as *mut c_void),
+            (&start as *const _ as *mut c_void), (&batch as *const _ as *mut c_void), (&ref_ptr as *const _ as *mut c_void),
+            (&seeds_ptr as *const _ as *mut c_void), (&seed_h10 as *const _ as *mut c_void),
+            (&n_pad as *const _ as *mut c_void), (&k_pad as *const _ as *mut c_void),
+        ];
+        unsafe { result::launch_kernel(reference, ref_cfg.grid_dim, ref_cfg.block_dim, ref_cfg.shared_mem_bytes, stream.cu_stream(), &mut ref_params) }?;
+        stream.synchronize()?;
+        let (a, b) = (stream.clone_dtoh(&ncf_winner)?[0], stream.clone_dtoh(&ref_winner)?[0]);
+        let ord = stream.context().ordinal();
+        if a != u64::MAX && a == b {
+            info!("PoM: chaseless solver matches the reference kernel on GPU {} (lowest winner {} of {})", ord, a, batch);
+            Ok(true)
+        } else {
+            warn!("PoM: chaseless solver disagrees with the reference kernel on GPU {} ({:?} vs {:?})", ord, (a != u64::MAX).then_some(a), (b != u64::MAX).then_some(b));
+            Ok(false)
+        }
     }
 
     /// v4 (re-walk) grind: one block of 32 threads per nonce over `[start, start + batch)`.
@@ -1649,59 +1725,106 @@ pub fn is_installed(device_id: u32) -> bool {
 /// Raised before an inference is spawned, lowered once no inference is in flight. While
 /// raised, no PoM operation may start or reload a model — including a worker that acquired the
 /// lifecycle lock before the pause.
-static INFERENCE_PAUSED: AtomicBool = AtomicBool::new(false);
+/// One bit per device, plus `PAUSE_ALL` for the whole rig.
+static INFERENCE_PAUSED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+const PAUSE_ALL: u64 = 1 << 63;
 
+fn pause_bit(device_id: u32) -> u64 {
+    if device_id < 63 { 1 << device_id } else { PAUSE_ALL }
+}
+
+/// The device an inference was routed to while it alone is paused, with its model.
+static SERVING: std::sync::Mutex<Option<([u8; 32], u32)>> = std::sync::Mutex::new(None);
+
+/// Pauses (or resumes) every device.
 pub fn set_inference_paused(paused: bool) {
-    INFERENCE_PAUSED.store(paused, Ordering::Release);
-}
-
-pub fn inference_paused() -> bool {
-    INFERENCE_PAUSED.load(Ordering::Acquire)
-}
-
-/// Per-GPU inference pause: bit `n` is set while GPU `n` serves an inference. Only that card's
-/// walk stands still; every other card keeps mining fresh templates (approach of the ocminer
-/// (suprnova) fork). Devices past 63 are tracked in `inference_pause_counts` alone.
-static INFERENCE_PAUSED_MASK: AtomicU64 = AtomicU64::new(0);
-
-/// Nesting count per paused device, so overlapping requests on one card (a request and a probe)
-/// keep it paused until the last one ends.
-fn inference_pause_counts() -> &'static Mutex<HashMap<u32, usize>> {
-    static COUNTS: OnceLock<Mutex<HashMap<u32, usize>>> = OnceLock::new();
-    COUNTS.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-fn set_inference_paused_on(device_id: u32, paused: bool) {
-    let mut counts = inference_pause_counts().lock().unwrap_or_else(|p| p.into_inner());
-    let count = counts.entry(device_id).or_insert(0);
-    *count = if paused { count.saturating_add(1) } else { count.saturating_sub(1) };
-    let now_paused = *count > 0;
-    if !now_paused {
-        counts.remove(&device_id);
+    INFERENCE_PAUSED.store(if paused { PAUSE_ALL } else { 0 }, Ordering::Release);
+    if !paused {
+        *SERVING.lock().unwrap_or_else(|e| e.into_inner()) = None;
     }
-    if device_id < 64 {
-        let bit = 1u64 << device_id;
-        if now_paused {
-            INFERENCE_PAUSED_MASK.fetch_or(bit, Ordering::AcqRel);
-        } else {
-            INFERENCE_PAUSED_MASK.fetch_and(!bit, Ordering::AcqRel);
+}
+
+/// Pauses (or resumes) the one device serving an inference of `model_id`; the others keep
+/// mining. While paused, the inference of `model_id` is pinned to that device.
+pub fn set_inference_paused_on(device_id: u32, model_id: &[u8; 32], paused: bool) {
+    let bit = pause_bit(device_id);
+    let mut serving = SERVING.lock().unwrap_or_else(|e| e.into_inner());
+    if paused {
+        INFERENCE_PAUSED.fetch_or(bit, Ordering::AcqRel);
+        *serving = Some((*model_id, device_id));
+    } else {
+        INFERENCE_PAUSED.fetch_and(!bit, Ordering::AcqRel);
+        if serving.is_some_and(|(_, d)| d == device_id) {
+            *serving = None;
         }
     }
 }
 
-/// Whether `device_id` must hold off every PoM operation now: the global pause, or its own.
+/// Pauses `device_id` alone, clearing any other pause: for a client running one job at a time.
+pub fn set_inference_paused_only(device_id: u32, model_id: &[u8; 32]) {
+    let mut serving = SERVING.lock().unwrap_or_else(|e| e.into_inner());
+    INFERENCE_PAUSED.store(pause_bit(device_id), Ordering::Release);
+    *serving = Some((*model_id, device_id));
+}
+
+/// The device the inference of `model_id` is pinned to while that device alone is paused.
+pub fn pinned_device(model_id: &[u8; 32]) -> Option<u32> {
+    SERVING.lock().unwrap_or_else(|e| e.into_inner()).filter(|(m, _)| m == model_id).map(|(_, d)| d)
+}
+
+/// Whether any device is paused for an inference.
+pub fn inference_paused() -> bool {
+    INFERENCE_PAUSED.load(Ordering::Acquire) != 0
+}
+
+/// Whether the whole rig is paused for an inference.
+pub fn inference_paused_all() -> bool {
+    INFERENCE_PAUSED.load(Ordering::Acquire) & PAUSE_ALL != 0
+}
+
+/// Cards held by `pause_for_inference` guards, beside the client pauses above: bit `n` while GPU
+/// `n` serves an inference. Devices past 63 are tracked in `inference_hold_counts` alone.
+static INFERENCE_HELD_MASK: AtomicU64 = AtomicU64::new(0);
+
+/// Nesting count per held device, so overlapping work on one card (a request and a probe) keeps
+/// it paused until the last one ends.
+fn inference_hold_counts() -> &'static Mutex<HashMap<u32, usize>> {
+    static COUNTS: OnceLock<Mutex<HashMap<u32, usize>>> = OnceLock::new();
+    COUNTS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn set_inference_held_on(device_id: u32, held: bool) {
+    let mut counts = inference_hold_counts().lock().unwrap_or_else(|p| p.into_inner());
+    let count = counts.entry(device_id).or_insert(0);
+    *count = if held { count.saturating_add(1) } else { count.saturating_sub(1) };
+    let now_held = *count > 0;
+    if !now_held {
+        counts.remove(&device_id);
+    }
+    if device_id < 64 {
+        let bit = 1u64 << device_id;
+        if now_held {
+            INFERENCE_HELD_MASK.fetch_or(bit, Ordering::AcqRel);
+        } else {
+            INFERENCE_HELD_MASK.fetch_and(!bit, Ordering::AcqRel);
+        }
+    }
+}
+
+/// Whether `device_id` must hold off every PoM operation now: a client pause (the whole rig or
+/// this card) or a `pause_for_inference` guard on this card.
 ///
 /// A crash guard as much as a throughput one: on an inference card the walk can gather zero-dup
 /// over llama's resident weights, so a walk that runs or rebuilds while llama frees or reloads
 /// them reads freed VRAM — a sticky CUDA_ERROR_ILLEGAL_ADDRESS that poisons the context.
 pub fn inference_paused_for(device_id: u32) -> bool {
-    if inference_paused() {
+    if INFERENCE_PAUSED.load(Ordering::Acquire) & (PAUSE_ALL | pause_bit(device_id)) != 0 {
         return true;
     }
     if device_id < 64 {
-        INFERENCE_PAUSED_MASK.load(Ordering::Acquire) & (1u64 << device_id) != 0
+        INFERENCE_HELD_MASK.load(Ordering::Acquire) & (1u64 << device_id) != 0
     } else {
-        inference_pause_counts().lock().map_or(false, |c| c.contains_key(&device_id))
+        inference_hold_counts().lock().map_or(false, |c| c.contains_key(&device_id))
     }
 }
 
@@ -1710,7 +1833,7 @@ pub struct InferencePause(u32);
 
 impl Drop for InferencePause {
     fn drop(&mut self) {
-        set_inference_paused_on(self.0, false);
+        set_inference_held_on(self.0, false);
     }
 }
 
@@ -1718,20 +1841,82 @@ impl Drop for InferencePause {
 /// device's miner is evicted for an inference load: PAUSE -> DRAIN (`uninstall`'s barrier) ->
 /// SWAP -> GENERATE -> RESUME, with the walk unable to restart or rebuild in between.
 pub fn pause_for_inference(device_id: u32) -> InferencePause {
-    set_inference_paused_on(device_id, true);
+    set_inference_held_on(device_id, true);
     InferencePause(device_id)
 }
 
-/// Set once a CUDA fault that outlives the context is seen; the process must restart to recover.
+/// The device `model_id` is served on: the one a client pause pinned it to, else its mining
+/// device, else device 0.
+pub fn inference_device(model_id: &[u8; 32]) -> u32 {
+    pinned_device(model_id).or_else(|| device_for_model(model_id)).unwrap_or(0)
+}
+
+/// The device to pause alone for inference on `model_id`: its mining device on a rig of several,
+/// `None` when the whole rig must pause (one device, or the model is mined on none).
+pub fn serving_device(model_id: &[u8; 32]) -> Option<u32> {
+    (mining_device_count() > 1).then(|| device_for_model(model_id)).flatten()
+}
+
+/// Devices with a mining tier assigned.
+pub fn mining_device_count() -> usize {
+    mining_tiers().lock().map(|g| g.len()).unwrap_or(0)
+}
+
+/// Set once a sticky CUDA fault leaves a model this rig mines with no live device; only a new
+/// process recovers.
 static FATAL_GPU_FAULT: AtomicBool = AtomicBool::new(false);
+/// Devices abandoned after a sticky CUDA fault in their context, one bit per device.
+static DEAD_DEVICES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 pub fn fatal_gpu_fault() -> bool {
     FATAL_GPU_FAULT.load(Ordering::Acquire)
 }
 
+/// Removes `device_id` from the tier assignment; true when another device that `can_mine` the
+/// model still mines it.
+fn drop_and_still_covered(tiers: &mut HashMap<u32, MiningTier>, device_id: u32, can_mine: impl Fn(u32, &[u8; 32]) -> bool) -> bool {
+    let model = tiers.remove(&device_id).map(|(id, _)| id);
+    model.is_some_and(|m| tiers.iter().any(|(d, (id, _))| *id == m && can_mine(*d, &m)))
+}
+
+/// Whether `device_id` was abandoned after a sticky CUDA fault.
+pub fn device_dead(device_id: u32) -> bool {
+    device_id < 64 && DEAD_DEVICES.load(Ordering::Acquire) & (1 << device_id) != 0
+}
+
+/// A sticky fault poisons the CUDA context of `device_id` only: the device is abandoned and the
+/// others keep mining, unless no other live device mines its model, which needs a restart.
 fn mark_fatal_gpu_fault(device_id: u32, message: &str) {
-    if !FATAL_GPU_FAULT.swap(true, Ordering::AcqRel) {
-        error!("PoM[gpu{}]: fatal sticky CUDA fault: {}. Full process restart required.", device_id, message);
+    if device_id >= 64 {
+        if !FATAL_GPU_FAULT.swap(true, Ordering::AcqRel) {
+            error!("PoM[gpu{}]: fatal sticky CUDA fault: {}. Full process restart required.", device_id, message);
+        }
+        return;
+    }
+    if DEAD_DEVICES.fetch_or(1 << device_id, Ordering::AcqRel) & (1 << device_id) != 0 {
+        return;
+    }
+    // The device leaves every assignment, so no era crossing, pin or routing ever reaches it.
+    if let Ok(mut g) = device_tiers().lock() {
+        g.remove(&device_id);
+    }
+    {
+        let mut serving = SERVING.lock().unwrap_or_else(|e| e.into_inner());
+        if serving.is_some_and(|(_, d)| d == device_id) {
+            *serving = None;
+        }
+    }
+    let covered = mining_tiers()
+        .lock()
+        .map(|mut g| drop_and_still_covered(&mut g, device_id, |d, m| !device_dead(d) && !is_oom_banlisted(d, m)))
+        .unwrap_or(false);
+    if covered {
+        error!(
+            "PoM[gpu{}]: sticky CUDA fault: {}. This GPU is abandoned until the next restart; the other GPUs keep mining.",
+            device_id, message
+        );
+    } else if !FATAL_GPU_FAULT.swap(true, Ordering::AcqRel) {
+        error!("PoM[gpu{}]: fatal sticky CUDA fault: {}. No other GPU mines its model — full process restart required.", device_id, message);
     }
 }
 
@@ -1777,6 +1962,9 @@ pub fn release_pad(device_id: u32) {
 /// caller does not count it as hashed; otherwise the lowest winning nonce, if any.
 #[allow(clippy::too_many_arguments)]
 pub fn mine(device_id: u32, pre_pow_hash: &[u8; 32], timestamp: u64, target_le: &[u8; 32], start: u64, batch: u64, h3: bool, walk_v2: bool, h5_1: bool, h5_2: bool, v3: bool, v4: bool, seed_h10: bool, seed_h14: bool, pad: Option<([u8; 32], u64)>) -> Option<Option<u64>> {
+    if device_dead(device_id) {
+        return None;
+    }
     if inference_paused_for(device_id) {
         log_throttled(device_id, "paused", || info!("PoM[gpu{}]: mining paused while an inference runs", device_id));
         return None;
@@ -1832,7 +2020,9 @@ fn mining_tiers() -> &'static Mutex<HashMap<u32, MiningTier>> {
 /// Record a GPU's mining tier so its miner can be rebuilt after an inference swapped the model away.
 pub fn set_mining_tier(device_id: u32, model_id: [u8; 32], gguf_path: String) {
     if let Ok(mut g) = mining_tiers().lock() {
-        g.insert(device_id, (model_id, gguf_path));
+        if !device_dead(device_id) {
+            g.insert(device_id, (model_id, gguf_path));
+        }
     }
 }
 
@@ -1869,7 +2059,7 @@ pub fn advance_mining_tier_if_due(daa: u64) {
     for &(dev, tier) in &devices {
         // A card serving an inference keeps its model until the request ends; it crosses over on a
         // later tick. Swapping now would free the weights the generation is reading.
-        if inference_paused_for(dev) {
+        if device_dead(dev) || inference_paused_for(dev) {
             continue;
         }
         // No model for this tier in the era being entered: nothing to swap to, the device simply
@@ -2063,6 +2253,9 @@ pub fn load_llama_for_inference(gguf: &str, target_dev: u32) -> Result<u64, crat
 /// inference has priority, so mining reloads its model when it next gets the GPU. Returns true if
 /// the miner is ready to mine.
 pub fn ensure_installed(device_id: u32, daa: u64) -> bool {
+    if device_dead(device_id) {
+        return false;
+    }
     if inference_paused_for(device_id) {
         return false;
     }
@@ -2416,6 +2609,43 @@ fn ensure_installed_inner(device_id: u32, daa: u64) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_faulted_device_is_dropped_and_restart_needed_only_when_its_model_is_lost() {
+        let (a, b) = ([1u8; 32], [2u8; 32]);
+        let mut tiers: HashMap<u32, MiningTier> = HashMap::new();
+        tiers.insert(0, (a, "a".into()));
+        tiers.insert(1, (a, "a".into()));
+        tiers.insert(2, (b, "b".into()));
+        let any = |_: u32, _: &[u8; 32]| true;
+        let mut banned = tiers.clone();
+        assert!(!super::drop_and_still_covered(&mut banned, 0, |d, _| d != 1));
+        assert!(super::drop_and_still_covered(&mut tiers, 0, any));
+        assert!(!tiers.contains_key(&0));
+        assert!(!super::drop_and_still_covered(&mut tiers, 2, any));
+        assert!(!super::drop_and_still_covered(&mut tiers, 1, any));
+        assert!(!super::drop_and_still_covered(&mut tiers, 9, any));
+    }
+
+    #[test]
+    fn inference_pause_is_per_device_or_whole_rig() {
+        let m = [7u8; 32];
+        super::set_inference_paused(false);
+        super::set_inference_paused_on(2, &m, true);
+        assert!(super::inference_paused() && !super::inference_paused_all());
+        assert!(super::inference_paused_for(2) && !super::inference_paused_for(0));
+        assert_eq!((super::pinned_device(&m), super::pinned_device(&[8; 32])), (Some(2), None));
+        super::set_inference_paused_on(2, &m, false);
+        assert!(!super::inference_paused() && super::pinned_device(&m).is_none());
+        super::set_inference_paused_on(1, &m, true);
+        super::set_inference_paused_only(3, &m);
+        assert!(super::inference_paused_for(3) && !super::inference_paused_for(1));
+        assert_eq!(super::pinned_device(&m), Some(3));
+        super::set_inference_paused(true);
+        assert!(super::inference_paused_all() && super::inference_paused_for(0) && super::inference_paused_for(7));
+        super::set_inference_paused(false);
+        assert!(!super::inference_paused_for(7));
+    }
+
     use super::*;
 
     fn t(name: &str, ptr: u64, nbytes: usize, dev: bool) -> (String, u64, usize, bool) {

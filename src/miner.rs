@@ -288,6 +288,12 @@ impl MinerManager {
         let specs = manager.build().unwrap();
         for spec in specs {
             let device_id = spec.id();
+            // A device abandoned after a CUDA fault keeps a poisoned context: no new worker on it.
+            let index = device_id.strip_prefix('#').and_then(|s| s.split_whitespace().next()).and_then(|s| s.parse::<u32>().ok());
+            if index.is_some_and(keryx_miner::pom_gpu::device_dead) {
+                warn!("GPU {} was abandoned after a CUDA fault — no worker until the next restart", device_id);
+                continue;
+            }
             let worker_hashes_tried = Arc::new(AtomicU64::new(0));
             hashes_by_worker.lock().unwrap().insert(device_id.clone(), worker_hashes_tried.clone());
             vec.push(Self::launch_gpu_miner(
@@ -443,7 +449,7 @@ impl MinerManager {
                                     None => None,
                                 };
                             }
-                            std::thread::sleep(std::time::Duration::from_millis(10));
+                            std::thread::sleep(std::time::Duration::from_millis(25));
                             continue;
                         }
                         let daa = state.as_ref().unwrap().daa_score;
@@ -519,9 +525,8 @@ impl MinerManager {
                             }
                         }
                         let installed = keryx_miner::pom_gpu::ensure_installed(worker_device_id, daa);
-                        if keryx_miner::pom_gpu::fatal_gpu_fault() {
-                            mark_fatal_gpu_fault(&device_id, "sticky CUDA runtime fault while rebuilding the PoM miner");
-                            return Err("fatal CUDA fault during PoM rebuild".into());
+                        if keryx_miner::pom_gpu::device_dead(worker_device_id) {
+                            return Err("CUDA fault during PoM rebuild — this GPU is abandoned".into());
                         }
                         if !installed {
                             std::thread::sleep(std::time::Duration::from_millis(200));
@@ -586,9 +591,8 @@ impl MinerManager {
                             continue;
                         }
                         let searched = keryx_miner::pom_gpu::mine(worker_device_id, &pph, time, &target_le, pom_nonce, batch, h3, walk_v2, h5_1, h5_2, v3, v4, h10, h14, pad);
-                        if keryx_miner::pom_gpu::fatal_gpu_fault() {
-                            mark_fatal_gpu_fault(&device_id, "sticky CUDA runtime fault while mining");
-                            return Err("fatal CUDA fault during PoM mining".into());
+                        if keryx_miner::pom_gpu::device_dead(worker_device_id) {
+                            return Err("CUDA fault during PoM mining — this GPU is abandoned".into());
                         }
                         // An unsearched batch (a pause, or a launch that failed, e.g. a context pad
                         // that does not fit) is not hashrate: a card that cannot mine shows 0.

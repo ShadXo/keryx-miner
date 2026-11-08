@@ -893,6 +893,8 @@ struct Traced {
 pub struct Generated {
     pub text: String,
     pub trace: Option<crate::trace::ResponseTrace>,
+    /// CUDA device the answer was generated on.
+    pub device: u32,
 }
 
 /// `load_and_run_inference` with the canonical trace of `tier` captured.
@@ -935,7 +937,11 @@ fn resident_engine(spec: &ModelSpec) -> Option<(String, u32)> {
     // Route inference to the device that MINES this model (per-GPU tier assignment): only that
     // GPU pauses PoW and the walk shares the resident weights (zero-dup). Falls back to device 0
     // (single-GPU / unassigned model).
-    let dev_id = crate::pom_gpu::device_for_model(&spec.model_id).unwrap_or(0);
+    let dev_id = crate::pom_gpu::inference_device(&spec.model_id);
+    if crate::pom_gpu::device_dead(dev_id) {
+        log::warn!("LlmEngine: '{}' would run on gpu{}, abandoned after a CUDA fault — response dropped", spec.name, dev_id);
+        return None;
+    }
     let gguf = gguf_path_for(spec).to_string_lossy().into_owned();
 
     if !crate::llama_engine::active_for(&gguf, dev_id as usize) {
@@ -1277,39 +1283,98 @@ fn arm_trace(spec: &ModelSpec, gguf: &str, dev_id: u32, tier: u8, chain: bool, a
     true
 }
 
+/// The prompt without NUL characters, which the engine cannot take.
+fn engine_prompt(prompt: &str) -> std::borrow::Cow<'_, str> {
+    if prompt.contains('\0') { std::borrow::Cow::Owned(prompt.replace('\0', "")) } else { std::borrow::Cow::Borrowed(prompt) }
+}
+
+/// Context tokens the node reserves beyond the prompt and the answer budget.
+const CONTEXT_OVERHEAD_TOKENS: usize = 512;
+
+/// Byte budget of a prompt sure to fit `ctx_floor` with `max_tokens` and the overhead (a token
+/// spans at least one byte).
+fn prompt_budget(ctx_floor: u32, max_tokens: usize) -> usize {
+    (ctx_floor as usize).saturating_sub(max_tokens.saturating_add(CONTEXT_OVERHEAD_TOKENS))
+}
+
+/// `prompt` cut to `cap` bytes keeping its head and its tail, on character boundaries; `None`
+/// when it already fits.
+fn head_tail_cut(prompt: &str, cap: usize) -> Option<String> {
+    const SEP: &str = "\n…\n";
+    if prompt.len() <= cap {
+        return None;
+    }
+    let budget = cap.saturating_sub(SEP.len());
+    let mut head = budget / 2;
+    while !prompt.is_char_boundary(head) {
+        head -= 1;
+    }
+    let mut tail = prompt.len() - (budget - head);
+    while !prompt.is_char_boundary(tail) {
+        tail += 1;
+    }
+    Some(if cap < SEP.len() { String::new() } else { format!("{}{SEP}{}", &prompt[..head], &prompt[tail..]) })
+}
+
+thread_local! {
+    static LAST_FAILURE_TRANSIENT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether the last inference that produced nothing on this thread failed for a passing reason
+/// (no engine resident or available yet), so a later try may succeed.
+pub fn last_failure_transient() -> bool {
+    LAST_FAILURE_TRANSIENT.with(|c| c.get())
+}
+
 fn run_inference(model_id: &[u8; 32], prompt: &str, max_tokens: usize, traced: Option<Traced>) -> Option<Generated> {
+    LAST_FAILURE_TRANSIENT.with(|c| c.set(false));
     let _serving = ServingGuard::new();
     let specs = *SUPPORTED_SPECS.read().unwrap();
     let spec = specs.iter().find(|s| &s.model_id == model_id)?;
+    let prompt = engine_prompt(prompt);
 
-    // llama.cpp gets the raw tokens of whatever string we pass — apply the model's chat
-    // template here (template-strict models emit EOG immediately on a bare prompt).
-    let templated = format_prompt_by_name(spec.name, prompt);
     // Pause PoM on the serving card only, for the whole request (load included); every other card
     // keeps mining. Requests, challenges and probes all come through here. Raised before
     // `resident_engine`, so a load it needs is already covered (the pause nests).
-    let _paused = crate::pom_gpu::pause_for_inference(crate::pom_gpu::device_for_model(&spec.model_id).unwrap_or(0));
-    let (gguf, dev_id) = resident_engine(spec)?;
+    let _paused = crate::pom_gpu::pause_for_inference(crate::pom_gpu::inference_device(&spec.model_id));
+    let Some((gguf, dev_id)) = resident_engine(spec) else {
+        LAST_FAILURE_TRANSIENT.with(|c| c.set(true));
+        return None;
+    };
     let traced = traced.filter(|t| arm_trace(spec, &gguf, dev_id, t.tier, t.chain, t.attention));
+    let plan = match traced.as_ref() {
+        Some(t) => {
+            let m = if t.attention {
+                crate::trace::TierManifest::for_attn(t.tier)?
+            } else if t.chain {
+                crate::trace::TierManifest::for_chain(t.tier)?
+            } else {
+                crate::trace::TierManifest::for_tier(t.tier)?
+            };
+            let owned_ctx =
+                if t.chain { crate::trace::chain_ctx(t.tier).map(|c| c.1) } else { crate::trace::prefix_ctx(t.tier).cloned() };
+            let tokens = owned_ctx.as_ref().map(|c| crate::trace::prefix_tokens(c, &t.request_hash));
+            Some((m, owned_ctx, tokens))
+        }
+        None => None,
+    };
 
-    let outcome = if let Some(Traced { tier, prompt_len, request_hash, chain, attention }) = traced {
-        let m = if attention {
-            crate::trace::TierManifest::for_attn(tier)?
-        } else if chain {
-            crate::trace::TierManifest::for_chain(tier)?
-        } else {
-            crate::trace::TierManifest::for_tier(tier)?
+    let attempt = |prompt: &str| {
+        // llama.cpp gets the raw tokens of whatever string we pass — apply the model's chat
+        // template here (template-strict models emit EOG immediately on a bare prompt).
+        let templated = format_prompt_by_name(spec.name, prompt);
+        let (Some(t), Some((m, owned_ctx, tokens))) = (traced.as_ref(), plan.as_ref()) else {
+            return crate::llama_engine::generate(&gguf, dev_id as usize, &templated, max_tokens).map(|text| (text, None));
         };
-        let min_prompt = keryx_verifiable_inference::shape::min_prompt_positions(prompt_len);
+        let (chain, attention) = (t.chain, t.attention);
+        let min_prompt = keryx_verifiable_inference::shape::min_prompt_positions(t.prompt_len);
         let per_position = keryx_verifiable_inference::shape::ANSWER_BYTES_PER_POSITION;
-        let owned_ctx = if chain { crate::trace::chain_ctx(tier).map(|c| c.1) } else { crate::trace::prefix_ctx(tier).cloned() };
         let ctx = owned_ctx.as_ref();
         let parts = ctx.and_then(|_| format_prompt_parts(spec.name, prompt));
         if ctx.is_some() && parts.is_none() {
             fatal(&format!("'{}' has no prefix template", spec.name));
         }
-        let tokens = ctx.map(|c| crate::trace::prefix_tokens(c, &request_hash));
-        let (head, prefix) = match (&parts, &tokens, ctx) {
+        let (head, prefix) = match (&parts, tokens, ctx) {
             (Some((head, rest)), Some(tokens), Some(c)) => {
                 (head.as_str(), Some(crate::llama_engine::PromptPrefix { tokens, head_tokens: c.offset, rest }))
             }
@@ -1338,14 +1403,23 @@ fn run_inference(model_id: &[u8; 32], prompt: &str, max_tokens: usize, traced: O
             }
             Ok((g.text, record.map(|record| crate::trace::ResponseTrace { record, tokens: g.tokens, seq })))
         })
-    } else {
-        crate::llama_engine::generate(&gguf, dev_id as usize, &templated, max_tokens).map(|text| (text, None))
     };
 
+    let mut outcome = attempt(prompt.as_ref());
+    if let (Err(crate::llama_engine::GenError::PromptTooLong(_)), Some(t)) = (&outcome, traced.as_ref()) {
+        let cap = prompt_budget(spec.ctx_floor, max_tokens);
+        if t.prompt_len as usize <= cap {
+            if let Some(cut) = head_tail_cut(prompt.as_ref(), cap) {
+                log::warn!("LlmEngine '{}': prompt too long — retrying with {} of its {} bytes", spec.name, cut.len(), prompt.len());
+                outcome = attempt(&cut);
+            }
+        }
+    }
+
     match outcome {
-        Ok((text, trace)) if !text.trim().is_empty() => {
+        Ok((text, trace)) if trace.is_some() || !text.trim().is_empty() => {
             mark_model_available(model_id, "generation_success");
-            Some(Generated { text: truncate_answer(text, max_tokens), trace })
+            Some(Generated { text: truncate_answer(text, max_tokens), trace, device: dev_id })
         }
         Ok(_) => {
             log::warn!("LlmEngine '{}': llama generate returned an empty answer — response dropped", spec.name);
@@ -1357,6 +1431,9 @@ fn run_inference(model_id: &[u8; 32], prompt: &str, max_tokens: usize, traced: O
             None
         }
         Err(e) => {
+            if matches!(e, crate::llama_engine::GenError::Unavailable) {
+                LAST_FAILURE_TRANSIENT.with(|c| c.set(true));
+            }
             log::warn!("LlmEngine '{}': llama generate failed ({:?}) — response dropped", spec.name, e);
             None
         }
@@ -1401,7 +1478,7 @@ pub fn open_block_task(model_id: &[u8; 32], tier: u8, trace: &crate::trace::Resp
     // An opening replays on the card hosting the model and may take its full context (which
     // frees that card's v5 context pad): hold that card alone paused, so its walk cannot refill
     // the pad under the replay. The other cards keep mining.
-    let _paused = crate::pom_gpu::pause_for_inference(crate::pom_gpu::device_for_model(&spec.model_id).unwrap_or(0));
+    let _paused = crate::pom_gpu::pause_for_inference(crate::pom_gpu::inference_device(&spec.model_id));
     let (gguf, dev_id) = resident_engine(spec)?;
     if !arm_trace(spec, &gguf, dev_id, tier, true, false) {
         return None;
@@ -1445,7 +1522,7 @@ pub fn open_attention_phase(
     let specs = *SUPPORTED_SPECS.read().unwrap();
     let spec = specs.iter().find(|s| &s.model_id == model_id)?;
     // A replay for an audit opening: see open_block_task — this card alone stays paused.
-    let _paused = crate::pom_gpu::pause_for_inference(crate::pom_gpu::device_for_model(&spec.model_id).unwrap_or(0));
+    let _paused = crate::pom_gpu::pause_for_inference(crate::pom_gpu::inference_device(&spec.model_id));
     let (gguf, dev_id) = resident_engine(spec)?;
     if trace.seq.is_none() || !arm_trace(spec, &gguf, dev_id, tier, true, true) {
         return None;
@@ -1477,7 +1554,7 @@ pub fn open_trace(
     let chain = trace.record.stage == crate::trace::STAGE_CHAIN;
     let attention = chain && trace.seq.is_some();
     // A replay for an audit opening: see open_block_task — this card alone stays paused.
-    let _paused = crate::pom_gpu::pause_for_inference(crate::pom_gpu::device_for_model(&spec.model_id).unwrap_or(0));
+    let _paused = crate::pom_gpu::pause_for_inference(crate::pom_gpu::inference_device(&spec.model_id));
     let (gguf, dev_id) = resident_engine(spec)?;
     if !arm_trace(spec, &gguf, dev_id, tier, chain, attention) {
         return None;
@@ -1534,6 +1611,44 @@ pub fn open_trace(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn engine_prompt_drops_nul_characters() {
+        assert!(matches!(engine_prompt("Say hello."), std::borrow::Cow::Borrowed("Say hello.")));
+        assert_eq!(engine_prompt("Say hel\0lo\0."), "Say hello.");
+        assert_eq!(engine_prompt("\0\0"), "");
+        assert!(std::ffi::CString::new(engine_prompt("a\0b").into_owned()).is_ok());
+    }
+
+    #[test]
+    fn prompt_budget_matches_the_node_safe_length() {
+        assert_eq!(prompt_budget(8_192, 256), 8_192 - 256 - 512);
+        assert_eq!(prompt_budget(256, 512), 0);
+        assert_eq!(prompt_budget(32_768, usize::MAX), 0);
+    }
+
+    #[test]
+    fn head_tail_cut_keeps_both_ends_within_the_cap() {
+        assert_eq!(head_tail_cut("hello", 5), None);
+        let text: String = (0..1_000).map(|i| char::from(b'a' + (i % 26) as u8)).collect();
+        let cut = head_tail_cut(&text, 101).unwrap();
+        assert!(cut.len() <= 101);
+        assert!(text.starts_with(cut.split("\n…\n").next().unwrap()));
+        assert!(text.ends_with(cut.split("\n…\n").nth(1).unwrap()));
+        for wide in ["é".repeat(700), "😀".repeat(400), "aé😀".repeat(200)] {
+            let cut = head_tail_cut(&wide, 333).unwrap();
+            assert!(cut.len() <= 333, "{} bytes", cut.len());
+        }
+        assert_eq!(head_tail_cut("hello", 2).as_deref(), Some(""));
+    }
+
+    #[test]
+    fn context_floors_mirror_the_node() {
+        for m in crate::models::REGISTRY {
+            let expected = if m.name.starts_with("qwen3.5-9b") { 8_192 } else { 32_768 };
+            assert_eq!(m.ctx_floor, expected, "{}", m.name);
+        }
+    }
 
     /// A model with no arm of its own falls through to generic ChatML, which template-strict
     /// models answer with leaked control tokens or an unclosed thinking block. The generic tail

@@ -666,6 +666,7 @@ async fn get_client(
     ipfs_url: String,
     keepalive_seconds: u64,
     keepalive_timeout_seconds: u64,
+    pool_password: String,
 ) -> Result<Box<dyn Client + 'static>, Error> {
     if keryxd_address.starts_with("stratum+tcp://") {
         let (_schema, address) = keryxd_address.split_once("://").unwrap();
@@ -677,6 +678,7 @@ async fn get_client(
             keepalive_seconds,
             keepalive_timeout_seconds,
             escrow_state_file,
+            pool_password,
         )
         .await?)
     } else if keryxd_address.starts_with("grpc://") {
@@ -782,6 +784,7 @@ async fn client_main(
         opt.ipfs_url.clone(),
         opt.stratum_keepalive_seconds,
         opt.stratum_keepalive_timeout_seconds,
+        opt.pool_password.clone(),
     )
     .await?;
 

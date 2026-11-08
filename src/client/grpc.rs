@@ -251,6 +251,11 @@ const CHAIN_RESTORE_PAGE_MIN: usize = 100;
 /// Longest a response waits for its acceptance and draw: past the node's ledger horizon its
 /// request is no longer pending.
 const TRACE_UNDRAWN_LIMIT_DAA: u64 = 72_000;
+/// Tries of a request whose inference fails for a passing reason, and the first retry delay.
+const MAX_REQUEST_RETRIES: u8 = 3;
+const REQUEST_RETRY_BASE: std::time::Duration = std::time::Duration::from_secs(20);
+/// Token budget cap of a `KRX:AI:1` request, the node's request cap.
+const MAX_KRX_AI_TOKENS: u64 = 4_096;
 /// First delay before a failed chain rebuild is retried, doubled at each failure up to the max.
 const CHAIN_RESTORE_RETRY_BASE: std::time::Duration = std::time::Duration::from_secs(5);
 const CHAIN_RESTORE_RETRY_MAX: std::time::Duration = std::time::Duration::from_secs(60);
@@ -294,9 +299,11 @@ struct InferenceJob {
     model_id: [u8; 32],
     tier: Option<u8>,
     max_tokens: u32,
-    /// The result (`None`: the inference failed, no AiResponse is submitted) and the duration
-    /// of the inference in seconds.
-    rx: oneshot::Receiver<(Option<keryx_miner::llm::Generated>, f64)>,
+    /// The result (`None`: the inference failed, no AiResponse is submitted), the duration of
+    /// the inference in seconds, and whether a failure was transient.
+    rx: oneshot::Receiver<(Option<keryx_miner::llm::Generated>, f64, bool)>,
+    /// The queued request, put back in the queue after a transient failure.
+    retry: Option<QueuedRequest>,
 }
 
 /// The trace of a finished inference, on its way into the AiResponse.
@@ -509,6 +516,8 @@ struct ReplayJob {
     seed_hash: String,
     /// Path of the attention phase it builds; `None` for the first opening.
     path: Option<Vec<u64>>,
+    /// Model the replay runs, which tells the device it occupies.
+    model_id: [u8; 32],
     started: std::time::Instant,
     rx: oneshot::Receiver<Option<Vec<u8>>>,
 }
@@ -772,6 +781,8 @@ pub struct KeryxdHandler {
     last_strike_poll: std::time::Instant,
     /// The node answers `GetAwaitedOpenings`.
     node_awaited_openings: bool,
+    /// A GetAwaitedOpenings answer was applied on this connection.
+    awaited_answered: bool,
     last_awaited_poll: std::time::Instant,
     /// Responses asked about at the last awaited-openings poll.
     awaited_polled: Vec<String>,
@@ -788,6 +799,8 @@ pub struct KeryxdHandler {
     request_checks: std::collections::HashMap<String, (bool, u64, std::time::Instant)>,
     /// When each request was queued.
     request_queued_at: std::collections::HashMap<String, std::time::Instant>,
+    /// Requests put back after a transient failure: tries so far and when the next may start.
+    request_retries: std::collections::HashMap<String, (u8, std::time::Instant)>,
     /// Escrow keys of this rig's identity per tier, own key included.
     sibling_escrows: std::collections::HashMap<u32, Vec<[u8; 32]>>,
     last_providers_poll: std::time::Instant,
@@ -1058,6 +1071,7 @@ impl KeryxdHandler {
             service_identity,
             last_strike_poll: std::time::Instant::now() - std::time::Duration::from_secs(55),
             node_awaited_openings: false,
+            awaited_answered: false,
             last_awaited_poll: std::time::Instant::now(),
             awaited_polled: Vec::new(),
             awaited_requests_polled: Vec::new(),
@@ -1067,6 +1081,7 @@ impl KeryxdHandler {
             node_checks_requests: false,
             request_checks: std::collections::HashMap::new(),
             request_queued_at: std::collections::HashMap::new(),
+            request_retries: std::collections::HashMap::new(),
             sibling_escrows: std::collections::HashMap::new(),
             last_providers_poll: std::time::Instant::now() - std::time::Duration::from_secs(PROVIDERS_POLL_SECS),
             last_message: std::time::Instant::now(),
@@ -1090,6 +1105,9 @@ impl KeryxdHandler {
         // Keep the checks' reference point; restored requests wait for a fresh node check.
         self.node_checks_requests |= parked.node_checks_requests;
         self.force_awaited_poll = true;
+        self.ai_answered_by_me.extend(parked.answered);
+        self.ai_seen_prefixes.extend(parked.seen);
+        self.request_retries.extend(parked.retries);
         for entry in parked.queue {
             self.ai_seen_prefixes.insert(entry.0.clone());
             let queued = parked.queued_at.get(&entry.0).copied().unwrap_or_else(std::time::Instant::now);
@@ -1294,6 +1312,8 @@ impl KeryxdHandler {
             txs.iter().map(|t| t.subnetwork_id.as_str()).collect::<Vec<_>>()
         );
         let escrow_secret = self.escrow_watcher.as_ref().map(|w| w.secret_bytes());
+        // Past the private-inference gate every request is sealed; plaintext ones are not served.
+        let private_era = block_daa >= keryx_miner::pom::private_inference_activation_daa();
         for tx in txs {
             // (raw, model_id, prompt, plaintext prompt length, max_tokens, inference_reward, private state)
             let extracted: Option<ExtractedRequest> =
@@ -1303,12 +1323,14 @@ impl KeryxdHandler {
                         let req = keryx_inference::AiRequestPayload::deserialize(&raw)?;
                         let (prompt, prompt_len, private) = if req.is_private() {
                             Self::open_private_request(&req, escrow_secret.as_ref())?
+                        } else if private_era {
+                            return None;
                         } else {
                             (String::from_utf8_lossy(&req.prompt).into_owned(), req.prompt.len() as u32, None)
                         };
                         Some((raw, req.model_id, prompt, prompt_len, req.max_tokens as usize, req.inference_reward, private))
                     })
-                } else if !tx.inputs.is_empty() {
+                } else if !tx.inputs.is_empty() && !private_era {
                     // KRX:AI:1: JSON format — model routed by "m" field, skipped if not loaded.
                     hex::decode(&tx.payload).ok().and_then(|raw| {
                         Self::parse_krx_ai_payload(&raw).and_then(|(model_name, prompt, max_tokens)| {
@@ -1416,13 +1438,11 @@ impl KeryxdHandler {
             return None;
         };
         match keryx_inference::open_request(req, secret) {
-            Ok(opened) => match decode_private_prompt(&opened.prompt) {
-                Some(prompt) => Some((prompt, opened.prompt.len() as u32, Some(PrivateRequest::Opened(opened.response_key.clone())))),
-                None => {
-                    warn!("Inference: private AiRequest opened but its compressed prompt is invalid — answering with an error body");
-                    Some((String::new(), 0, Some(PrivateRequest::Unreadable)))
-                }
-            },
+            Ok(opened) => Some((
+                decode_private_prompt(&opened.prompt),
+                opened.prompt.len() as u32,
+                Some(PrivateRequest::Opened(opened.response_key.clone())),
+            )),
             Err(keryx_inference::PrivateError::NotARecipient) => {
                 log::debug!("Inference: skipping private AiRequest — this escrow key is not a recipient");
                 None
@@ -1496,7 +1516,7 @@ impl KeryxdHandler {
         let v: serde_json::Value = serde_json::from_slice(&raw[PREFIX.len()..]).ok()?;
         let model = v["m"].as_str().unwrap_or("glm-4-9b-0414").to_string();
         let prompt = v["p"].as_str()?.to_string();
-        let max_tokens = v["n"].as_u64().unwrap_or(128) as usize;
+        let max_tokens = v["n"].as_u64().unwrap_or(128).min(MAX_KRX_AI_TOKENS) as usize;
         Some((model, prompt, max_tokens))
     }
 
@@ -1507,17 +1527,37 @@ impl KeryxdHandler {
     /// stale. Also suppresses the GPU stall warnings, which a deliberate pause would trip.
     fn set_opoi_pause(&self, paused: bool) {
         keryx_miner::pom_gpu::set_inference_paused(paused);
-        self.set_inference_busy(paused);
+        if let Some(flag) = &self.opoi_challenge_active {
+            flag.store(paused, Ordering::Relaxed);
+        }
     }
 
-    /// Marks an inference as running without pausing any mining: the card serving it pauses
-    /// itself (`pom_gpu::pause_for_inference`, raised in `llm::load_and_run_inference`) while every
-    /// other card keeps hashing. Drives the status bar's AI state and keeps the stall watchdog quiet
-    /// on a single-GPU rig, whose only card is the one standing still.
-    fn set_inference_busy(&self, busy: bool) {
-        if let Some(flag) = &self.opoi_challenge_active {
-            flag.store(busy, Ordering::Relaxed);
+    /// Pauses mining before work on `model_id`: only its device on a multi-GPU rig (the work is
+    /// pinned to it), else the rig. One job runs at a time, so any other pause is cleared.
+    async fn pause_for(&self, model_id: &[u8; 32], miner: &mut MinerManager) -> Result<(), Error> {
+        match keryx_miner::pom_gpu::serving_device(model_id) {
+            Some(dev) => {
+                keryx_miner::pom_gpu::set_inference_paused_only(dev, model_id);
+                if let Some(flag) = &self.opoi_challenge_active {
+                    flag.store(false, Ordering::Relaxed);
+                }
+                Ok(())
+            }
+            None => {
+                self.set_opoi_pause(true);
+                miner.process_block(None).await
+            }
         }
+    }
+
+    /// The device the running inference work occupies alone, with its model, when the rest of the
+    /// rig mines on.
+    fn busy_device(&self) -> Option<(u32, [u8; 32])> {
+        if self.challenge_inference_rx.is_some() {
+            return None;
+        }
+        let model = self.inference_rx.as_ref().map(|j| j.model_id).or(self.replay_rx.as_ref().map(|j| j.model_id))?;
+        keryx_miner::pom_gpu::pinned_device(&model).or_else(|| keryx_miner::pom_gpu::serving_device(&model)).map(|d| (d, model))
     }
 
     /// Whether the GPU is taken by inference work: a request, a challenge or a replay.
@@ -1694,14 +1734,22 @@ impl KeryxdHandler {
     fn own_request(&self) -> Option<usize> {
         let now = std::time::Instant::now();
         (0..self.ai_request_queue.len()).find(|&i| {
-            self.ai_request_queue.get(i).is_some_and(|(sid, ..)| !self.request_closed(sid))
+            self.ai_request_queue.get(i).is_some_and(|(sid, ..)| !self.request_closed(sid) && !self.retry_waiting(sid, now))
                 && (self.request_rank(i) == 0 || self.request_startable(i, now))
         })
+    }
+
+    /// Whether the request `sid` waits out its delay after a transient failure.
+    fn retry_waiting(&self, sid: &str, now: std::time::Instant) -> bool {
+        self.request_retries.get(sid).is_some_and(|(_, at)| *at > now)
     }
 
     /// Whether the queued request at `index` may start now: at once for the first rig of its
     /// address, after the wait of its rank and a node check for the others.
     fn request_startable(&self, index: usize, now: std::time::Instant) -> bool {
+        if self.ai_request_queue.get(index).is_some_and(|(sid, ..)| self.retry_waiting(sid, now)) {
+            return false;
+        }
         if !self.node_checks_requests {
             return true;
         }
@@ -1729,9 +1777,35 @@ impl KeryxdHandler {
             || waited >= delay + std::time::Duration::from_secs(REQUEST_CHECK_WAIT_SECS)
     }
 
-    fn try_start_inference(&mut self) {
-        if self.inference_busy() || keryx_miner::llm::probe_in_flight() || self.urgent_replay(self.next_request_work()) {
+    /// Puts a request back after a transient failure, to start again after a growing delay, at
+    /// most `MAX_REQUEST_RETRIES` times; the node's window still bounds it.
+    fn retry_request(&mut self, entry: QueuedRequest) {
+        let sid = entry.0.clone();
+        let tries = self.request_retries.get(&sid).map_or(0, |(n, _)| *n) + 1;
+        if tries > MAX_REQUEST_RETRIES {
+            warn!("Inference: request id={} still failing after {} tries — dropped", sid, MAX_REQUEST_RETRIES);
+            self.request_retries.remove(&sid);
             return;
+        }
+        if self.ai_request_queue.len() >= MAX_AI_QUEUE_SIZE {
+            warn!("Inference: request id={} not retried — queue full", sid);
+            self.request_retries.remove(&sid);
+            return;
+        }
+        let delay = REQUEST_RETRY_BASE.saturating_mul(1 << (tries - 1));
+        info!("Inference: request id={} retried in {} s (try {} of {})", sid, delay.as_secs(), tries, MAX_REQUEST_RETRIES);
+        self.request_retries.insert(sid.clone(), (tries, std::time::Instant::now() + delay));
+        self.request_queued_at.insert(sid, std::time::Instant::now());
+        self.ai_request_queue.push_back(entry);
+    }
+
+    async fn try_start_inference(&mut self, miner: &mut MinerManager) -> Result<(), Error> {
+        // Retry state lives only as long as its request is queued or running.
+        let running = self.inference_rx.as_ref().and_then(|j| j.retry.as_ref()).map(|(sid, ..)| sid.clone());
+        let queue = &self.ai_request_queue;
+        self.request_retries.retain(|sid, _| running.as_ref() == Some(sid) || queue.iter().any(|(q, ..)| q == sid));
+        if self.inference_busy() || keryx_miner::llm::probe_in_flight() || self.urgent_replay(self.next_request_work()) {
+            return Ok(());
         }
         while self.ai_request_queue.front().is_some_and(|(sid, ..)| self.ai_answered_by_me.contains(sid)) {
             if let Some((sid, ..)) = self.ai_request_queue.pop_front() {
@@ -1739,11 +1813,13 @@ impl KeryxdHandler {
             }
         }
         self.drop_unawaited_requests();
-        let Some(index) = self.startable_request() else { return };
-        if let Some((stable_id, request_hash, model_id, prompt, prompt_len, max_tokens, private)) = self.ai_request_queue.remove(index) {
+        let Some(index) = self.startable_request() else { return Ok(()) };
+        if let Some(entry) = self.ai_request_queue.remove(index) {
+            let retry = Some(entry.clone());
+            let (stable_id, request_hash, model_id, prompt, prompt_len, max_tokens, private) = entry;
             self.request_queued_at.remove(&stable_id);
             self.request_checks.remove(&stable_id);
-            let (tx_done, rx_done) = oneshot::channel::<(Option<keryx_miner::llm::Generated>, f64)>();
+            let (tx_done, rx_done) = oneshot::channel::<(Option<keryx_miner::llm::Generated>, f64, bool)>();
             let traced = self.last_known_daa >= keryx_miner::pom::verifiable_inference_activation_daa();
             let tier = traced.then(|| keryx_miner::models::pom_tier_index(&model_id, self.last_known_daa)).flatten();
             let chain = keryx_miner::trace::chain_active(self.last_known_daa);
@@ -1757,33 +1833,41 @@ impl KeryxdHandler {
                 tier,
                 max_tokens: max_tokens as u32,
                 rx: rx_done,
+                retry,
             };
             if unreadable {
                 // No inference to run: the answer is the fixed error text.
-                let _ = tx_done.send((Some(keryx_miner::llm::Generated { text: UNREADABLE_PRIVATE_REQUEST_ANSWER.to_string(), trace: None }), 0.0));
+                let _ = tx_done.send((Some(keryx_miner::llm::Generated { text: UNREADABLE_PRIVATE_REQUEST_ANSWER.to_string(), trace: None, device: 0 }), 0.0, false));
                 self.inference_rx = Some(job);
-                return;
+                return Ok(());
             }
             // Second guard: re-check readiness at execution time (files could have been deleted).
             if !keryx_miner::llm::is_model_ready(&model_id) {
-                log::error!("Inference: model became unavailable after queuing id={} — discarding request", stable_id);
-                return;
+                log::warn!("Inference: model not ready for id={}", stable_id);
+                if let Some(entry) = job.retry {
+                    self.retry_request(entry);
+                }
+                return Ok(());
             }
+            // Mining pauses on the device this very request runs on (or the whole rig) first.
+            self.pause_for(&model_id, miner).await?;
             info!("Inference: spawning LLM inference (max_tokens={}{})", max_tokens, if tier.is_some() { ", traced" } else { "" });
             tokio::task::spawn_blocking(move || {
                 let started = std::time::Instant::now();
                 let result = match tier {
                     Some(tier) => keryx_miner::llm::load_and_run_traced_inference(&model_id, &prompt, max_tokens, tier, prompt_len, &request_hash, chain, attention),
                     None => keryx_miner::llm::load_and_run_inference(&model_id, &prompt, max_tokens)
-                        .map(|text| keryx_miner::llm::Generated { text, trace: None }),
+                        .map(|text| keryx_miner::llm::Generated { text, trace: None, device: 0 }),
                 };
+                let transient = result.is_none() && keryx_miner::llm::last_failure_transient();
                 if result.is_none() {
-                    log::warn!("Inference: inference returned no result for id={} — AiResponse will be skipped", stable_id);
+                    log::warn!("Inference: inference returned no result for id={}{}", stable_id, if transient { " (transient)" } else { " — AiResponse will be skipped" });
                 }
-                let _ = tx_done.send((result, started.elapsed().as_secs_f64()));
+                let _ = tx_done.send((result, started.elapsed().as_secs_f64(), transient));
             });
             self.inference_rx = Some(job);
         }
+        Ok(())
     }
 
     /// Records the seed block of the block task window of a template, once per window and parent set.
@@ -1876,14 +1960,13 @@ impl KeryxdHandler {
         let (seed, seed_hash, accepted_daa) = (d.seed, d.seed_hash.clone(), d.accepted_daa);
         let (model_id, tier, trace, request_hash) = (p.model_id, p.tier, Arc::clone(&p.trace), p.request_hash);
         info!("Trace: response {} audited at chain block {} — replaying {} points", txid, seed_hash, keryx_miner::trace::POINTS);
-        self.set_opoi_pause(true);
-        miner.process_block(None).await?;
+        self.pause_for(&model_id, miner).await?;
         let (tx_done, rx_done) = oneshot::channel::<Option<Vec<u8>>>();
         tokio::task::spawn_blocking(move || {
             let body = keryx_miner::llm::open_trace(&model_id, tier, &trace, &seed, txid_bytes, &request_hash, accepted_daa);
             let _ = tx_done.send(body);
         });
-        self.replay_rx = Some(ReplayJob { response_txid: txid, seed_hash, path: None, started: std::time::Instant::now(), rx: rx_done });
+        self.replay_rx = Some(ReplayJob { response_txid: txid, seed_hash, path: None, model_id, started: std::time::Instant::now(), rx: rx_done });
         Ok(())
     }
 
@@ -1896,15 +1979,14 @@ impl KeryxdHandler {
         let (seed, seed_hash, prev) = (d.seed, d.seed_hash.clone(), a.last_partials());
         let (model_id, tier, trace) = (p.model_id, p.tier, Arc::clone(&p.trace));
         info!("Trace: response {} — replaying attention phase {}", txid, path.len());
-        self.set_opoi_pause(true);
-        miner.process_block(None).await?;
+        self.pause_for(&model_id, miner).await?;
         let (tx_done, rx_done) = oneshot::channel::<Option<Vec<u8>>>();
         let job_path = path.clone();
         tokio::task::spawn_blocking(move || {
             let body = keryx_miner::llm::open_attention_phase(&model_id, tier, &trace, &seed, txid_bytes, &job_path, &prev);
             let _ = tx_done.send(body);
         });
-        self.replay_rx = Some(ReplayJob { response_txid: txid, seed_hash, path: Some(path), started: std::time::Instant::now(), rx: rx_done });
+        self.replay_rx = Some(ReplayJob { response_txid: txid, seed_hash, path: Some(path), model_id, started: std::time::Instant::now(), rx: rx_done });
         Ok(())
     }
 
@@ -2457,6 +2539,7 @@ impl KeryxdHandler {
             if p.accepted_hash.as_deref().is_some_and(|h| removed.contains(h)) {
                 p.accepted_hash = None;
                 p.draw = None;
+                p.node_awaits = None;
                 reset.push(txid.clone());
             } else if p.draw.as_ref().is_some_and(|d| removed.contains(d.seed_hash.as_str())) {
                 p.draw = None;
@@ -2650,6 +2733,7 @@ impl KeryxdHandler {
     /// only an estimate of the node's ledger.
     fn apply_awaited_openings(&mut self, resp: &crate::proto::GetAwaitedOpeningsResponseMessage) {
         self.awaited_poll_pending = false;
+        self.awaited_answered = true;
         if resp.requests_checked {
             self.node_checks_requests = true;
             let awaited: std::collections::HashMap<String, u64> =
@@ -2719,7 +2803,11 @@ impl KeryxdHandler {
                     replay_failures: 0,
                     retry_at: None,
                 });
-                if !kept {
+                if kept {
+                    if let Some(op) = p.opening.as_mut() {
+                        op.deadline_daa = o.deadline_daa;
+                    }
+                } else {
                     p.attn = None;
                     p.opening = None;
                     self.opening_inflight.retain(|_, f| f.response_txid != o.response_txid);
@@ -2736,6 +2824,11 @@ impl KeryxdHandler {
             if !d.audited || (!in_phases && d.deadline_daa != o.deadline_daa) {
                 d.audited = true;
                 d.deadline_daa = o.deadline_daa;
+                let seed_hash = d.seed_hash.clone();
+                // The stored opening follows the deadline the node now sets.
+                if let Some(op) = p.opening.as_mut().filter(|op| op.seed_hash == seed_hash) {
+                    op.deadline_daa = o.deadline_daa;
+                }
                 changed.push(o.response_txid.clone());
             }
             if d.opened && idle && !in_phases && p.attn.is_none() {
@@ -2798,10 +2891,17 @@ impl KeryxdHandler {
     /// Drops the traces past their window and the chain log they no longer need.
     fn prune_traces(&mut self) {
         let daa = self.last_known_daa;
+        let awaited_answered = self.awaited_answered;
         let before: Vec<String> = self.pending_traces.keys().cloned().collect();
         let inflight: std::collections::HashSet<String> = self.opening_inflight.values().map(|o| o.response_txid.clone()).collect();
         self.pending_traces.retain(|txid, p| match p.draw.as_ref() {
-            None => p.submitted_daa + TRACE_UNDRAWN_LIMIT_DAA > daa,
+            // Until the node said on this connection whether it awaits an accepted response, it
+            // is kept whatever its age.
+            None => {
+                p.submitted_daa + TRACE_UNDRAWN_LIMIT_DAA > daa
+                    || p.node_awaits == Some(true)
+                    || (p.accepted_hash.is_some() && p.node_awaits.is_none() && !awaited_answered)
+            }
             Some(d) if !d.audited => d.seed_daa + TRACE_UNAUDITED_GRACE_DAA > daa,
             Some(d) => {
                 let deadline = d.deadline_daa.max(p.attn.as_ref().map_or(0, |a| a.deadline_daa));
@@ -2969,10 +3069,19 @@ impl KeryxdHandler {
         let Some(mut job) = self.inference_rx.take() else {
             return false;
         };
-        let Ok((result_opt, gen_secs)) = job.rx.try_recv() else {
+        let Ok((result_opt, gen_secs, transient)) = job.rx.try_recv() else {
             self.inference_rx = Some(job);
             return false;
         };
+        if result_opt.is_none() && transient {
+            if let Some(entry) = job.retry.take() {
+                self.retry_request(entry);
+                return true;
+            }
+        }
+        if let Some((sid, ..)) = job.retry.as_ref() {
+            self.request_retries.remove(sid);
+        }
         let Some(generated) = result_opt else {
             // Inference returned None: model not ready or think block exhausted max_tokens.
             // Do NOT upload anything to IPFS — skip this AiResponse entirely.
@@ -3280,12 +3389,10 @@ impl KeryxdHandler {
                     if !block.transactions.is_empty() {
                         // Full block — scan directly.
                         self.scan_txs_for_ai_requests(&block.transactions, block.header.as_ref().map_or(0, |h| h.daa_score));
-                        // The serving card pauses and drains itself before its model swap
-                        // (PAUSE -> DRAIN -> SWAP -> GENERATE -> RESUME, in the inference task);
-                        // the other cards keep mining.
+                        // Pause and drain mining BEFORE spawning inference, so no PoM op can
+                        // race the model swap: PAUSE -> DRAIN -> SWAP -> GENERATE -> RESUME.
                         if !self.inference_busy() && self.startable_request().is_some() {
-                            self.try_start_inference();
-                            self.set_inference_busy(self.inference_busy());
+                            self.try_start_inference(miner).await?;
                         }
                         // Escrow: check for new escrow UTXOs and mature claims.
                         let claim_tx = self.escrow_watcher.as_mut().and_then(|w| w.handle_block(&block));
@@ -3414,17 +3521,33 @@ impl KeryxdHandler {
                 if let Some(ref block) = template.block {
                     self.scan_txs_for_ai_requests(&block.transactions, block.header.as_ref().map_or(0, |h| h.daa_score));
                 }
-                if !self.inference_busy() && self.startable_request().is_some()
-                {
-                    self.try_start_inference();
+                if !self.inference_busy() && self.startable_request().is_some() {
+                    self.try_start_inference(miner).await?;
                 }
-                // An inference or audit replay in flight no longer holds the template back: only
-                // the card serving it is paused (inside llm, around its request or replay), and
-                // every other card keeps mining this fresh template.
-                let inference_busy = self.inference_busy();
-                // Past this point any global pause comes from the node, not from us.
-                self.set_opoi_pause(false);
-                self.set_inference_busy(inference_busy);
+                // Pause GPU mining while any inference is in flight. On a multi-GPU rig only the
+                // device serving it pauses and the template still goes to the others.
+                if self.inference_busy() {
+                    match self.busy_device() {
+                        Some((dev, model)) => {
+                            keryx_miner::pom_gpu::set_inference_paused_only(dev, &model);
+                            keryx_miner::pom_gpu::log_throttled(u32::MAX, "tpl-busy-dev", || {
+                                info!("Inference on GPU {} — the other GPUs keep mining", dev)
+                            });
+                        }
+                        None => {
+                            let (inf, chal, rep) = (self.inference_rx.is_some(), self.challenge_inference_rx.is_some(), self.replay_rx.is_some());
+                            keryx_miner::pom_gpu::log_throttled(u32::MAX, "tpl-busy", || {
+                                info!("Template held: inference {} challenge {} replay {}", inf, chal, rep)
+                            });
+                            self.set_opoi_pause(true);
+                            miner.process_block(None).await?;
+                            return Ok(());
+                        }
+                    }
+                } else {
+                    // Past this point any pause comes from the node, not from us.
+                    self.set_opoi_pause(false);
+                }
                 if let Some(header) = template.block.as_ref().and_then(|b| b.header.as_ref()) {
                     self.resolve_task_seed(header).await;
                 }
@@ -3503,8 +3626,7 @@ impl KeryxdHandler {
                         self.backfill_note_block(&hash, block.header.as_ref());
                         self.backfill_pump().await?;
                         if !self.inference_busy() && self.startable_request().is_some() {
-                            self.try_start_inference();
-                            self.set_inference_busy(self.inference_busy());
+                            self.try_start_inference(miner).await?;
                         }
                         let claim_tx = self.escrow_watcher.as_mut().and_then(|w| w.handle_block(&block));
                         if let Some(w) = self.escrow_watcher.as_ref() {
@@ -3810,6 +3932,9 @@ impl Drop for KeryxdHandler {
             request_txids: std::mem::take(&mut self.ai_request_txids),
             queued_at: std::mem::take(&mut self.request_queued_at),
             node_checks_requests: self.node_checks_requests,
+            answered: std::mem::take(&mut self.ai_answered_by_me),
+            seen: std::mem::take(&mut self.ai_seen_prefixes),
+            retries: std::mem::take(&mut self.request_retries),
         };
         if !parked.queue.is_empty()
             || parked.inference.is_some()
@@ -3817,6 +3942,8 @@ impl Drop for KeryxdHandler {
             || parked.publish.is_some()
             || !parked.responses.is_empty()
             || !parked.request_txids.is_empty()
+            || !parked.answered.is_empty()
+            || !parked.seen.is_empty()
         {
             *PARKED.lock().unwrap_or_else(|p| p.into_inner()) = Some(parked);
         }
@@ -3835,6 +3962,10 @@ struct Parked {
     request_txids: std::collections::HashMap<String, (String, u64)>,
     queued_at: std::collections::HashMap<String, std::time::Instant>,
     node_checks_requests: bool,
+    /// Requests this worker answered or saw, so a reconnect neither serves nor queues them again.
+    answered: std::collections::HashSet<String>,
+    seen: std::collections::HashSet<String>,
+    retries: std::collections::HashMap<String, (u8, std::time::Instant)>,
 }
 
 static PARKED: Mutex<Option<Parked>> = Mutex::new(None);
@@ -3846,19 +3977,19 @@ static LAST_KNOWN_DAA: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU
 const COMPRESSED_PROMPT_MAGIC: [u8; 4] = [0x00, b'K', b'Z', 0x01];
 const MAX_DECOMPRESSED_PROMPT_LEN: u64 = 1 << 20;
 
-/// Plaintext of an opened private prompt: inflated when it carries the compression magic.
-/// `None` for a compressed prompt that is corrupt or inflates past the cap.
-fn decode_private_prompt(bytes: &[u8]) -> Option<String> {
+/// Plaintext of an opened private prompt: inflated when it carries the compression magic, cut at
+/// the cap. A stream that fails to inflate yields its partial output, else the raw bytes.
+pub(crate) fn decode_private_prompt(bytes: &[u8]) -> String {
     use std::io::Read;
     let Some(deflated) = bytes.strip_prefix(&COMPRESSED_PROMPT_MAGIC[..]) else {
-        return Some(String::from_utf8_lossy(bytes).into_owned());
+        return String::from_utf8_lossy(bytes).into_owned();
     };
     let mut inflated = Vec::new();
-    flate2::read::DeflateDecoder::new(deflated).take(MAX_DECOMPRESSED_PROMPT_LEN + 1).read_to_end(&mut inflated).ok()?;
-    if inflated.len() as u64 > MAX_DECOMPRESSED_PROMPT_LEN {
-        return None;
+    let read = flate2::read::DeflateDecoder::new(deflated).take(MAX_DECOMPRESSED_PROMPT_LEN).read_to_end(&mut inflated);
+    if read.is_err() && inflated.is_empty() {
+        return String::from_utf8_lossy(deflated).into_owned();
     }
-    Some(String::from_utf8_lossy(&inflated).into_owned())
+    String::from_utf8_lossy(&inflated).into_owned()
 }
 
 /// Generation and replay speeds measured on this rig, by model, for the life of the process.
@@ -3969,6 +4100,13 @@ mod speeds {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn krx_ai_token_budget_is_capped() {
+        let raw = br#"KRX:AI:1:{"m":"glm-4-9b-0414","p":"hi","n":999999}"#;
+        let (_, prompt, max_tokens) = super::KeryxdHandler::parse_krx_ai_payload(raw).unwrap();
+        assert_eq!((prompt.as_str(), max_tokens as u64), ("hi", super::MAX_KRX_AI_TOKENS));
+    }
+
     #[test]
     fn awaited_openings_need_a_recent_node() {
         assert!(super::version_at_least("1.6.6", (1, 6, 6)));
@@ -4129,17 +4267,22 @@ mod tests {
             out
         };
 
-        assert_eq!(decode_private_prompt("Bonjour, ça va ?".as_bytes()).as_deref(), Some("Bonjour, ça va ?"));
+        assert_eq!(decode_private_prompt("Bonjour, ça va ?".as_bytes()), "Bonjour, ça va ?");
         let text = "Entrée 41 — le code est ORCHIDÉE-7319. ".repeat(500);
         let packed = deflate(text.as_bytes());
         assert!(packed.len() < text.len() / 10);
-        assert_eq!(decode_private_prompt(&packed).as_deref(), Some(text.as_str()));
+        assert_eq!(decode_private_prompt(&packed), text);
 
         let mut corrupt = COMPRESSED_PROMPT_MAGIC.to_vec();
         corrupt.extend([0xFF; 32]);
-        assert_eq!(decode_private_prompt(&corrupt), None);
+        assert_eq!(decode_private_prompt(&corrupt), "\u{FFFD}".repeat(32));
+        let ascii: String = (0..4000).map(|i| char::from(b'a' + (i * 7 % 26) as u8)).collect();
+        let mut truncated = deflate(ascii.as_bytes());
+        truncated.truncate(truncated.len() / 2);
+        let partial = decode_private_prompt(&truncated);
+        assert!(!partial.is_empty() && ascii.starts_with(&partial));
         let bomb = deflate(&vec![b'a'; MAX_DECOMPRESSED_PROMPT_LEN as usize + 1]);
-        assert_eq!(decode_private_prompt(&bomb), None);
+        assert_eq!(decode_private_prompt(&bomb), "a".repeat(MAX_DECOMPRESSED_PROMPT_LEN as usize));
     }
 
     /// Round-trip against a live node. Ignored by default — run with
