@@ -68,7 +68,7 @@ jobs:
 
   build:
     needs: [pom-fatbin]
-    if: always() && needs.pom-fatbin.result != 'failure'
+    if: ${{ !cancelled() && needs.pom-fatbin.result != 'failure' }}
     runs-on: windows-2022
     timeout-minutes: 350
 

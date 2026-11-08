@@ -130,7 +130,7 @@ jobs:
 
   build:
     needs: [fatbin]
-    if: always() && needs.fatbin.result != 'failure'
+    if: ${{ !cancelled() && needs.fatbin.result != 'failure' }}
     runs-on: ubuntu-latest
     timeout-minutes: 350
 
