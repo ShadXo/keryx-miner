@@ -17,6 +17,7 @@ on:
 
 env:
   CUDA_VERSION: "12.8.1"
+  PROTOC_VERSION: "23.4"
 
 jobs:
   test:
@@ -27,16 +28,19 @@ jobs:
     timeout-minutes: 45
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: arduino/setup-protoc@v3
-        with:
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
+      # Direct download, as upstream's release.yml: arduino/setup-protoc has no Node 24 release.
+      - name: Install protoc
+        run: |
+          curl -sSL -o protoc.zip https://github.com/protocolbuffers/protobuf/releases/download/v${{ env.PROTOC_VERSION }}/protoc-${{ env.PROTOC_VERSION }}-linux-x86_64.zip
+          mkdir -p "$HOME/protoc" && unzip -q -o protoc.zip -d "$HOME/protoc" && rm protoc.zip
+          echo "$HOME/protoc/bin" >> "$GITHUB_PATH"
 
       - uses: dtolnay/rust-toolchain@stable
 
       - name: Install CUDA (nvcc only)
-        uses: Jimver/cuda-toolkit@v0.2.35
+        uses: Jimver/cuda-toolkit@v0.2.36
         with:
           cuda: ${{ env.CUDA_VERSION }}
           method: network
@@ -52,7 +56,7 @@ jobs:
           sudo ln -sf /usr/local/cuda/lib64/stubs/libcuda.so /usr/local/cuda/lib64/stubs/libcuda.so.1
           echo "LD_LIBRARY_PATH=/usr/local/cuda/lib64/stubs:$LD_LIBRARY_PATH" >> "$GITHUB_ENV"
 
-      - uses: actions/cache@v4
+      - uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry

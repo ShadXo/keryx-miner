@@ -68,9 +68,9 @@ jobs:
   # is stale (predates the ILP x2 commit); this rebuilds it from current source.
   fatbin:
     if: inputs.nextgen_kernel == 'native'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Compile nextgen fatbin
         run: bash .github/scripts/pom-nextgen-fatbin.sh "$FATBIN_IMAGE" "$FATBIN_SM103_IMAGE"
@@ -119,7 +119,7 @@ jobs:
           # Must read 8.7 (CUDA 12.8). 8.8 means the wrong toolkit and no r570 support.
           grep -m1 '^\.version' keryx-cuda-sm120.ptx
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: nextgen-fatbin
           path: |
@@ -131,21 +131,21 @@ jobs:
   build:
     needs: [fatbin]
     if: ${{ !cancelled() && needs.fatbin.result != 'failure' }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 350
 
     steps:
       - name: Free disk space
-        uses: jlumbroso/free-disk-space@main
+        uses: jlumbroso/free-disk-space@v2.0.0
         with:
-          tool-cache: true
+          preinstalled-runtimes: true
           docker-images: false
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Fetch native fatbin
         if: inputs.nextgen_kernel == 'native'
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: nextgen-fatbin
           path: .
@@ -167,7 +167,7 @@ jobs:
           printf 'image=%s\n' "$(printf '%s' "$BUILD_IMAGE" | tr -c '[:alnum:].-' '_')" >> "$GITHUB_OUTPUT"
 
       - name: Cache llama engine
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: dist/libkeryx-llama.so
           # A cache hit sets KERYX_LLAMA_SKIP=1 and reuses the stored .so wholesale, so ANY
@@ -184,10 +184,12 @@ jobs:
           # The toolkit is part of the key too, taken from BUILD_IMAGE via the step above rather
           # than written out as a literal: a hardcoded `cuda1282` does not change when someone
           # bumps BUILD_IMAGE, which is the same silent-stale-reuse bug one paragraph up.
-          key: llama-${{ env.LLAMA_TAG }}-${{ inputs.llama_archs }}-${{ steps.cachekey.outputs.image }}-nehalem1-${{ hashFiles('tools/keryx-llama/keryx_llama.cpp', 'build.rs') }}
+          # tools/keryx-llama/** covers the patches too: build.rs applies them to llama.cpp, so a
+          # patch-only change (0007 canonical weights, say) must rebuild the .so as well.
+          key: llama-${{ env.LLAMA_TAG }}-${{ inputs.llama_archs }}-${{ steps.cachekey.outputs.image }}-nehalem1-${{ hashFiles('tools/keryx-llama/**', 'build.rs') }}
 
       - name: Cache cargo
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             .cargo-home/registry
@@ -312,7 +314,7 @@ jobs:
             '
           sudo chown -R "$(id -u):$(id -g)" .
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: keryx-miner-${{ inputs.nextgen_kernel }}-${{ github.sha }}
           path: pkg/
